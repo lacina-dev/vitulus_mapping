@@ -152,9 +152,15 @@ class BandProjectorNode:
         return DemGrid.load_npz(self.dem_path)
 
     def regenerate(self, name=None, write_files=True):
-        if not self.busy.acquire(blocking=False):
-            if write_files:
-                rospy.logwarn('band_projector: regeneration already running')
+        # File-writing regenerations (manual save / regenerate) must not lose
+        # the lock race against the periodic auto-regen timer — wait for it,
+        # otherwise the raster is silently skipped. Live (write_files=False)
+        # auto-regens still bail immediately if one is already running.
+        if write_files:
+            if not self.busy.acquire(blocking=True, timeout=60.0):
+                rospy.logwarn('band_projector: regeneration busy >60s, skipped')
+                return None
+        elif not self.busy.acquire(blocking=False):
             return None
         try:
             t0 = time.monotonic()
