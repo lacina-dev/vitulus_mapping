@@ -1,0 +1,35 @@
+<launch>
+  <!-- Mapping v3: mapping with known poses, runs ALONGSIDE the current stack.
+       Zero writes outside /mapping/*.
+       site      .. per-garden data directory name
+       octomap   .. optional path to a previously saved .ot to continue from -->
+  <arg name="site" default="default"/>
+  <arg name="output_dir" default="$(env HOME)/.vitulus/mapping_v3/$(arg site)"/>
+  <arg name="octomap" default=""/>
+
+  <group ns="mapping">
+    <rosparam command="load" file="$(find vitulus_mapping)/config/mapping_v3.yaml"/>
+
+    <node pkg="octomap_server" type="octomap_server_node" name="octomap_server"
+          output="screen" args="$(arg octomap)"/>
+
+    <!-- 2D projection throttled for the web UI 3D view (rosbridge-friendly) -->
+    <node pkg="topic_tools" type="throttle" name="projected_map_throttle"
+          args="messages projected_map 0.5 projected_map_slow"/>
+
+    <node pkg="vitulus_mapping" type="insertion_gate" name="insertion_gate"
+          output="screen">
+      <param name="output_dir" value="$(arg output_dir)"/>
+    </node>
+
+    <node pkg="vitulus_mapping" type="trajectory_dem" name="trajectory_dem"
+          output="screen">
+      <param name="output_dir" value="$(arg output_dir)"/>
+    </node>
+
+    <node pkg="vitulus_mapping" type="band_projector" name="band_projector"
+          output="screen">
+      <param name="output_dir" value="$(arg output_dir)"/>
+    </node>
+  </group>
+</launch>

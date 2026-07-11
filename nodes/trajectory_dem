@@ -1,0 +1,214 @@
+#!/usr/bin/env python3
+"""trajectory_dem — builds the canonical ground DEM from the robot trajectory
+(Mapping v3, phase 1). Ground z = navsat map-frame altitude of base_link minus
+wheel radius: cm-class, immune to vegetation, covers everything mowable.
+
+Samples only while the insertion gate is OPEN (subscribes /mapping/gate), so
+the DEM inherits the same trust conditions as the octomap archive.
+
+Interfaces (relative to /mapping):
+  in   gate               std_msgs/Bool (from insertion_gate, 5 Hz)
+  in   gate_status        std_msgs/String (z_corr from insertion_gate)
+  out  terrain            grid_map_msgs/GridMap (layers: ground_elevation,
+                          confidence, last_seen_age, source), every ~5 s
+  set  save_dem           std_msgs/String ('' = default path)
+  file <output_dir>/dem.npz (autosave, atomic; loaded on start)
+"""
+
+import json
+import math
+import os
+
+import numpy as np
+import rospy
+import tf2_ros
+from grid_map_msgs.msg import GridMap
+from sensor_msgs.msg import CompressedImage
+from std_msgs.msg import Bool, String
+
+from vitulus_mapping.demgrid import DemGrid
+from vitulus_mapping.preview import dem_to_png
+from vitulus_mapping.rosgridmap import dem_to_gridmap_msg
+
+
+class TrajectoryDemNode:
+    def __init__(self):
+        self.map_frame = rospy.get_param('~map_frame', 'map')
+        self.base_frame = rospy.get_param('~base_frame', 'base_link')
+        self.resolution = float(rospy.get_param('~resolution', 0.05))
+        self.wheel_radius = float(rospy.get_param('~wheel_radius', 0.055))
+        self.z_offset = float(rospy.get_param('~z_offset', 0.0))  # field calib
+        self.stamp_radius = float(rospy.get_param('~stamp_radius', 0.12))
+        self.min_travel = float(rospy.get_param('~min_travel', 0.05))
+        self.max_slope_deg = float(rospy.get_param('~max_slope_deg', 35.0))
+        self.gate_timeout_s = float(rospy.get_param('~gate_timeout_s', 1.0))
+        self.output_dir = os.path.expanduser(rospy.get_param(
+            '~output_dir', '~/.vitulus/mapping_v3/default'))
+        autosave_s = float(rospy.get_param('~autosave_period_s', 60.0))
+        publish_s = float(rospy.get_param('~publish_period_s', 5.0))
+
+        self.dem_path = os.path.join(self.output_dir, 'dem.npz')
+        if rospy.get_param('~load_existing', True) and os.path.exists(self.dem_path):
+            self.dem = DemGrid.load_npz(self.dem_path)
+            rospy.loginfo('trajectory_dem: loaded %s %s', self.dem_path,
+                          json.dumps(self.dem.stats()))
+        else:
+            self.dem = DemGrid(self.resolution)
+
+        self.tf_buf = tf2_ros.Buffer(rospy.Duration(10.0))
+        self.tf_listener = tf2_ros.TransformListener(self.tf_buf)
+
+        self.gate_open = False
+        self.gate_stamp = 0.0
+        self.z_corr = 0.0               # from insertion_gate (single source)
+        self.z_live = False
+        self.last_sample = None         # (x, y, ground_z)
+        self.samples = 0
+        self.skipped_dz = 0
+        self.dirty = False
+
+        self.pub_terrain = rospy.Publisher('terrain', GridMap, queue_size=1,
+                                           latch=True)
+        self.pub_png = rospy.Publisher('terrain_png', CompressedImage,
+                                       queue_size=1, latch=True)
+        self.pub_status = rospy.Publisher('dem_status', String, queue_size=1,
+                                          latch=True)
+        self.z_range = None
+        rospy.Subscriber('gate', Bool, self.cb_gate, queue_size=1)
+        rospy.Subscriber('gate_status', String, self.cb_gate_status,
+                         queue_size=1)
+        rospy.Subscriber('save_dem', String, self.cb_save, queue_size=1)
+
+        rospy.Timer(rospy.Duration(0.2), self.tick_sample)
+        rospy.Timer(rospy.Duration(publish_s), self.tick_publish)
+        rospy.Timer(rospy.Duration(autosave_s), self.tick_autosave)
+        rospy.Timer(rospy.Duration(60.0), self.tick_report)
+        rospy.Timer(rospy.Duration(1.0), self.tick_status)
+        rospy.on_shutdown(self.save)
+        if self.dem.valid_bbox() is not None:   # show loaded DEM immediately
+            msg = dem_to_gridmap_msg(self.dem, self.map_frame, rospy.Time.now())
+            if msg is not None:
+                self.pub_terrain.publish(msg)
+            self.publish_png()
+        rospy.loginfo('trajectory_dem up: res=%.2fm wheel_r=%.3fm out=%s',
+                      self.resolution, self.wheel_radius, self.output_dir)
+
+    def cb_gate(self, msg):
+        self.gate_open = msg.data
+        self.gate_stamp = rospy.Time.now().to_sec()
+
+    def cb_gate_status(self, msg):
+        """z correction comes from the insertion gate — the SAME offset the
+        clouds are inserted with, so DEM and octomap stay z-consistent."""
+        try:
+            s = json.loads(msg.data)
+        except ValueError:
+            return
+        if 'z_corr_m' in s:
+            self.z_corr = float(s['z_corr_m'])
+        self.z_live = s.get('z_source') == 'rtk'
+
+    def cb_save(self, msg):
+        path = msg.data.strip() or self.dem_path
+        self.save(path)
+
+    # ---- sampling -----------------------------------------------------------
+    def tick_sample(self, _evt):
+        now = rospy.Time.now().to_sec()
+        if not self.gate_open or now - self.gate_stamp > self.gate_timeout_s:
+            return
+        try:
+            tr = self.tf_buf.lookup_transform(self.map_frame, self.base_frame,
+                                              rospy.Time(0), rospy.Duration(0.05))
+        except (tf2_ros.LookupException, tf2_ros.ConnectivityException,
+                tf2_ros.ExtrapolationException):
+            return
+        x = tr.transform.translation.x
+        y = tr.transform.translation.y
+        tf_z = tr.transform.translation.z
+        ground_z = tf_z + self.z_corr - self.wheel_radius + self.z_offset
+
+        if self.last_sample is not None:
+            dist = math.hypot(x - self.last_sample[0], y - self.last_sample[1])
+            if dist < self.min_travel:
+                return
+            # z innovation vs max plausible slope (catches altitude glitches)
+            max_dz = math.tan(math.radians(self.max_slope_deg)) * dist + 0.08
+            if abs(ground_z - self.last_sample[2]) > max_dz:
+                self.skipped_dz += 1
+                rospy.logwarn_throttle(
+                    10.0, 'trajectory_dem: dz jump %.2fm over %.2fm skipped',
+                    ground_z - self.last_sample[2], dist)
+                self.last_sample = (x, y, ground_z)
+                return
+
+        self.dem.stamp_disc(x, y, ground_z, now, self.stamp_radius)
+        self.last_sample = (x, y, ground_z)
+        self.samples += 1
+        self.dirty = True
+
+    # ---- output -------------------------------------------------------------
+    def tick_publish(self, _evt):
+        if not self.dirty:
+            return
+        msg = dem_to_gridmap_msg(self.dem, self.map_frame, rospy.Time.now())
+        if msg is not None:
+            self.pub_terrain.publish(msg)
+        self.publish_png()
+
+    def publish_png(self):
+        bbox = self.dem.valid_bbox()
+        if bbox is None:
+            return
+        x0, y0, x1, y1 = bbox
+        sl = (slice(x0, x1 + 1), slice(y0, y1 + 1))
+        try:
+            png, self.z_range = dem_to_png(self.dem.elev[sl],
+                                           self.dem.source[sl])
+        except Exception as e:
+            rospy.logwarn_throttle(30.0, 'trajectory_dem: png failed: %s', e)
+            return
+        img = CompressedImage()
+        img.header.stamp = rospy.Time.now()
+        img.format = 'png'
+        img.data = png
+        self.pub_png.publish(img)
+
+    def tick_status(self, _evt):
+        now = rospy.Time.now().to_sec()
+        st = self.dem.stats()
+        st.update({
+            'samples': self.samples,
+            'dz_skips': self.skipped_dz,
+            'gate_open': self.gate_open and now - self.gate_stamp
+                         <= self.gate_timeout_s,
+            'gps_alt_ok': self.z_live,
+            'z_range': [round(z, 2) for z in self.z_range]
+                       if self.z_range else None,
+        })
+        self.pub_status.publish(String(json.dumps(st)))
+
+    def tick_autosave(self, _evt):
+        if self.dirty:
+            self.save()
+            self.dirty = False
+
+    def tick_report(self, _evt):
+        if self.samples:
+            rospy.loginfo('trajectory_dem: %d samples, %d dz-skips, %s',
+                          self.samples, self.skipped_dz,
+                          json.dumps(self.dem.stats()))
+
+    def save(self, path=None):
+        p = path or self.dem_path
+        try:
+            self.dem.save_npz(p)
+            rospy.loginfo('trajectory_dem: saved %s', p)
+        except Exception as e:
+            rospy.logerr('trajectory_dem: save failed: %s', e)
+
+
+if __name__ == '__main__':
+    rospy.init_node('trajectory_dem')
+    TrajectoryDemNode()
+    rospy.spin()

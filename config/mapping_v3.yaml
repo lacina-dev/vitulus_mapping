@@ -1,0 +1,57 @@
+# Mapping v3 — loaded at ns /mapping, keys land as private params of the nodes.
+# Everything lives under /mapping/*; the existing stack is untouched.
+
+octomap_server:
+  frame_id: map
+  base_frame_id: base_link
+  resolution: 0.05
+  sensor_model/max_range: 4.0        # D435 trustworthy outdoor range
+  sensor_model/hit: 0.7
+  sensor_model/miss: 0.4
+  sensor_model/min: 0.12
+  sensor_model/max: 0.97
+  filter_ground: false               # ground stays in the 3D evidence archive
+  filter_speckles: true
+  latch: false                       # hectare maps: no latched full publishes
+  compress_map: true
+
+insertion_gate:
+  mode: fused                        # fused (map from the fused pose, default)
+                                     # | rtk (strict RTK-only) | off
+  cloud_topics: ['/ground_cloud', '/obstacles_cloud']
+  max_rate_hz: 3.0                   # insertion is single-thread: throttle
+  max_hacc_mm: 50.0
+  max_vacc_mm: 80.0
+  max_gps_age_s: 1.5
+  max_gps_odom_age_s: 1.5
+  max_heading_diff_deg: 8.0
+  heading_offset_deg: 0.0
+  max_heading_age_s: 1.5
+  max_pose_age_s: 0.7
+  max_speed_mps: 1.0
+  jump_margin_m: 0.25
+  jump_cooldown_s: 5.0
+
+trajectory_dem:
+  resolution: 0.05
+  wheel_radius: 0.055                # vitulus4WD URDF
+  z_offset: 0.0                      # field-calibration constant
+  stamp_radius: 0.12
+  min_travel: 0.05
+  max_slope_deg: 35.0
+  max_gps_odom_age_s: 1.0
+  gate_timeout_s: 1.0
+  autosave_period_s: 60.0
+  publish_period_s: 5.0
+  load_existing: true
+
+band_projector:
+  auto_regen_period_s: 10.0          # live raster for the UI (0 = off)
+  band_min: 0.10                     # obstacles 0.10-0.60 m above LOCAL ground
+  band_max: 0.60
+  min_evidence: 3                    # voxels in band per cell (field-tuned)
+  min_cluster_cells: 3               # drop smaller obstacle clusters (speckles)
+  fill_percentile: 5.0
+  fill_min_pts: 3
+  max_slope_deg: 35.0
+  inpaint_max_dist_m: 0.5

@@ -1,0 +1,400 @@
+#!/usr/bin/env python3
+"""mapping_manager — lifecycle manager for the Mapping v3 session (UI-facing).
+
+Runs permanently (started from the vitulus_ui launch); the mapping pipeline
+itself (insertion_gate + octomap_server + trajectory_dem + band_projector)
+is spawned/stopped on demand as a roslaunch subprocess, one site (garden)
+at a time.
+
+Interfaces (absolute, UI-friendly):
+  in   /mapping_manager/start        std_msgs/String  site name ('' = 'default')
+  in   /mapping_manager/stop         std_msgs/String  (payload ignored)
+  in   /mapping_manager/remove_site  std_msgs/String  site name (refuses running)
+  in   /mapping_manager/show_site    std_msgs/String  site name ('' = newest) ->
+                                     renders saved previews from disk
+  out  /mapping_manager/status       std_msgs/String  latched JSON 1 Hz:
+       {running, site, uptime_s, pid, sites: [{name, dem_kb, dem_cells?,
+        rasters, has_ot, mtime}]}
+  out  /mapping_manager/terrain_png  sensor_msgs/CompressedImage (latched)
+  out  /mapping_manager/raster_png   sensor_msgs/CompressedImage (latched)
+  out  /mapping_manager/preview_info std_msgs/String  latched JSON
+  in   /mapping_manager/serve_site   std_msgs/String  '' = newest raster of
+                                     newest site with any raster; '<site>' =
+                                     newest raster of that site; '<site>/
+                                     <raster>' = that exact raster ->
+                                     publishes it as the site_map
+  out  /mapping_manager/site_map     nav_msgs/OccupancyGrid  latched, for
+                                     gloc_server's ~map_topic (WP1,
+                                     LOCALIZATION_V2_PLAN.md)
+
+The previews make saved maps visible in the UI at ANY time (the live
+/mapping/* preview topics exist only while the pipeline runs).
+
+A site directory is created on first start — 'new map' in the UI is just
+starting with an unused name.
+"""
+
+import json
+import os
+import shutil
+import signal
+import subprocess
+import time
+
+import cv2
+import numpy as np
+import rospy
+from nav_msgs.msg import OccupancyGrid
+from sensor_msgs.msg import CompressedImage
+from std_msgs.msg import String
+
+from vitulus_mapping.demgrid import DemGrid
+from vitulus_mapping.pgmio import load_occupancy_pgm
+from vitulus_mapping.preview import dem_to_png
+
+
+class MappingManager:
+    def __init__(self):
+        self.base_dir = os.path.expanduser(rospy.get_param(
+            '~base_dir', '~/.vitulus/mapping_v3'))
+        os.makedirs(self.base_dir, exist_ok=True)
+        self.proc = None
+        self.site = None
+        self.started_at = None
+        self.map_frame = rospy.get_param('~map_frame', 'map')
+        self.serving = None    # {'site', 'raster', 'mtime'} of the last
+                                # successfully published site_map, or None
+
+        self.pub_status = rospy.Publisher('/mapping_manager/status', String,
+                                          queue_size=1, latch=True)
+        self.pub_terrain = rospy.Publisher('/mapping_manager/terrain_png',
+                                           CompressedImage, queue_size=1,
+                                           latch=True)
+        self.pub_raster = rospy.Publisher('/mapping_manager/raster_png',
+                                          CompressedImage, queue_size=1,
+                                          latch=True)
+        self.pub_preview = rospy.Publisher('/mapping_manager/preview_info',
+                                           String, queue_size=1, latch=True)
+        self.pub_site_map = rospy.Publisher('/mapping_manager/site_map',
+                                            OccupancyGrid, queue_size=1,
+                                            latch=True)
+        rospy.Subscriber('/mapping_manager/start', String, self.cb_start,
+                         queue_size=1)
+        rospy.Subscriber('/mapping_manager/stop', String, self.cb_stop,
+                         queue_size=1)
+        rospy.Subscriber('/mapping_manager/remove_site', String,
+                         self.cb_remove, queue_size=1)
+        rospy.Subscriber('/mapping_manager/show_site', String,
+                         self.cb_show, queue_size=1)
+        rospy.Subscriber('/mapping_manager/serve_site', String,
+                         self.cb_serve_site, queue_size=1)
+        rospy.Timer(rospy.Duration(1.0), self.tick_status)
+        rospy.on_shutdown(self.shutdown)
+        self.show_site('')            # newest saved map visible right away
+        rospy.loginfo('mapping_manager up, base_dir=%s', self.base_dir)
+
+    # ---- lifecycle -----------------------------------------------------------
+    def running(self):
+        return self.proc is not None and self.proc.poll() is None
+
+    def cb_start(self, msg):
+        site = msg.data.strip() or 'default'
+        if not site.replace('_', '').replace('-', '').isalnum():
+            rospy.logwarn('mapping_manager: invalid site name %r', site)
+            return
+        if self.running():
+            if site == self.site:
+                rospy.loginfo('mapping_manager: %s already running', site)
+                return
+            self.stop_proc()
+        # continue from a saved octomap archive when the site has one
+        ot = os.path.join(self.base_dir, site, 'garden.ot')
+        cmd = ['roslaunch', 'vitulus_mapping', 'mapping_v3.launch',
+               'site:=' + site]
+        if os.path.exists(ot):
+            cmd.append('octomap:=' + ot)
+        rospy.logwarn('mapping_manager: starting %s', ' '.join(cmd))
+        self.proc = subprocess.Popen(cmd, start_new_session=True)
+        self.site = site
+        self.started_at = time.time()
+        self.link_site_datum(site)
+
+    def link_site_datum(self, site):
+        """Point the canonical site-datum path at this site's datum.yaml so
+        navi_transform picks it up (POSE_DATUM_PLAN 1b). The link may dangle
+        until insertion_gate captures the georef — that is fine."""
+        link = os.path.expanduser(rospy.get_param(
+            '~site_datum_link', '~/.vitulus/saves/site_datum.yaml'))
+        target = os.path.join(self.base_dir, site, 'datum.yaml')
+        try:
+            os.makedirs(os.path.dirname(link), exist_ok=True)
+            if os.path.islink(link) or os.path.exists(link):
+                os.remove(link)
+            os.symlink(target, link)
+            rospy.loginfo('mapping_manager: site datum link -> %s', target)
+        except OSError as e:
+            rospy.logwarn('mapping_manager: datum link failed: %s', e)
+
+    def cb_stop(self, _msg):
+        if not self.running():
+            rospy.loginfo('mapping_manager: nothing to stop')
+            return
+        self.stop_proc()
+
+    def stop_proc(self):
+        rospy.logwarn('mapping_manager: stopping %s (pid %s)',
+                      self.site, self.proc.pid)
+        # save the in-RAM octomap before killing the pipeline, so the next
+        # start of this site continues instead of losing the 3D archive
+        # (trajectory_dem saves its DEM on shutdown by itself)
+        try:
+            ot = os.path.join(self.base_dir, self.site, 'garden.ot')
+            subprocess.run(['rosrun', 'octomap_server', 'octomap_saver',
+                            '-f', ot, '__ns:=/mapping'],
+                           check=True, timeout=60,
+                           stdout=subprocess.DEVNULL,
+                           stderr=subprocess.STDOUT)
+            rospy.loginfo('mapping_manager: octomap saved to %s', ot)
+        except Exception as e:
+            rospy.logwarn('mapping_manager: octomap autosave failed: %s', e)
+        try:
+            # SIGINT to the whole roslaunch session for a clean node shutdown
+            os.killpg(os.getpgid(self.proc.pid), signal.SIGINT)
+            self.proc.wait(timeout=20)
+        except Exception:
+            try:
+                os.killpg(os.getpgid(self.proc.pid), signal.SIGKILL)
+            except Exception:
+                pass
+        stopped = self.site
+        self.proc = None
+        self.site = None
+        self.started_at = None
+        if stopped:
+            self.show_site(stopped)   # freshly saved data -> update previews
+
+    def cb_remove(self, msg):
+        site = msg.data.strip()
+        path = os.path.join(self.base_dir, site)
+        if not site or not os.path.isdir(path):
+            return
+        if self.running() and site == self.site:
+            rospy.logwarn('mapping_manager: refusing to remove running site %s',
+                          site)
+            return
+        shutil.rmtree(path)
+        rospy.logwarn('mapping_manager: removed site %s', site)
+        self.show_site('')
+
+    def shutdown(self):
+        if self.running():
+            self.stop_proc()
+
+    # ---- saved-map previews ---------------------------------------------------
+    def cb_show(self, msg):
+        self.show_site(msg.data.strip())
+
+    def _render_site(self, site):
+        """Returns (info, terrain_png_msg|None, raster_png_msg|None)."""
+        d = os.path.join(self.base_dir, site)
+        stamp = rospy.Time.now()
+        info = {'site': site, 'terrain': False, 'raster': None}
+        terrain_msg = raster_msg = None
+
+        dem_path = os.path.join(d, 'dem.npz')
+        if os.path.exists(dem_path):
+            dem = DemGrid.load_npz(dem_path)
+            bbox = dem.valid_bbox()
+            if bbox is not None:
+                x0, y0, x1, y1 = bbox
+                sl = (slice(x0, x1 + 1), slice(y0, y1 + 1))
+                png, zr = dem_to_png(dem.elev[sl], dem.source[sl])
+                terrain_msg = CompressedImage()
+                terrain_msg.header.stamp = stamp
+                terrain_msg.format = 'png'
+                terrain_msg.data = png
+                info['terrain'] = True
+                info['z_range'] = [round(z, 2) for z in zr] if zr else None
+                info['area_m2'] = dem.stats()['area_traj_m2']
+
+        rasters = os.path.join(d, 'rasters')
+        if os.path.isdir(rasters):
+            for name in sorted(os.listdir(rasters), reverse=True):
+                pgm = os.path.join(rasters, name, name + '.pgm')
+                if not os.path.exists(pgm):
+                    continue
+                gray = cv2.imread(pgm, cv2.IMREAD_GRAYSCALE)
+                if gray is None:
+                    continue
+                ok, buf = cv2.imencode('.png', gray)
+                if not ok:
+                    continue
+                raster_msg = CompressedImage()
+                raster_msg.header.stamp = stamp
+                raster_msg.format = 'png'
+                raster_msg.data = buf.tobytes()
+                info['raster'] = name
+                break
+        return info, terrain_msg, raster_msg
+
+    def show_site(self, site):
+        """Render previews of a SAVED site from disk and publish latched —
+        works with the pipeline stopped. With no site given, shows the
+        newest site that actually renders something."""
+        try:
+            if site:
+                candidates = [site]
+            else:
+                candidates = sorted(
+                    (n for n in os.listdir(self.base_dir)
+                     if os.path.isdir(os.path.join(self.base_dir, n))),
+                    key=lambda n: os.path.getmtime(
+                        os.path.join(self.base_dir, n)), reverse=True)
+            if not candidates:
+                self.pub_preview.publish(String(json.dumps(
+                    {'site': None, 'terrain': False, 'raster': None})))
+                return
+            chosen = None
+            for name in candidates:
+                info, t, r = self._render_site(name)
+                if t is not None or r is not None or name == candidates[-1]:
+                    chosen = (info, t, r)
+                    break
+            info, t, r = chosen
+            if t is not None:
+                self.pub_terrain.publish(t)
+            if r is not None:
+                self.pub_raster.publish(r)
+            self.pub_preview.publish(String(json.dumps(info)))
+            rospy.loginfo('mapping_manager: preview %s', json.dumps(info))
+        except Exception as e:
+            rospy.logwarn('mapping_manager: preview failed: %s', e)
+
+    # ---- site_map server (WP1, LOCALIZATION_V2_PLAN.md) ----------------------
+    def _newest_raster_in(self, site):
+        """Newest (by .pgm mtime) raster dir under <site>/rasters, or None."""
+        rasters = os.path.join(self.base_dir, site, 'rasters')
+        if not os.path.isdir(rasters):
+            return None
+        best_name, best_mtime = None, -1.0
+        for name in os.listdir(rasters):
+            pgm = os.path.join(rasters, name, name + '.pgm')
+            if not os.path.exists(pgm):
+                continue
+            mtime = os.path.getmtime(pgm)
+            if mtime > best_mtime:
+                best_name, best_mtime = name, mtime
+        return best_name
+
+    def _newest_site_with_raster(self):
+        """Newest site (by directory mtime) that has at least one raster."""
+        sites = sorted(
+            (n for n in os.listdir(self.base_dir)
+             if os.path.isdir(os.path.join(self.base_dir, n))),
+            key=lambda n: os.path.getmtime(os.path.join(self.base_dir, n)),
+            reverse=True)
+        for name in sites:
+            if self._newest_raster_in(name) is not None:
+                return name
+        return None
+
+    def cb_serve_site(self, msg):
+        """'' -> newest raster of newest site with any raster; '<site>' ->
+        newest raster of that site; '<site>/<raster>' -> that exact raster."""
+        payload = msg.data.strip()
+        try:
+            if not payload:
+                site = self._newest_site_with_raster()
+                if site is None:
+                    rospy.logwarn('mapping_manager: serve_site: no site has '
+                                  'a raster yet')
+                    return
+                raster = self._newest_raster_in(site)
+            elif '/' in payload:
+                site, raster = payload.split('/', 1)
+            else:
+                site = payload
+                raster = self._newest_raster_in(site)
+                if raster is None:
+                    rospy.logwarn('mapping_manager: serve_site: site %s has '
+                                  'no raster', site)
+                    return
+            self._publish_site_map(site, raster)
+        except Exception as e:
+            rospy.logerr('mapping_manager: serve_site %r failed: %s',
+                         payload, e)
+
+    def _publish_site_map(self, site, raster):
+        base = os.path.join(self.base_dir, site, 'rasters', raster, raster)
+        pgm_path = base + '.pgm'
+        if not os.path.exists(pgm_path):
+            rospy.logwarn('mapping_manager: serve_site: no such raster %s/%s',
+                          site, raster)
+            return
+        data, resolution, origin_xy = load_occupancy_pgm(base)
+        nx, ny = data.shape
+
+        grid = OccupancyGrid()
+        grid.header.stamp = rospy.Time.now()
+        grid.header.frame_id = self.map_frame
+        grid.info.resolution = resolution
+        grid.info.width = nx
+        grid.info.height = ny
+        grid.info.origin.position.x = origin_xy[0]
+        grid.info.origin.position.y = origin_xy[1]
+        grid.info.origin.orientation.w = 1.0
+        grid.data = data.T.ravel().tolist()   # row-major over y rows,
+                                               # matches band_projector
+        self.pub_site_map.publish(grid)
+
+        self.serving = {'site': site, 'raster': raster,
+                        'mtime': int(os.path.getmtime(pgm_path))}
+        rospy.loginfo('mapping_manager: site_map <- %s/%s (%dx%d @ %.3f m)',
+                      site, raster, nx, ny, resolution)
+
+    # ---- status --------------------------------------------------------------
+    def site_info(self, name):
+        d = os.path.join(self.base_dir, name)
+        info = {'name': name, 'dem_kb': 0, 'rasters': 0, 'has_ot': False,
+                'mtime': int(os.path.getmtime(d))}
+        dem = os.path.join(d, 'dem.npz')
+        if os.path.exists(dem):
+            info['dem_kb'] = os.path.getsize(dem) // 1024
+            try:
+                with np.load(dem) as f:
+                    src = f['source']
+                    res = float(f['res'])
+                    info['dem_m2'] = round(int((src != 0).sum()) * res * res, 1)
+            except Exception:
+                pass
+        rasters = os.path.join(d, 'rasters')
+        if os.path.isdir(rasters):
+            info['rasters'] = len(os.listdir(rasters))
+        info['has_ot'] = any(f.endswith('.ot') for f in os.listdir(d))
+        return info
+
+    def tick_status(self, _evt):
+        if self.proc is not None and self.proc.poll() is not None:
+            rospy.logwarn('mapping_manager: launch exited (code %s)',
+                          self.proc.returncode)
+            self.proc = None
+            self.site = None
+            self.started_at = None
+        sites = sorted(n for n in os.listdir(self.base_dir)
+                       if os.path.isdir(os.path.join(self.base_dir, n)))
+        status = {
+            'running': self.running(),
+            'site': self.site,
+            'uptime_s': int(time.time() - self.started_at)
+                        if self.started_at else 0,
+            'pid': self.proc.pid if self.running() else None,
+            'sites': [self.site_info(n) for n in sites],
+            'serving': self.serving,
+        }
+        self.pub_status.publish(String(json.dumps(status)))
+
+
+if __name__ == '__main__':
+    rospy.init_node('mapping_manager')
+    MappingManager()
+    rospy.spin()

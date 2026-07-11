@@ -1,0 +1,366 @@
+#!/usr/bin/env python3
+"""insertion_gate — gated insertion for mapping with known poses (Mapping v3,
+phase 0). Passes sensor clouds to octomap ONLY when the pose is trustworthy
+(RTK FIXED + accuracy + heading agreement + innovation gates); logs every
+decision. Runs alongside the existing stack, publishes nothing outside
+/mapping/*.
+
+Because the nav EKF does not estimate z (map-frame TF z stays ~0), passed
+clouds are re-parented to an alias TF frame ('<orig>_mapping') whose transform
+equals TF map->sensor with z corrected from navsat /odometry/gps altitude.
+octomap_server then raytraces from the true sensor origin and voxels get real
+absolute z, consistent with the trajectory DEM.
+
+Interfaces (all names relative to the node's namespace, /mapping by default):
+  in   ~cloud_topics        (default /ground_cloud, /obstacles_cloud)
+  in   /gnss/navpvt         ublox_msgs/NavPVT (RTK carrier solution, hAcc/vAcc)
+  in   /gnss_heading/nav_fused  sensor_msgs/Imu (dual-antenna heading)
+  in   /odometry/gps        nav_msgs/Odometry (navsat map-frame pose + altitude)
+  out  cloud_in             sensor_msgs/PointCloud2 (gated, alias frame)
+  out  gate                 std_msgs/Bool  (5 Hz, current decision)
+  out  gate_status          std_msgs/String (1 Hz latched JSON)
+  set  gate_mode            std_msgs/String ('rtk' | 'force_on' | 'off')
+  log  <output_dir>/logs/gate_YYYYmmdd_HHMMSS.csv (one row per cloud)
+
+Georef capture (POSE_DATUM_PLAN.md phase 1a, additive): once per session,
+after ~5 s of sustained RTK-grade quality, the UTM pose of the SITE (map)
+frame origin is computed from TF (utm->odom o inv(map->odom)) and stored to
+<output_dir>/datum.yaml (first time) + datum_session_*.yaml (every session,
+for drift tracking). Nothing consumes it yet — it is the foundation for
+persistent site georeferencing (phase 1b applies it to localization).
+"""
+
+import csv
+import json
+import math
+import os
+import threading
+import time
+
+import numpy as np
+import rospy
+import yaml
+import tf2_ros
+from geometry_msgs.msg import TransformStamped
+from nav_msgs.msg import Odometry
+from sensor_msgs.msg import Imu, PointCloud2
+from std_msgs.msg import Bool, String
+from tf.transformations import (euler_from_matrix, euler_from_quaternion,
+                                quaternion_matrix)
+from ublox_msgs.msg import NavPVT
+from vitulus_msgs.msg import Navi_transform
+
+from vitulus_mapping.gates import GateConfig, InsertionGate
+
+
+class InsertionGateNode:
+    def __init__(self):
+        self.map_frame = rospy.get_param('~map_frame', 'map')
+        self.base_frame = rospy.get_param('~base_frame', 'base_link')
+        self.cloud_topics = rospy.get_param(
+            '~cloud_topics', ['/ground_cloud', '/obstacles_cloud'])
+        self.max_rate_hz = float(rospy.get_param('~max_rate_hz', 3.0))
+        self.output_dir = os.path.expanduser(rospy.get_param(
+            '~output_dir', '~/.vitulus/mapping_v3/default'))
+
+        cfg = GateConfig(
+            mode=rospy.get_param('~mode', 'fused'),
+            max_hacc_mm=rospy.get_param('~max_hacc_mm', 50.0),
+            max_vacc_mm=rospy.get_param('~max_vacc_mm', 80.0),
+            max_gps_age_s=rospy.get_param('~max_gps_age_s', 1.5),
+            max_gps_odom_age_s=rospy.get_param('~max_gps_odom_age_s', 1.5),
+            max_heading_diff_deg=rospy.get_param('~max_heading_diff_deg', 8.0),
+            heading_offset_deg=rospy.get_param('~heading_offset_deg', 0.0),
+            max_heading_age_s=rospy.get_param('~max_heading_age_s', 1.5),
+            max_pose_age_s=rospy.get_param('~max_pose_age_s', 0.7),
+            max_speed_mps=rospy.get_param('~max_speed_mps', 1.0),
+            jump_margin_m=rospy.get_param('~jump_margin_m', 0.25),
+            jump_cooldown_s=rospy.get_param('~jump_cooldown_s', 5.0),
+            map_corr_xy_m=rospy.get_param('~map_corr_xy_m', 0.08),
+            map_corr_yaw_deg=rospy.get_param('~map_corr_yaw_deg', 2.0),
+        )
+        self.gate = InsertionGate(cfg)
+
+        self.tf_buf = tf2_ros.Buffer(rospy.Duration(10.0))
+        self.tf_listener = tf2_ros.TransformListener(self.tf_buf)
+        self.tf_bcast = tf2_ros.TransformBroadcaster()
+
+        self.pub_cloud = rospy.Publisher('cloud_in', PointCloud2, queue_size=2)
+        self.pub_gate = rospy.Publisher('gate', Bool, queue_size=1)
+        self.pub_status = rospy.Publisher('gate_status', String,
+                                          queue_size=1, latch=True)
+
+        self.counters = {t: {'in': 0, 'out': 0} for t in self.cloud_topics}
+        self.last_pub = {t: 0.0 for t in self.cloud_topics}
+        self.last_alias_stamp = {}
+        self.alias_lock = threading.Lock()   # cloud cbs run concurrently
+        self.last_passed = None
+        self.last_corrections = 0
+        # georef capture state (phase 1a)
+        self.georef_stable_s = float(rospy.get_param('~georef_stable_s', 5.0))
+        self._georef_good_since = None
+        self._georef_done = False
+        self._last_latlon = None
+        self._csv = None
+        self._csv_writer = None
+        self._open_csv()
+
+        rospy.Subscriber('/gnss/navpvt', NavPVT, self.cb_navpvt, queue_size=2)
+        rospy.Subscriber('/gnss_heading/navpvt', NavPVT,
+                         self.cb_heading_navpvt, queue_size=2)
+        rospy.Subscriber('/gnss_heading/nav_fused', Imu, self.cb_heading,
+                         queue_size=2)
+        rospy.Subscriber('/odometry/gps', Odometry, self.cb_gps_odom,
+                         queue_size=2)
+        rospy.Subscriber('/nav_tf/odom_status', Navi_transform,
+                         self.cb_pose_src, queue_size=1)
+        rospy.Subscriber('gate_mode', String, self.cb_mode, queue_size=1)
+        for topic in self.cloud_topics:
+            rospy.Subscriber(topic, PointCloud2, self.cb_cloud,
+                             callback_args=topic, queue_size=1,
+                             buff_size=2 ** 22)
+
+        rospy.Timer(rospy.Duration(0.2), self.tick_gate)
+        rospy.Timer(rospy.Duration(1.0), self.tick_status)
+        rospy.loginfo('insertion_gate up: mode=%s clouds=%s -> %s',
+                      cfg.mode, self.cloud_topics,
+                      rospy.resolve_name('cloud_in'))
+
+    # ---- sensor feeds -------------------------------------------------------
+    def cb_navpvt(self, msg):
+        self.gate.feed_navpvt(rospy.Time.now().to_sec(), msg.flags,
+                              msg.hAcc, msg.vAcc)
+        self._last_latlon = (msg.lat * 1e-7, msg.lon * 1e-7)
+
+    def cb_heading_navpvt(self, msg):
+        self.gate.feed_heading_navpvt(rospy.Time.now().to_sec(), msg.flags)
+
+    def cb_heading(self, msg):
+        q = msg.orientation
+        yaw = euler_from_quaternion([q.x, q.y, q.z, q.w])[2]
+        self.gate.feed_heading(msg.header.stamp.to_sec(), yaw)
+
+    def cb_gps_odom(self, msg):
+        p = msg.pose.pose.position
+        self.gate.feed_gps_odom(msg.header.stamp.to_sec(), p.x, p.y, p.z)
+
+    def cb_pose_src(self, msg):
+        self.gate.feed_pose_src(rospy.Time.now().to_sec(), msg.status)
+
+    def cb_mode(self, msg):
+        mode = msg.data.strip()
+        if mode not in ('fused', 'rtk', 'force_on', 'off'):
+            rospy.logwarn('insertion_gate: unknown mode %r', mode)
+            return
+        self.gate.cfg.mode = mode
+        rospy.logwarn('insertion_gate: mode -> %s', mode)
+
+    def sample_pose(self):
+        try:
+            tr = self.tf_buf.lookup_transform(self.map_frame, self.base_frame,
+                                              rospy.Time(0), rospy.Duration(0.05))
+        except (tf2_ros.LookupException, tf2_ros.ConnectivityException,
+                tf2_ros.ExtrapolationException):
+            return
+        t = tr.transform.translation
+        q = tr.transform.rotation
+        yaw = euler_from_quaternion([q.x, q.y, q.z, q.w])[2]
+        self.gate.feed_pose(tr.header.stamp.to_sec(), t.x, t.y, t.z, yaw)
+        try:
+            mo = self.tf_buf.lookup_transform(self.map_frame, 'odom',
+                                              rospy.Time(0),
+                                              rospy.Duration(0.05))
+        except (tf2_ros.LookupException, tf2_ros.ConnectivityException,
+                tf2_ros.ExtrapolationException):
+            return
+        mt = mo.transform.translation
+        mq = mo.transform.rotation
+        myaw = euler_from_quaternion([mq.x, mq.y, mq.z, mq.w])[2]
+        self.gate.feed_map_odom(rospy.Time.now().to_sec(), mt.x, mt.y, myaw)
+        if self.gate.corrections != self.last_corrections:
+            rospy.logwarn('insertion_gate: localization correction #%d '
+                          'detected (map->odom step) — insertion paused %.0fs',
+                          self.gate.corrections, self.gate.cfg.jump_cooldown_s)
+            self.last_corrections = self.gate.corrections
+
+    # ---- gate ticks ---------------------------------------------------------
+    def tick_gate(self, _evt):
+        self.sample_pose()
+        dec = self.gate.evaluate(rospy.Time.now().to_sec())
+        self.pub_gate.publish(Bool(dec.passed))
+        if dec.passed != self.last_passed:
+            (rospy.loginfo if dec.passed else rospy.logwarn)(
+                'insertion_gate: %s %s',
+                'OPEN' if dec.passed else 'CLOSED', dec.reasons)
+            self.last_passed = dec.passed
+        self._last_decision = dec
+
+    def tick_status(self, _evt):
+        dec = getattr(self, '_last_decision', None)
+        if dec is None:
+            return
+        status = {'pass': dec.passed, 'reasons': dec.reasons,
+                  'z_corr_m': round(self.gate.z_correction(), 3),
+                  'counters': self.counters}
+        status.update(dec.info)
+        self.pub_status.publish(String(json.dumps(status)))
+        self.try_capture_georef(dec)
+
+    # ---- site georeference capture (POSE_DATUM_PLAN phase 1a) ---------------
+    def try_capture_georef(self, dec):
+        if self._georef_done:
+            return
+        flags = dec.info.get('quality_flags', dec.reasons)
+        rtk_quality = (dec.passed or dec.info.get('mode') == 'fused') \
+            and not flags and dec.info.get('rtk_fixed')
+        now = time.monotonic()
+        if not rtk_quality:
+            self._georef_good_since = None
+            return
+        if self._georef_good_since is None:
+            self._georef_good_since = now
+            return
+        if now - self._georef_good_since < self.georef_stable_s:
+            return
+        try:
+            t_uo = self.tf_buf.lookup_transform('utm', 'odom', rospy.Time(0),
+                                                rospy.Duration(0.1))
+            t_mo = self.tf_buf.lookup_transform(self.map_frame, 'odom',
+                                                rospy.Time(0),
+                                                rospy.Duration(0.1))
+        except (tf2_ros.LookupException, tf2_ros.ConnectivityException,
+                tf2_ros.ExtrapolationException):
+            return                       # navsat/utm not up yet — keep waiting
+
+        def to_mat(tr):
+            q = tr.transform.rotation
+            t = tr.transform.translation
+            m = quaternion_matrix([q.x, q.y, q.z, q.w])
+            m[0:3, 3] = [t.x, t.y, t.z]
+            return m
+
+        # UTM pose of the site (map) frame origin: utm->map = utm->odom o inv(map->odom)
+        m_um = to_mat(t_uo) @ np.linalg.inv(to_mat(t_mo))
+        e, n, alt = m_um[0:3, 3]
+        yaw = euler_from_matrix(m_um)[2]
+        datum = {
+            'utm_e': float(round(e, 3)), 'utm_n': float(round(n, 3)),
+            'alt': float(round(alt, 3)),
+            'yaw_rad': float(round(yaw, 6)),
+            'z_corr_m': round(self.gate.z_correction(), 3),
+            'captured': time.strftime('%Y-%m-%d %H:%M:%S'),
+            'version': 1,
+        }
+        if self._last_latlon is not None:
+            datum['robot_lat'] = round(self._last_latlon[0], 8)
+            datum['robot_lon'] = round(self._last_latlon[1], 8)
+            try:
+                from pyproj import CRS, Transformer
+                zone = int((self._last_latlon[1] + 180) // 6) + 1
+                crs = CRS.from_dict({'proj': 'utm', 'zone': zone,
+                                     'ellps': 'WGS84'})
+                tr = Transformer.from_crs(crs, 'EPSG:4326', always_xy=True)
+                lon0, lat0 = tr.transform(e, n)
+                datum.update({'utm_zone': zone,
+                              'origin_lat': round(lat0, 8),
+                              'origin_lon': round(lon0, 8)})
+            except Exception:
+                pass
+
+        session_path = os.path.join(
+            self.output_dir, time.strftime('datum_session_%Y%m%d_%H%M%S.yaml'))
+        with open(session_path, 'w') as f:
+            yaml.safe_dump(datum, f, default_flow_style=False, sort_keys=False)
+        datum_path = os.path.join(self.output_dir, 'datum.yaml')
+        if not os.path.exists(datum_path):
+            with open(datum_path, 'w') as f:
+                yaml.safe_dump(datum, f, default_flow_style=False,
+                               sort_keys=False)
+            rospy.logwarn('insertion_gate: site georeference CAPTURED -> %s '
+                          '(utm %.2f, %.2f, alt %.2f, yaw %.2f deg)',
+                          datum_path, e, n, alt, math.degrees(yaw))
+        else:
+            rospy.loginfo('insertion_gate: session georef logged -> %s',
+                          session_path)
+        self._georef_done = True
+
+    # ---- cloud path ---------------------------------------------------------
+    def cb_cloud(self, msg, topic):
+        self.counters[topic]['in'] += 1
+        now = time.monotonic()
+        if now - self.last_pub[topic] < 1.0 / self.max_rate_hz:
+            return
+        dec = getattr(self, '_last_decision', None)
+        if dec is None:
+            return
+        self.log_decision(msg, topic, dec)
+        if not dec.passed:
+            return
+
+        alias = msg.header.frame_id + '_mapping'
+        with self.alias_lock:
+            need_tf = self.last_alias_stamp.get(alias) != msg.header.stamp.to_nsec()
+            if need_tf:
+                self.last_alias_stamp[alias] = msg.header.stamp.to_nsec()
+        if need_tf:
+            try:
+                tr = self.tf_buf.lookup_transform(
+                    self.map_frame, msg.header.frame_id,
+                    msg.header.stamp, rospy.Duration(0.2))
+            except (tf2_ros.LookupException, tf2_ros.ConnectivityException,
+                    tf2_ros.ExtrapolationException) as e:
+                rospy.logwarn_throttle(10.0, 'insertion_gate: TF for cloud '
+                                       'failed: %s', e)
+                return
+            out = TransformStamped()
+            out.header.stamp = msg.header.stamp
+            out.header.frame_id = self.map_frame
+            out.child_frame_id = alias
+            out.transform = tr.transform
+            out.transform.translation.z += self.gate.z_correction()
+            self.tf_bcast.sendTransform(out)
+
+        gated = PointCloud2()
+        gated.header.stamp = msg.header.stamp
+        gated.header.frame_id = alias
+        gated.height = msg.height
+        gated.width = msg.width
+        gated.fields = msg.fields
+        gated.is_bigendian = msg.is_bigendian
+        gated.point_step = msg.point_step
+        gated.row_step = msg.row_step
+        gated.data = msg.data
+        gated.is_dense = msg.is_dense
+        self.pub_cloud.publish(gated)
+        self.last_pub[topic] = now
+        self.counters[topic]['out'] += 1
+
+    # ---- logging ------------------------------------------------------------
+    def _open_csv(self):
+        logdir = os.path.join(self.output_dir, 'logs')
+        os.makedirs(logdir, exist_ok=True)
+        path = os.path.join(logdir, time.strftime('gate_%Y%m%d_%H%M%S.csv'))
+        self._csv = open(path, 'w', newline='')
+        self._csv_writer = csv.writer(self._csv)
+        self._csv_writer.writerow(
+            ['stamp', 'topic', 'pass', 'reasons', 'mode', 'pose_src',
+             'rtk_fixed', 'hacc_mm', 'vacc_mm', 'heading_diff_deg',
+             'z_source', 'z_corr_m', 'map_corrections'])
+        rospy.loginfo('insertion_gate: decision log %s', path)
+
+    def log_decision(self, msg, topic, dec):
+        i = dec.info
+        self._csv_writer.writerow(
+            [f'{msg.header.stamp.to_sec():.3f}', topic, int(dec.passed),
+             '|'.join(dec.reasons), i.get('mode', ''), i.get('pose_src', ''),
+             i.get('rtk_fixed', ''), i.get('hacc_mm', ''),
+             i.get('vacc_mm', ''), i.get('heading_diff_deg', ''),
+             i.get('z_source', ''), round(self.gate.z_correction(), 3),
+             i.get('map_corrections', 0)])
+        self._csv.flush()
+
+
+if __name__ == '__main__':
+    rospy.init_node('insertion_gate')
+    InsertionGateNode()
+    rospy.spin()

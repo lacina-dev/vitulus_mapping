@@ -1,0 +1,294 @@
+#!/usr/bin/env python3
+"""band_projector — regenerates the ground-relative 2D obstacle raster on
+demand (Mapping v3, phase 2): obstacle(x, y) = occupied-voxel evidence with
+z - DEM(x, y) in [0.10, 0.60] m above LOCAL ground.
+
+Pipeline per regeneration (all on a COPY of the canonical DEM):
+  1. ask trajectory_dem to save, then load dem.npz
+  2. percentile fill of DEM from octomap occupied columns (undriven areas)
+  3. slope-consistency filter of fills + bounded inpainting
+  4. band classification -> raster; publish + export map_server pgm/yaml
+
+Interfaces (relative to /mapping):
+  in   octomap_point_cloud_centers  sensor_msgs/PointCloud2 (from octomap_server)
+  trig regenerate          std_msgs/String ('' or raster name)
+  trig regenerate_srv      std_srvs/Trigger (returns stats JSON)
+  trig save                std_msgs/String — full snapshot: garden.ot (via
+                           octomap_saver) + dem.npz + fresh raster
+  trig compare             std_msgs/String — A/B stats vs /rtabmap/grid_map
+  out  obstacle_map        nav_msgs/OccupancyGrid (latched)
+  out  projector_status    std_msgs/String (latched JSON)
+"""
+
+import json
+import os
+import subprocess
+import threading
+import time
+
+import numpy as np
+import rospy
+from nav_msgs.msg import OccupancyGrid
+from sensor_msgs.msg import CompressedImage, PointCloud2
+from std_msgs.msg import String
+from std_srvs.srv import Empty, Trigger, TriggerResponse
+
+from vitulus_mapping.band import compare_rasters, project_band
+from vitulus_mapping.demgrid import DemGrid
+from vitulus_mapping.pgmio import save_occupancy_pgm
+from vitulus_mapping.preview import raster_to_png
+from vitulus_mapping.roscloud import pointcloud2_to_xyz
+
+
+class BandProjectorNode:
+    def __init__(self):
+        self.map_frame = rospy.get_param('~map_frame', 'map')
+        self.band_min = float(rospy.get_param('~band_min', 0.10))
+        self.band_max = float(rospy.get_param('~band_max', 0.60))
+        self.min_evidence = int(rospy.get_param('~min_evidence', 3))
+        self.min_cluster_cells = int(rospy.get_param('~min_cluster_cells', 3))
+        self.fill_percentile = float(rospy.get_param('~fill_percentile', 5.0))
+        self.fill_min_pts = int(rospy.get_param('~fill_min_pts', 3))
+        self.max_slope_deg = float(rospy.get_param('~max_slope_deg', 35.0))
+        self.inpaint_max_dist_m = float(rospy.get_param('~inpaint_max_dist_m', 0.5))
+        self.output_dir = os.path.expanduser(rospy.get_param(
+            '~output_dir', '~/.vitulus/mapping_v3/default'))
+        self.dem_path = os.path.join(self.output_dir, 'dem.npz')
+
+        self.centers_msg = None
+        self.last_raster = None      # (raster, dem_copy) for compare
+        self.busy = threading.Lock()
+
+        self.pub_map = rospy.Publisher('obstacle_map', OccupancyGrid,
+                                       queue_size=1, latch=True)
+        self.pub_png = rospy.Publisher('obstacle_map_png', CompressedImage,
+                                       queue_size=1, latch=True)
+        self.pub_status = rospy.Publisher('projector_status', String,
+                                          queue_size=1, latch=True)
+        self.pub_save_dem = rospy.Publisher('save_dem', String, queue_size=1)
+        self.last_state = {'state': 'idle'}
+
+        rospy.Subscriber('octomap_point_cloud_centers', PointCloud2,
+                         self.cb_centers, queue_size=1, buff_size=2 ** 26)
+        rospy.Subscriber('regenerate', String, self.cb_regenerate, queue_size=1)
+        rospy.Subscriber('save', String, self.cb_save, queue_size=1)
+        rospy.Subscriber('compare', String, self.cb_compare, queue_size=1)
+        rospy.Subscriber('clear', String, self.cb_clear, queue_size=1)
+        rospy.Service('regenerate_srv', Trigger, self.srv_regenerate)
+        rospy.Timer(rospy.Duration(2.0), self.tick_status)
+        auto_s = float(rospy.get_param('~auto_regen_period_s', 10.0))
+        if auto_s > 0:
+            rospy.Timer(rospy.Duration(auto_s), self.tick_auto_regen)
+        self.status('idle')
+        rospy.loginfo('band_projector up: band=[%.2f, %.2f] out=%s',
+                      self.band_min, self.band_max, self.output_dir)
+
+    def status(self, state, extra=None):
+        d = {'state': state}
+        if extra:
+            d.update(extra)
+        self.last_state = d
+        self.tick_status(None)
+
+    def tick_status(self, _evt):
+        d = dict(self.last_state)
+        c = self.centers_msg
+        d['octomap_points'] = c.width * c.height if c is not None else 0
+        self.pub_status.publish(String(json.dumps(d)))
+
+    def cb_centers(self, msg):
+        self.centers_msg = msg
+
+    # ---- triggers -----------------------------------------------------------
+    def cb_regenerate(self, msg):
+        threading.Thread(target=self.regenerate,
+                         args=(msg.data.strip() or None,), daemon=True).start()
+
+    def srv_regenerate(self, _req):
+        info = self.regenerate(None)
+        return TriggerResponse(success=info is not None,
+                               message=json.dumps(info or {}))
+
+    def cb_save(self, msg):
+        threading.Thread(target=self.full_save,
+                         args=(msg.data.strip() or None,), daemon=True).start()
+
+    def cb_compare(self, msg):
+        threading.Thread(target=self.compare, daemon=True).start()
+
+    def cb_clear(self, _msg):
+        """Reset the 3D evidence archive (after a localization correction
+        shifted previously inserted data). The DEM is kept — its running
+        mean re-converges; obstacles re-accumulate within seconds."""
+        def run():
+            try:
+                rospy.ServiceProxy('octomap_server/reset', Empty)()
+                self.centers_msg = None
+                rospy.logwarn('band_projector: octomap CLEARED on request')
+                self.status('cleared')
+                self.regenerate(write_files=False)
+            except Exception as e:
+                rospy.logerr('band_projector: clear failed: %s', e)
+                self.status('error', {'error': str(e)})
+        threading.Thread(target=run, daemon=True).start()
+
+    def tick_auto_regen(self, _evt):
+        """Live raster: regenerate periodically while data flows so the UI
+        3D view shows ground vs obstacles as mapping progresses. No disk
+        writes — snapshots stay manual."""
+        if self.centers_msg is None or self.busy.locked():
+            return
+        threading.Thread(target=self.regenerate,
+                         kwargs={'write_files': False}, daemon=True).start()
+
+    # ---- core ---------------------------------------------------------------
+    def load_dem(self):
+        """Ask the DEM node for a fresh save, then load it."""
+        self.pub_save_dem.publish(String(''))
+        time.sleep(2.0)
+        if not os.path.exists(self.dem_path):
+            rospy.logerr('band_projector: no DEM at %s', self.dem_path)
+            return None
+        return DemGrid.load_npz(self.dem_path)
+
+    def regenerate(self, name=None, write_files=True):
+        if not self.busy.acquire(blocking=False):
+            if write_files:
+                rospy.logwarn('band_projector: regeneration already running')
+            return None
+        try:
+            t0 = time.monotonic()
+            if write_files:
+                self.status('regenerating')
+            dem = self.load_dem()
+            if dem is None:
+                if write_files:
+                    self.status('error', {'error': 'no DEM'})
+                return None
+            centers = self.centers_msg
+            pts = (pointcloud2_to_xyz(centers)
+                   if centers is not None else np.empty((0, 3), np.float32))
+            if centers is None:
+                rospy.logwarn('band_projector: no octomap centers yet — '
+                              'raster from DEM only')
+
+            work = dem.copy()
+            filled = work.fill_from_columns(pts, self.fill_percentile,
+                                            self.fill_min_pts)
+            dropped = work.slope_filter_fills(self.max_slope_deg)
+            inpainted = work.inpaint(self.inpaint_max_dist_m)
+            raster, info = project_band(work, pts, self.band_min,
+                                        self.band_max, self.min_evidence,
+                                        self.min_cluster_cells)
+            info.update({'fill_cells': filled, 'fill_dropped_slope': dropped,
+                         'inpainted_cells': inpainted, 'points': len(pts),
+                         'took_s': round(time.monotonic() - t0, 1)})
+
+            stamp = rospy.Time.now()
+            self.publish_grid(raster, work, stamp)
+            self.publish_png(raster, stamp)
+            self.last_raster = (raster, work)
+
+            if write_files:
+                out_name = name or time.strftime('rastr_%Y%m%d_%H%M%S')
+                base = os.path.join(self.output_dir, 'rasters', out_name,
+                                    out_name)
+                save_occupancy_pgm(base, raster, work.res, (work.ox, work.oy))
+                with open(base + '_meta.json', 'w') as f:
+                    json.dump(info, f, indent=1)
+                rospy.loginfo('band_projector: %s -> %s',
+                              json.dumps(info), base)
+                self.status('done', info)
+            else:
+                self.status('live', info)
+            return info
+        except Exception as e:
+            rospy.logerr('band_projector: regeneration failed: %s', e)
+            self.status('error', {'error': str(e)})
+            return None
+        finally:
+            self.busy.release()
+
+    def publish_grid(self, raster, dem, stamp):
+        nx, ny = raster.shape
+        msg = OccupancyGrid()
+        msg.header.stamp = stamp
+        msg.header.frame_id = self.map_frame
+        msg.info.resolution = dem.res
+        msg.info.width = nx
+        msg.info.height = ny
+        msg.info.origin.position.x = dem.ox
+        msg.info.origin.position.y = dem.oy
+        msg.info.origin.orientation.w = 1.0
+        msg.data = raster.T.ravel().tolist()   # row-major over y rows
+        self.pub_map.publish(msg)
+
+    def publish_png(self, raster, stamp):
+        try:
+            png, _ = raster_to_png(raster)
+        except Exception as e:
+            rospy.logwarn('band_projector: png failed: %s', e)
+            return
+        img = CompressedImage()
+        img.header.stamp = stamp
+        img.format = 'png'
+        img.data = png
+        self.pub_png.publish(img)
+
+    def full_save(self, name=None):
+        """Snapshot: .ot archive + DEM + fresh raster into output_dir."""
+        ot_path = os.path.join(self.output_dir,
+                               (name or 'garden') + '.ot')
+        os.makedirs(self.output_dir, exist_ok=True)
+        ns = rospy.get_namespace().rstrip('/') or '/mapping'
+        cmd = ['rosrun', 'octomap_server', 'octomap_saver', '-f', ot_path,
+               '__ns:=' + ns]
+        try:
+            subprocess.run(cmd, check=True, timeout=120,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
+            rospy.loginfo('band_projector: octomap saved %s', ot_path)
+        except Exception as e:
+            rospy.logerr('band_projector: octomap_saver failed: %s', e)
+        self.regenerate(name)
+
+    def compare(self):
+        """A/B vs the current rtabmap occupancy grid, resampled onto ours."""
+        if self.last_raster is None:
+            rospy.logwarn('band_projector: regenerate first, then compare')
+            return
+        try:
+            ref = rospy.wait_for_message('/rtabmap/grid_map', OccupancyGrid,
+                                         timeout=5.0)
+        except rospy.ROSException:
+            rospy.logwarn('band_projector: /rtabmap/grid_map unavailable')
+            return
+        raster, dem = self.last_raster
+        nx, ny = raster.shape
+        xs = dem.ox + (np.arange(nx) + 0.5) * dem.res
+        ys = dem.oy + (np.arange(ny) + 0.5) * dem.res
+        gx, gy = np.meshgrid(xs, ys, indexing='ij')
+        rx = np.floor((gx - ref.info.origin.position.x)
+                      / ref.info.resolution).astype(np.int64)
+        ry = np.floor((gy - ref.info.origin.position.y)
+                      / ref.info.resolution).astype(np.int64)
+        ref_arr = np.array(ref.data, np.int8).reshape(ref.info.height,
+                                                      ref.info.width)
+        b = np.full((nx, ny), -1, np.int8)
+        ok = (rx >= 0) & (rx < ref.info.width) & (ry >= 0) & (ry < ref.info.height)
+        b[ok] = ref_arr[ry[ok], rx[ok]]
+        b[b >= 65] = 100
+        b[(b >= 0) & (b < 65)] = 0
+        stats = compare_rasters(raster, b)
+        path = os.path.join(self.output_dir,
+                            time.strftime('compare_%Y%m%d_%H%M%S.json'))
+        with open(path, 'w') as f:
+            json.dump(stats, f, indent=1)
+        rospy.loginfo('band_projector: A/B vs rtabmap: %s -> %s',
+                      json.dumps(stats), path)
+        self.status('compared', stats)
+
+
+if __name__ == '__main__':
+    rospy.init_node('band_projector')
+    BandProjectorNode()
+    rospy.spin()
