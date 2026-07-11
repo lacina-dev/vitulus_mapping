@@ -349,6 +349,13 @@ class MappingManager:
 
         self.serving = {'site': site, 'raster': raster,
                         'mtime': int(os.path.getmtime(pgm_path))}
+        # Keep the canonical site-datum symlink following the SERVED site, not
+        # just the last MAPPED one (2026-07-11 review). Previously link_site_datum
+        # ran only from start_proc (mapping), so serving site A's raster to gloc
+        # while the link still pointed at a previously-mapped site B left
+        # navi_transform's fallback datum offset from the served map (garden vs
+        # garden2 datums differ ~0.23 m / 0.9 deg). Serving now relinks too.
+        self.link_site_datum(site)
         rospy.loginfo('mapping_manager: site_map <- %s/%s (%dx%d @ %.3f m)',
                       site, raster, nx, ny, resolution)
 
