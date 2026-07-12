@@ -101,6 +101,22 @@ class InsertionGateNode:
         self._georef_good_since = None
         self._georef_done = False
         self._last_latlon = None
+        # --- continuous datum refinement (datumfix 2026-07-12) --------------
+        # The one-shot early capture bakes in the residual dock-departure error
+        # (pose just transitioned dock-DR -> GPS, before RTK settled). Measured
+        # ~0.11 m backward on 2026-07-12. FIX: keep sampling utm->map for the
+        # WHOLE session whenever the FULL localization is trustworthy (RTK FIXED
+        # + gps_good + probation_proven, read from /nav_tf/loc_status), keep a
+        # rolling buffer, and rewrite datum.yaml with a robust (median) estimate
+        # at session stop. The early datum.yaml is still written first (so a
+        # georef exists mid-session) but now also gated on probation_proven.
+        self._loc = {}                       # latest /nav_tf/loc_status dict
+        self._loc_t = 0.0
+        self._datum_samples = []             # [(e, n, alt, yaw, z_corr), ...]
+        self._datum_samples_max = int(rospy.get_param(
+            '~datum_samples_max', 3000))     # ~50 min @ 1 Hz
+        self._datum_lock = threading.Lock()
+        self._georef_stop_written = False
         self._csv = None
         self._csv_writer = None
         self._open_csv()
@@ -114,6 +130,8 @@ class InsertionGateNode:
                          queue_size=2)
         rospy.Subscriber('/nav_tf/odom_status', Navi_transform,
                          self.cb_pose_src, queue_size=1)
+        rospy.Subscriber('/nav_tf/loc_status', String, self.cb_loc_status,
+                         queue_size=1)
         rospy.Subscriber('gate_mode', String, self.cb_mode, queue_size=1)
         for topic in self.cloud_topics:
             rospy.Subscriber(topic, PointCloud2, self.cb_cloud,
@@ -146,6 +164,25 @@ class InsertionGateNode:
 
     def cb_pose_src(self, msg):
         self.gate.feed_pose_src(rospy.Time.now().to_sec(), msg.status)
+
+    def cb_loc_status(self, msg):
+        """navi_transform's authoritative localization health (JSON): owner,
+        gps_good, probation_proven, docked. Used to gate datum refinement on
+        the FULL arbiter state, not just raw RTK carrier quality."""
+        try:
+            self._loc = json.loads(msg.data)
+            self._loc_t = time.monotonic()
+        except (ValueError, TypeError):
+            pass
+
+    def _loc_trustworthy(self):
+        """True when navi_transform reports GPS ownership fully proven and
+        fresh — the precondition for capturing/refining the site datum."""
+        if not self._loc or (time.monotonic() - self._loc_t) > 3.0:
+            return False
+        return bool(self._loc.get('gps_good')
+                    and self._loc.get('probation_proven')
+                    and not self._loc.get('docked'))
 
     def cb_mode(self, msg):
         mode = msg.data.strip()
@@ -207,21 +244,9 @@ class InsertionGateNode:
         self.try_capture_georef(dec)
 
     # ---- site georeference capture (POSE_DATUM_PLAN phase 1a) ---------------
-    def try_capture_georef(self, dec):
-        if self._georef_done:
-            return
-        flags = dec.info.get('quality_flags', dec.reasons)
-        rtk_quality = (dec.passed or dec.info.get('mode') == 'fused') \
-            and not flags and dec.info.get('rtk_fixed')
-        now = time.monotonic()
-        if not rtk_quality:
-            self._georef_good_since = None
-            return
-        if self._georef_good_since is None:
-            self._georef_good_since = now
-            return
-        if now - self._georef_good_since < self.georef_stable_s:
-            return
+    def _sample_utm_map(self):
+        """Return (e, n, alt, yaw) of the site (map) frame origin in UTM, or
+        None if TF not ready. utm->map = utm->odom o inv(map->odom)."""
         try:
             t_uo = self.tf_buf.lookup_transform('utm', 'odom', rospy.Time(0),
                                                 rospy.Duration(0.1))
@@ -230,7 +255,7 @@ class InsertionGateNode:
                                                 rospy.Duration(0.1))
         except (tf2_ros.LookupException, tf2_ros.ConnectivityException,
                 tf2_ros.ExtrapolationException):
-            return                       # navsat/utm not up yet — keep waiting
+            return None                  # navsat/utm not up yet — keep waiting
 
         def to_mat(tr):
             q = tr.transform.rotation
@@ -239,17 +264,21 @@ class InsertionGateNode:
             m[0:3, 3] = [t.x, t.y, t.z]
             return m
 
-        # UTM pose of the site (map) frame origin: utm->map = utm->odom o inv(map->odom)
         m_um = to_mat(t_uo) @ np.linalg.inv(to_mat(t_mo))
         e, n, alt = m_um[0:3, 3]
         yaw = euler_from_matrix(m_um)[2]
+        return float(e), float(n), float(alt), float(yaw)
+
+    def _build_datum(self, e, n, alt, yaw, nsamples=1):
+        """Assemble a datum dict (with lat/lon back-projection) for writing."""
         datum = {
             'utm_e': float(round(e, 3)), 'utm_n': float(round(n, 3)),
             'alt': float(round(alt, 3)),
             'yaw_rad': float(round(yaw, 6)),
             'z_corr_m': round(self.gate.z_correction(), 3),
             'captured': time.strftime('%Y-%m-%d %H:%M:%S'),
-            'version': 1,
+            'n_samples': int(nsamples),
+            'version': 2,
         }
         if self._last_latlon is not None:
             datum['robot_lat'] = round(self._last_latlon[0], 8)
@@ -266,7 +295,55 @@ class InsertionGateNode:
                               'origin_lon': round(lon0, 8)})
             except Exception:
                 pass
+        return datum
 
+    def try_capture_georef(self, dec):
+        """Called at 1 Hz. Two jobs:
+          (1) continuously accumulate utm->map samples whenever navi_transform
+              reports GPS ownership fully proven (gps_good + probation_proven),
+              so the STOP path can write a robust median datum; and
+          (2) write the EARLY datum.yaml once (so a georef exists mid-session)
+              — now also gated on probation_proven, preventing the residual
+              dock-departure error from baking into even the first value.
+        """
+        now = time.monotonic()
+        # Trust the full arbiter (loc_status). Fall back to raw RTK-fixed
+        # quality only if loc_status is absent (older navi_transform).
+        if self._loc:
+            trustworthy = self._loc_trustworthy()
+        else:
+            flags = dec.info.get('quality_flags', dec.reasons)
+            trustworthy = (dec.passed or dec.info.get('mode') == 'fused') \
+                and not flags and bool(dec.info.get('rtk_fixed'))
+
+        if not trustworthy:
+            self._georef_good_since = None
+            return
+
+        sample = self._sample_utm_map()
+        if sample is None:
+            return                       # TF not ready — do not start the clock
+        e, n, alt, yaw = sample
+
+        # (1) accumulate for the robust stop-time estimate
+        with self._datum_lock:
+            self._datum_samples.append((e, n, alt, yaw,
+                                        self.gate.z_correction()))
+            if len(self._datum_samples) > self._datum_samples_max:
+                # keep the most recent window (settled localization)
+                self._datum_samples = \
+                    self._datum_samples[-self._datum_samples_max:]
+
+        # (2) early one-shot datum.yaml (still needed mid-session)
+        if self._georef_done:
+            return
+        if self._georef_good_since is None:
+            self._georef_good_since = now
+            return
+        if now - self._georef_good_since < self.georef_stable_s:
+            return
+
+        datum = self._build_datum(e, n, alt, yaw)
         session_path = os.path.join(
             self.output_dir, time.strftime('datum_session_%Y%m%d_%H%M%S.yaml'))
         with open(session_path, 'w') as f:
@@ -276,13 +353,77 @@ class InsertionGateNode:
             with open(datum_path, 'w') as f:
                 yaml.safe_dump(datum, f, default_flow_style=False,
                                sort_keys=False)
-            rospy.logwarn('insertion_gate: site georeference CAPTURED -> %s '
-                          '(utm %.2f, %.2f, alt %.2f, yaw %.2f deg)',
+            rospy.logwarn('insertion_gate: site georeference CAPTURED (early) '
+                          '-> %s (utm %.2f, %.2f, alt %.2f, yaw %.2f deg); '
+                          'will refine at session stop',
                           datum_path, e, n, alt, math.degrees(yaw))
         else:
             rospy.loginfo('insertion_gate: session georef logged -> %s',
                           session_path)
         self._georef_done = True
+
+    def finalize_georef(self):
+        """At session shutdown, rewrite datum.yaml with a ROBUST estimate
+        (median over all trustworthy samples collected during the drive),
+        correcting the early-capture dock-departure residual. Idempotent."""
+        if self._georef_stop_written:
+            return
+        with self._datum_lock:
+            samples = list(self._datum_samples)
+        if not samples:
+            rospy.logwarn('insertion_gate: finalize_georef: no trustworthy '
+                          'utm->map samples collected — leaving datum.yaml '
+                          '(early capture) unchanged')
+            return
+        self._georef_stop_written = True
+        arr = np.array([(e, n, alt, yaw) for (e, n, alt, yaw, _z) in samples],
+                       dtype=float)
+        # circular median for yaw (values cluster near 0; wrap-safe)
+        med = np.median(arr, axis=0)
+        e, n, alt = med[0], med[1], med[2]
+        yaws = arr[:, 3]
+        yaw = math.atan2(float(np.median(np.sin(yaws))),
+                         float(np.median(np.cos(yaws))))
+        datum = self._build_datum(e, n, alt, yaw, nsamples=len(samples))
+
+        datum_path = os.path.join(self.output_dir, 'datum.yaml')
+        old = None
+        try:
+            with open(datum_path) as f:
+                old = yaml.safe_load(f)
+        except Exception:
+            pass
+        with open(datum_path, 'w') as f:
+            yaml.safe_dump(datum, f, default_flow_style=False, sort_keys=False)
+        # also archive as the definitive session datum
+        final_path = os.path.join(
+            self.output_dir, time.strftime('datum_final_%Y%m%d_%H%M%S.yaml'))
+        with open(final_path, 'w') as f:
+            yaml.safe_dump(datum, f, default_flow_style=False, sort_keys=False)
+
+        if old and 'utm_e' in old:
+            de = e - float(old['utm_e'])
+            dn = n - float(old['utm_n'])
+            delta = math.hypot(de, dn)
+            rospy.logwarn('insertion_gate: site georeference REFINED at stop '
+                          '(%d samples): utm %.3f, %.3f (delta from early '
+                          '%.3f, %.3f | %.3f m), yaw %.3f deg -> %s',
+                          len(samples), e, n, de, dn, delta,
+                          math.degrees(yaw), datum_path)
+            # STEP 2d: the "docked" waypoint lives in the navi map pickle in
+            # MAP-frame coords under the OLD datum. After a meaningful datum
+            # shift, the GPS-world <-> map alignment moved; re-save "docked"
+            # once while docked + well-localized so the dock seed and RTK agree.
+            if delta > 0.05:
+                rospy.logwarn(
+                    'insertion_gate: datum moved %.3f m — recommend re-saving '
+                    'the "docked" waypoint once while docked & well-localized: '
+                    'rostopic pub -1 /navi_manager/save_waypoint std_msgs/String '
+                    '"data: \'docked\'"', delta)
+        else:
+            rospy.logwarn('insertion_gate: site georeference WRITTEN at stop '
+                          '(%d samples): utm %.3f, %.3f -> %s',
+                          len(samples), e, n, datum_path)
 
     # ---- cloud path ---------------------------------------------------------
     def cb_cloud(self, msg, topic):
@@ -362,5 +503,9 @@ class InsertionGateNode:
 
 if __name__ == '__main__':
     rospy.init_node('insertion_gate')
-    InsertionGateNode()
+    node = InsertionGateNode()
+    # Refine + rewrite datum.yaml with the robust median estimate when the
+    # mapping session stops (SIGINT from roslaunch / mapping_manager). This is
+    # the fix for the early-capture dock-departure error.
+    rospy.on_shutdown(node.finalize_georef)
     rospy.spin()

@@ -179,6 +179,16 @@ class MappingManager:
         self.started_at = None
         if stopped:
             self.show_site(stopped)   # freshly saved data -> update previews
+            # datumfix (2026-07-12): auto-serve the just-mapped site so its
+            # freshly-saved raster is latched on /mapping_manager/site_map (and
+            # the datum symlink relinked) immediately at stop — same as boot.
+            # Without this, serving stayed null until someone sent serve_site,
+            # leaving the localization/costmap chain on the bootstrap map.
+            if self._newest_raster_in(stopped) is not None:
+                raster = self._newest_raster_in(stopped)
+                rospy.loginfo('mapping_manager: auto-serving %s/%s after stop',
+                              stopped, raster)
+                self._publish_site_map(stopped, raster)
 
     def cb_remove(self, msg):
         site = msg.data.strip()
