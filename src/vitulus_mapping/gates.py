@@ -56,6 +56,17 @@ class GateConfig:
     jump_cooldown_s: float = 5.0
     map_corr_xy_m: float = 0.08       # map->odom step = localization correction
     map_corr_yaw_deg: float = 2.0
+    # Rate-based pause (sync fix 2026-07-12): a single map->odom step rarely
+    # exceeds map_corr_xy_m when the EDT tracker slews the correction gently at
+    # ~5 Hz in 2-11 cm bites, so the per-step watchdog above almost never
+    # fires — yet the CUMULATIVE shift over a cloud's TF-lookup window is large
+    # enough to smear inserted points into ghost obstacles. Pause insertion
+    # whenever the |map->odom| translation accumulated over the last
+    # map_corr_window_s exceeds max_maporr_rate_mps * window (i.e. the map
+    # frame is being actively corrected). GPS-owned stable driving (near-zero
+    # correction rate) passes; tracker-corrected blind passes pause.
+    max_maporr_rate_mps: float = 0.02  # 20 mm/s cumulative correction budget
+    map_corr_window_s: float = 1.0
     rtk_pose_src: str = 'SAT'         # rtk mode: required pose owner
                                       # (mapping must NOT ride on rtabmap poses)
     max_pose_src_age_s: float = 2.0
@@ -85,6 +96,10 @@ class InsertionGate:
         self._pose_src = None         # (t, status) from /nav_tf/odom_status
         self.corrections = 0          # localization corrections seen
         self._last_corr_m = 0.0
+        # sliding window of (t, step_m) map->odom translation deltas, for the
+        # cumulative correction-rate pause
+        self._corr_hist = []
+        self._corr_rate_mps = 0.0     # last computed windowed rate
 
     @property
     def mode(self):
@@ -136,6 +151,22 @@ class InsertionGate:
             self._last_corr_m = d
             self._cooldown_until = max(self._cooldown_until,
                                        t + self.cfg.jump_cooldown_s)
+        # cumulative correction-rate tracking: accumulate every step (however
+        # small) over a sliding window; the sum / window is the rate the
+        # evaluate() pause gates on. This catches the gentle multi-Hz tracker
+        # slew that never trips the per-step watchdog above.
+        self._corr_hist.append((t, d))
+        cutoff = t - self.cfg.map_corr_window_s
+        while self._corr_hist and self._corr_hist[0][0] < cutoff:
+            self._corr_hist.pop(0)
+        win = max(self.cfg.map_corr_window_s, 1e-3)
+        self._corr_rate_mps = sum(s for _tt, s in self._corr_hist) / win
+
+    def corr_rate_mps(self):
+        """Cumulative |map->odom| translation over the last map_corr_window_s,
+        expressed as m/s. Non-zero while localization is actively correcting
+        the map frame (tracker slew / RTK anchor pull-in)."""
+        return self._corr_rate_mps
 
     def feed_pose_src(self, t, status):
         """Who owns the map pose right now (navi_transform status: SAT =
@@ -257,6 +288,20 @@ class InsertionGate:
             info['last_jump_m'] = round(max(self._last_jump_m,
                                             self._last_corr_m), 2)
         info['map_corrections'] = self.corrections
+
+        # rate-based pause: don't map while the map frame is actively being
+        # corrected. Recompute the windowed rate against `now` so it decays to
+        # 0 once feed_map_odom stops delivering corrections (stale samples age
+        # out of the window even without a new feed).
+        cutoff = now - cfg.map_corr_window_s
+        while self._corr_hist and self._corr_hist[0][0] < cutoff:
+            self._corr_hist.pop(0)
+        win = max(cfg.map_corr_window_s, 1e-3)
+        rate = sum(s for _tt, s in self._corr_hist) / win
+        self._corr_rate_mps = rate
+        info['map_corr_rate_mmps'] = round(rate * 1000.0, 1)
+        if rate > cfg.max_maporr_rate_mps:
+            reasons.append('map_corr_rate')
 
         if mode == 'rtk':
             reasons.extend(rtk_reasons)

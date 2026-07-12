@@ -78,6 +78,8 @@ class InsertionGateNode:
             jump_cooldown_s=rospy.get_param('~jump_cooldown_s', 5.0),
             map_corr_xy_m=rospy.get_param('~map_corr_xy_m', 0.08),
             map_corr_yaw_deg=rospy.get_param('~map_corr_yaw_deg', 2.0),
+            max_maporr_rate_mps=rospy.get_param('~max_maporr_rate_mps', 0.02),
+            map_corr_window_s=rospy.get_param('~map_corr_window_s', 1.0),
         )
         self.gate = InsertionGate(cfg)
 
@@ -486,7 +488,7 @@ class InsertionGateNode:
         self._csv_writer.writerow(
             ['stamp', 'topic', 'pass', 'reasons', 'mode', 'pose_src',
              'rtk_fixed', 'hacc_mm', 'vacc_mm', 'heading_diff_deg',
-             'z_source', 'z_corr_m', 'map_corrections'])
+             'z_source', 'z_corr_m', 'map_corrections', 'map_corr_rate_mmps'])
         rospy.loginfo('insertion_gate: decision log %s', path)
 
     def log_decision(self, msg, topic, dec):
@@ -497,7 +499,7 @@ class InsertionGateNode:
              i.get('rtk_fixed', ''), i.get('hacc_mm', ''),
              i.get('vacc_mm', ''), i.get('heading_diff_deg', ''),
              i.get('z_source', ''), round(self.gate.z_correction(), 3),
-             i.get('map_corrections', 0)])
+             i.get('map_corrections', 0), i.get('map_corr_rate_mmps', '')])
         self._csv.flush()
 
 

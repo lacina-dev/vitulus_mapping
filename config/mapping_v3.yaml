@@ -31,6 +31,18 @@ insertion_gate:
   max_speed_mps: 1.0
   jump_margin_m: 0.25
   jump_cooldown_s: 5.0
+  # Rate-based pause (sync fix 2026-07-12). The per-step map->odom watchdog
+  # (jump_cooldown) only fires on a >8 cm single correction; the EDT tracker
+  # instead slews the map frame at ~5 Hz in 2-11 cm bites, so it slips under
+  # that threshold while cumulatively shifting the map enough to smear inserted
+  # clouds into ghost obstacles. This pauses insertion whenever the cumulative
+  # |map->odom| translation over map_corr_window_s exceeds max_maporr_rate_mps.
+  # HONEST TRADEOFF: GPS/RTK-owned stable driving (near-zero correction rate)
+  # keeps mapping; tracker-corrected / blind passes now pause and are NOT
+  # mapped. On the 2026-07-12 garden session only ~3% of inserts were RTK-owned
+  # and ~31% happened mid tracker-correction — those 31% were the ghost source.
+  max_maporr_rate_mps: 0.02          # 20 mm/s cumulative correction budget
+  map_corr_window_s: 1.0
 
 trajectory_dem:
   resolution: 0.05
