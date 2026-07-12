@@ -22,5 +22,6 @@
   <depend>vitulus_msgs</depend>
 
   <exec_depend>octomap_server</exec_depend>
+  <exec_depend>laser_geometry</exec_depend>
 
 </package>

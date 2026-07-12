@@ -70,6 +70,17 @@ class GateConfig:
     rtk_pose_src: str = 'SAT'         # rtk mode: required pose owner
                                       # (mapping must NOT ride on rtabmap poses)
     max_pose_src_age_s: float = 2.0
+    # z-correction mode (dataprep 2026-07-12). 'local' = use the CURRENT
+    # RTK-grade (gps.z - tf.z) at sample time, position-tied, frozen on
+    # outage — tracks real ground undulation as the robot drives. 'global' =
+    # the old single heavily-smoothed scalar for the whole site (fine only on
+    # near-flat ground). Default local.
+    z_corr_mode: str = 'local'
+    # per-source runtime range caps (item 3). Points beyond these (from the
+    # sensor origin) are dropped by the NODE before forwarding to octomap;
+    # the gate just carries the values for echo/persist.
+    lidar_max_range_m: float = 8.0
+    depth_max_range_m: float = 2.8
 
 
 @dataclass
@@ -189,10 +200,21 @@ class InsertionGate:
                 or vacc > self.cfg.max_vacc_mm):
             return
         new = z - self._pose[3]
-        if self._z_corr_t is None:
-            self._z_corr = new
+        if self.cfg.z_corr_mode == 'local':
+            # LOCAL: track the current ground offset at THIS position. A light
+            # EMA still removes per-fix cm jitter, but it is fast enough (0.6)
+            # to follow real slope as the robot drives, instead of averaging
+            # the whole site into one flat scalar. Frozen on outage (below).
+            if self._z_corr_t is None:
+                self._z_corr = new
+            else:
+                self._z_corr += 0.6 * (new - self._z_corr)
         else:
-            self._z_corr += 0.3 * (new - self._z_corr)   # smooth cm jitter
+            # GLOBAL (legacy): one slowly-smoothed scalar for the whole site.
+            if self._z_corr_t is None:
+                self._z_corr = new
+            else:
+                self._z_corr += 0.3 * (new - self._z_corr)
         self._z_corr_t = t
 
     # ---- helpers -----------------------------------------------------------
@@ -202,11 +224,21 @@ class InsertionGate:
         return self._z_corr
 
     # ---- decision ----------------------------------------------------------
-    def evaluate(self, now):
+    def evaluate(self, now, stamped_pose=None):
+        """Evaluate the insertion decision at time `now`.
+
+        stamped_pose (item 7, gate-at-cloud-stamp): when the caller has looked
+        up TF map->base_link at a SPECIFIC cloud timestamp, it passes that pose
+        as (t, x, y, z, yaw) and `now`=that stamp. The pose-quality blocking
+        gates (pose freshness, heading agreement) then judge the pose that
+        actually produced the cloud, not the latest 5 Hz tick — so a cloud
+        stamped mid-correction is rejected on ITS own pose, not a newer good
+        one. When None, the latest fed pose is used (5 Hz tick path)."""
         cfg = self.cfg
         mode = self.mode
         reasons = []
         info = {'mode': mode}
+        pose = stamped_pose if stamped_pose is not None else self._pose
 
         if mode == 'off':
             return GateDecision(False, ['mode_off'], info)
@@ -268,18 +300,18 @@ class InsertionGate:
             info['heading_age_s'] = round(age, 2)
             if age > cfg.max_heading_age_s:
                 rtk_reasons.append('heading_stale')
-            elif self._pose is not None:
+            elif pose is not None:
                 diff = wrap_angle(yaw + math.radians(cfg.heading_offset_deg)
-                                  - self._pose[4])
+                                  - pose[4])
                 info['heading_diff_deg'] = round(math.degrees(diff), 1)
                 if abs(math.degrees(diff)) > cfg.max_heading_diff_deg:
                     rtk_reasons.append('heading_diff')
 
         # ---- blocking gates -------------------------------------------------
-        if self._pose is None:
+        if pose is None:
             reasons.append('no_pose')
         else:
-            pose_age = now - self._pose[0]
+            pose_age = now - pose[0]
             info['pose_age_s'] = round(pose_age, 2)
             if pose_age > cfg.max_pose_age_s:
                 reasons.append('pose_stale')

@@ -42,8 +42,9 @@ import rospy
 import yaml
 import tf2_ros
 from geometry_msgs.msg import TransformStamped
+from laser_geometry import LaserProjection
 from nav_msgs.msg import Odometry
-from sensor_msgs.msg import Imu, PointCloud2
+from sensor_msgs.msg import Imu, LaserScan, PointCloud2, PointField
 from std_msgs.msg import Bool, String
 from tf.transformations import (euler_from_matrix, euler_from_quaternion,
                                 quaternion_matrix)
@@ -62,6 +63,17 @@ class InsertionGateNode:
         self.max_rate_hz = float(rospy.get_param('~max_rate_hz', 3.0))
         self.output_dir = os.path.expanduser(rospy.get_param(
             '~output_dir', '~/.vitulus/mapping_v3/default'))
+        # LIDAR source (item 2): the filtered rplidar scan (laser_filter_scan_
+        # rplidar output) gives sun-immune hard geometry at the scan height
+        # (~0.35 m, inside the 0.10-0.60 obstacle band). It is projected to
+        # PointCloud2 here (laser_geometry) and fed through the SAME gate.
+        self.lidar_scan_topic = rospy.get_param(
+            '~lidar_scan_topic', '/rplidar/scan_filtered')
+        self.lidar_enabled = bool(rospy.get_param('~lidar_enabled', True))
+        # which cloud_topics are DEPTH sources (get the depth range cap); the
+        # lidar cloud gets the lidar cap. Used only to pick the cap per source.
+        self._depth_topics = set(self.cloud_topics)
+        self._lidar_topic_name = self.lidar_scan_topic + '_cloud'
 
         cfg = GateConfig(
             mode=rospy.get_param('~mode', 'fused'),
@@ -80,8 +92,15 @@ class InsertionGateNode:
             map_corr_yaw_deg=rospy.get_param('~map_corr_yaw_deg', 2.0),
             max_maporr_rate_mps=rospy.get_param('~max_maporr_rate_mps', 0.02),
             map_corr_window_s=rospy.get_param('~map_corr_window_s', 1.0),
+            z_corr_mode=rospy.get_param('~z_corr_mode', 'local'),
+            lidar_max_range_m=float(rospy.get_param('~lidar_max_range_m', 8.0)),
+            depth_max_range_m=float(rospy.get_param('~depth_max_range_m', 2.8)),
         )
         self.gate = InsertionGate(cfg)
+        self.laser_proj = LaserProjection()
+        # runtime range caps persist per-site like band_overrides (item 3)
+        self.ranges_path = os.path.join(self.output_dir, 'range_overrides.json')
+        self._load_range_overrides()
 
         self.tf_buf = tf2_ros.Buffer(rospy.Duration(10.0))
         self.tf_listener = tf2_ros.TransformListener(self.tf_buf)
@@ -135,10 +154,20 @@ class InsertionGateNode:
         rospy.Subscriber('/nav_tf/loc_status', String, self.cb_loc_status,
                          queue_size=1)
         rospy.Subscriber('gate_mode', String, self.cb_mode, queue_size=1)
+        rospy.Subscriber('set_ranges', String, self.cb_set_ranges,
+                         queue_size=1)
         for topic in self.cloud_topics:
             rospy.Subscriber(topic, PointCloud2, self.cb_cloud,
                              callback_args=topic, queue_size=1,
                              buff_size=2 ** 22)
+        # LIDAR: project the filtered scan to a PointCloud2 and route it through
+        # the same cb_cloud gate under a synthetic topic name (so it gets its
+        # own in/out counters and the lidar range cap).
+        if self.lidar_enabled:
+            self.counters[self._lidar_topic_name] = {'in': 0, 'out': 0}
+            self.last_pub[self._lidar_topic_name] = 0.0
+            rospy.Subscriber(self.lidar_scan_topic, LaserScan, self.cb_scan,
+                             queue_size=1, buff_size=2 ** 20)
 
         rospy.Timer(rospy.Duration(0.2), self.tick_gate)
         rospy.Timer(rospy.Duration(1.0), self.tick_status)
@@ -194,6 +223,137 @@ class InsertionGateNode:
         self.gate.cfg.mode = mode
         rospy.logwarn('insertion_gate: mode -> %s', mode)
 
+    # ---- runtime range caps (item 3) ---------------------------------------
+    def _load_range_overrides(self):
+        """Load per-site lidar/depth range caps saved by a previous session,
+        so a tuned range survives restarts (mirrors band_overrides)."""
+        try:
+            if not os.path.exists(self.ranges_path):
+                return
+            with open(self.ranges_path) as f:
+                ov = json.load(f)
+            self._apply_ranges(ov, persist=False, log=False)
+            rospy.loginfo('insertion_gate: loaded per-site range overrides '
+                          'lidar=%.1f depth=%.1f from %s',
+                          self.gate.cfg.lidar_max_range_m,
+                          self.gate.cfg.depth_max_range_m, self.ranges_path)
+        except Exception as e:
+            rospy.logwarn('insertion_gate: could not load range overrides: %s',
+                          e)
+
+    def _save_range_overrides(self):
+        try:
+            os.makedirs(self.output_dir, exist_ok=True)
+            with open(self.ranges_path, 'w') as f:
+                json.dump({'lidar_max_m': self.gate.cfg.lidar_max_range_m,
+                           'depth_max_m': self.gate.cfg.depth_max_range_m},
+                          f, indent=1)
+        except Exception as e:
+            rospy.logwarn('insertion_gate: could not save range overrides: %s',
+                          e)
+
+    def _apply_ranges(self, req, persist=True, log=True):
+        """Validate + apply a partial {lidar_max_m?, depth_max_m?} dict.
+        Returns (applied_dict|None, error|None). Both caps in [0.5, 20] m."""
+        try:
+            lidar = float(req.get('lidar_max_m',
+                                  self.gate.cfg.lidar_max_range_m))
+            depth = float(req.get('depth_max_m',
+                                  self.gate.cfg.depth_max_range_m))
+        except (TypeError, ValueError) as e:
+            return None, 'non-numeric value: %s' % e
+        for name, v in (('lidar_max_m', lidar), ('depth_max_m', depth)):
+            if not (0.5 <= v <= 20.0):
+                return None, '%s out of range 0.5..20: %s' % (name, v)
+        self.gate.cfg.lidar_max_range_m = lidar
+        self.gate.cfg.depth_max_range_m = depth
+        applied = {'lidar_max_m': lidar, 'depth_max_m': depth}
+        if log:
+            rospy.loginfo('insertion_gate: range caps -> %s',
+                          json.dumps(applied))
+        if persist:
+            self._save_range_overrides()
+        return applied, None
+
+    def cb_set_ranges(self, msg):
+        try:
+            req = json.loads(msg.data) if msg.data.strip() else {}
+        except ValueError as e:
+            rospy.logwarn('insertion_gate: set_ranges bad JSON: %s', e)
+            return
+        if not isinstance(req, dict):
+            rospy.logwarn('insertion_gate: set_ranges payload not an object')
+            return
+        applied, err = self._apply_ranges(req)
+        if err:
+            rospy.logwarn('insertion_gate: set_ranges rejected: %s', err)
+        else:
+            self.tick_status(None)       # echo new caps immediately
+
+    # ---- lidar source (item 2) ---------------------------------------------
+    def cb_scan(self, msg):
+        """Project the filtered rplidar scan to a PointCloud2 (in the scan
+        frame) and route it through the SAME gate as the depth clouds. The
+        lidar range cap is applied at projection (range_cutoff), so far returns
+        never reach the point path."""
+        try:
+            cloud = self.laser_proj.projectLaser(
+                msg, range_cutoff=self.gate.cfg.lidar_max_range_m)
+        except Exception as e:
+            rospy.logwarn_throttle(10.0, 'insertion_gate: laser projection '
+                                   'failed: %s', e)
+            return
+        self.cb_cloud(cloud, self._lidar_topic_name)
+
+    # ---- per-source range cap (item 3) -------------------------------------
+    def _range_cap_for(self, topic):
+        if topic == self._lidar_topic_name:
+            return self.gate.cfg.lidar_max_range_m
+        return self.gate.cfg.depth_max_range_m
+
+    def _cap_cloud_range(self, msg, cap):
+        """Drop points farther than `cap` metres from the cloud's frame origin
+        (sensor origin), preserving ALL fields/point_step. Returns a new
+        PointCloud2 (unorganised) or the original if nothing to do / unable to
+        parse. laser_geometry already cut the lidar at range_cutoff, but depth
+        clouds are capped here."""
+        try:
+            if msg.is_bigendian or msg.point_step <= 0:
+                return msg
+            offs = {f.name: f.offset for f in msg.fields
+                    if f.name in ('x', 'y', 'z') and f.datatype == 7}
+            if len(offs) != 3:
+                return msg
+            n = msg.width * msg.height
+            if n == 0:
+                return msg
+            raw = np.frombuffer(msg.data, dtype=np.uint8,
+                                count=n * msg.point_step)
+            rows = raw.reshape(n, msg.point_step)
+            def comp(o):
+                return rows[:, o:o + 4].copy().view('<f4').reshape(-1)
+            x = comp(offs['x']); y = comp(offs['y']); z = comp(offs['z'])
+            r2 = x * x + y * y + z * z
+            keep = np.isfinite(r2) & (r2 <= cap * cap)
+            if keep.all():
+                return msg
+            kept = rows[keep]
+            out = PointCloud2()
+            out.header = msg.header
+            out.height = 1
+            out.width = int(kept.shape[0])
+            out.fields = msg.fields
+            out.is_bigendian = msg.is_bigendian
+            out.point_step = msg.point_step
+            out.row_step = msg.point_step * out.width
+            out.data = kept.tobytes()
+            out.is_dense = True
+            return out
+        except Exception as e:
+            rospy.logwarn_throttle(10.0, 'insertion_gate: range cap failed: %s',
+                                   e)
+            return msg
+
     def sample_pose(self):
         try:
             tr = self.tf_buf.lookup_transform(self.map_frame, self.base_frame,
@@ -240,6 +400,10 @@ class InsertionGateNode:
             return
         status = {'pass': dec.passed, 'reasons': dec.reasons,
                   'z_corr_m': round(self.gate.z_correction(), 3),
+                  'z_corr_mode': self.gate.cfg.z_corr_mode,
+                  'lidar_max_m': round(self.gate.cfg.lidar_max_range_m, 2),
+                  'depth_max_m': round(self.gate.cfg.depth_max_range_m, 2),
+                  'lidar_enabled': self.lidar_enabled,
                   'counters': self.counters}
         status.update(dec.info)
         self.pub_status.publish(String(json.dumps(status)))
@@ -428,17 +592,46 @@ class InsertionGateNode:
                           len(samples), e, n, datum_path)
 
     # ---- cloud path ---------------------------------------------------------
+    def _stamped_decision(self, stamp):
+        """Item 7 (gate-at-cloud-stamp): re-evaluate the gate against the pose
+        that TF held at THIS cloud's stamp, not the latest 5 Hz tick. Returns a
+        GateDecision, or None if TF at the stamp cannot be resolved (reject on
+        extrapolation)."""
+        tsec = stamp.to_sec()
+        try:
+            tr = self.tf_buf.lookup_transform(self.map_frame, self.base_frame,
+                                              stamp, rospy.Duration(0.05))
+        except (tf2_ros.LookupException, tf2_ros.ConnectivityException,
+                tf2_ros.ExtrapolationException):
+            return None                  # extrapolation / missing -> reject
+        t = tr.transform.translation
+        q = tr.transform.rotation
+        yaw = euler_from_quaternion([q.x, q.y, q.z, q.w])[2]
+        stamped_pose = (tr.header.stamp.to_sec(), t.x, t.y, t.z, yaw)
+        return self.gate.evaluate(tsec, stamped_pose=stamped_pose)
+
     def cb_cloud(self, msg, topic):
         self.counters[topic]['in'] += 1
         now = time.monotonic()
         if now - self.last_pub[topic] < 1.0 / self.max_rate_hz:
             return
-        dec = getattr(self, '_last_decision', None)
+        # Item 7: judge the pose that ACTUALLY produced this cloud (at
+        # msg.header.stamp), reusing the same decision machinery. Fall back to
+        # the latest tick decision only if the stamp is too old/new for TF (in
+        # which case the stamped lookup returns None -> reject).
+        dec = self._stamped_decision(msg.header.stamp)
         if dec is None:
-            return
+            tick = getattr(self, '_last_decision', None)
+            if tick is not None:
+                self.log_decision(msg, topic, tick)
+            return                       # reject on extrapolation
         self.log_decision(msg, topic, dec)
         if not dec.passed:
             return
+
+        # Item 3: per-source range cap before forwarding (lidar already cut at
+        # projection; depth clouds capped here).
+        msg = self._cap_cloud_range(msg, self._range_cap_for(topic))
 
         alias = msg.header.frame_id + '_mapping'
         with self.alias_lock:

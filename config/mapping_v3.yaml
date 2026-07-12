@@ -4,14 +4,28 @@
 octomap_server:
   frame_id: map
   base_frame_id: base_link
+  # Resolution (dataprep 2026-07-12): KEPT at 0.05 m for continuity with the
+  # existing 'garden' site (its garden.ot / rasters are 0.05 m; changing this
+  # here would orphan them). RECOMMENDATION for a NEW large site: 0.10 m — a
+  # hectare at 0.05 m is heavy (RAM + publish cost) and 0.10 m is plenty for
+  # the ground-relative obstacle band. Prefer a per-launch arg override for a
+  # new site over editing this line, so 'garden' stays at 0.05.
   resolution: 0.05
-  sensor_model/max_range: 4.0        # D435 trustworthy outdoor range
-  sensor_model/hit: 0.7
-  sensor_model/miss: 0.4
-  sensor_model/min: 0.12
-  sensor_model/max: 0.97
+  # Raytrace horizon. Must cover the LIDAR cap (8 m) now that /scan feeds the
+  # map (item 2); the D435 depth cap (2.8 m) is enforced upstream in the gate.
+  sensor_model/max_range: 8.0        # was 4.0 (D435-only); now covers lidar
+  sensor_model/hit: 0.7              # occupied evidence per hit
+  sensor_model/miss: 0.4             # free evidence per miss
+  sensor_model/min: 0.12             # clamp: min node occupancy prob
+  sensor_model/max: 0.97             # clamp: max node occupancy prob
+  # Vertical acceptance window for INSERTED points, in the map z frame. The
+  # gate re-parents clouds to an alias TF carrying real absolute z (navsat
+  # altitude), so map z ~ ground level; -1.0..+2.0 rejects gross z outliers
+  # (sky ghosts, sub-ground disparity errors) while keeping the sensing column.
+  pointcloud_min_z: -1.0
+  pointcloud_max_z: 2.0
   filter_ground: false               # ground stays in the 3D evidence archive
-  filter_speckles: true
+  filter_speckles: true              # drop isolated single-voxel speckles
   latch: false                       # hectare maps: no latched full publishes
   compress_map: true
 
@@ -19,7 +33,22 @@ insertion_gate:
   mode: fused                        # fused (map from the fused pose, default)
                                      # | rtk (strict RTK-only) | off
   cloud_topics: ['/ground_cloud', '/obstacles_cloud']
-  max_rate_hz: 3.0                   # insertion is single-thread: throttle
+  # dataprep 2026-07-12: raised 3->8 Hz. Adding the lidar source (item 2) plus
+  # the per-source range caps (item 3, which shrink the depth clouds) means the
+  # per-cloud publish cost dropped, so a higher insertion rate is affordable and
+  # gives denser evidence per driven metre.
+  max_rate_hz: 8.0                   # per-source throttle (was 3.0)
+  # LIDAR source (item 2): the filtered rplidar scan is projected to a cloud
+  # and fed through the same gate. Sun-immune hard geometry at ~0.35 m height.
+  lidar_scan_topic: '/rplidar/scan_filtered'
+  lidar_enabled: true
+  # z-correction (item 6): 'local' = position-tied current RTK ground offset
+  # (follows real slope, frozen on outage); 'global' = one smoothed site scalar.
+  z_corr_mode: local
+  # per-source range caps (item 3), runtime-settable via /mapping/set_ranges
+  # {lidar_max_m?, depth_max_m?} (0.5..20 m), persisted per-site.
+  lidar_max_range_m: 8.0             # lidar cut at projection (range_cutoff)
+  depth_max_range_m: 2.8            # D435 depth points beyond this are dropped
   max_hacc_mm: 50.0
   max_vacc_mm: 80.0
   max_gps_age_s: 1.5
