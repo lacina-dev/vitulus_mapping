@@ -110,6 +110,24 @@ band_projector:
   # still culls sparse lidar speckle (a wall is a big contiguous cluster), so
   # this recovers garage walls/fences without admitting noise.
   borrowed_min_evidence: 2
+  # REPORT 1 fix (freeserve 2026-07-12): after the DEM tightening (fill_percentile
+  # 1.5 + coherence guard + fill_min_pts 6) the real-ground columns shrank to
+  # ~the driven trajectory, so FREE (painted only on real-ground cells) collapsed
+  # to a thin ribbon even though the robot drove a real area. Extend the same
+  # ground-borrow used for obstacles to FREE: a cell within free_ground_radius_m
+  # of a real-ground cell (traj/percentile-fill, never inpaint) and with NO
+  # obstacle evidence is marked FREE (driveable surroundings). Honesty preserved
+  # by the EDT: FREE never spreads beyond this radius of a genuine measurement.
+  # NOTE on octomap free-voxels (REPORT 1 part b): octomap_server does NOT cheaply
+  # expose free voxels here — the node publishes occupied centres
+  # (octomap_point_cloud_centers) + a 2D projected_map; a full free-voxel stream
+  # would need octomap_server's ~occupied/free markers or a raytrace we do not
+  # subscribe to. The lidar-raycast-free proxy (free along scan rays at scan
+  # height) is doable only in insertion_gate from the raw cloud and is materially
+  # more complex. Decision: ship the ground-borrow (a) first and measure; only
+  # add a free-voxel source if borrow coverage proves insufficient.
+  free_via_borrowed_ground: true
+  free_ground_radius_m: 1.0          # 0 or false => strict real-ground-only FREE
   fill_percentile: 1.5               # low envelope of octree column z; lower =
                                      # more resistant to tall grass reading as
                                      # ground (audit 2026-07-12, was 5.0)

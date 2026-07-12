@@ -64,6 +64,22 @@ class MappingManager:
         self.map_frame = rospy.get_param('~map_frame', 'map')
         self.serving = None    # {'site', 'raster', 'mtime'} of the last
                                 # successfully published site_map, or None
+        self.serve_error = None  # last serve_site rejection reason (str) for
+                                 # the UI; cleared on the next successful serve
+        # REPORT 2 (freeserve 2026-07-12): every stopped mapping session should be
+        # immediately servable. stop_proc used to autosave ONLY the octomap (.ot),
+        # never a raster, so a just-mapped site had has_ot=true / rasters=0 and
+        # serve_site rejected it (serving fell back to the previously-served site
+        # — the reported "cannot switch to novamapa"). With raster_on_stop, stop
+        # asks band_projector to snapshot a raster (final_<timestamp>) BEFORE the
+        # pipeline is killed, so the just-mapped site is servable + auto-served.
+        self.raster_on_stop = bool(rospy.get_param('~raster_on_stop', True))
+        # how long to wait for band_projector's snapshot before killing the
+        # pipeline (regenerate loads DEM with a 2 s settle + rasters a hectare)
+        self.raster_on_stop_timeout_s = float(
+            rospy.get_param('~raster_on_stop_timeout_s', 25.0))
+        self.pub_mapping_save = rospy.Publisher('/mapping/save', String,
+                                                queue_size=1)
 
         self.pub_status = rospy.Publisher('/mapping_manager/status', String,
                                           queue_size=1, latch=True)
@@ -185,9 +201,42 @@ class MappingManager:
             return
         self.stop_proc()
 
+    def _snapshot_raster_on_stop(self, site):
+        """Ask band_projector for a full raster snapshot (final_<timestamp>)
+        while the pipeline is still alive, and wait for the raster dir to
+        appear. Returns the raster name on success, else None. This is what
+        makes every stopped session immediately servable (REPORT 2)."""
+        raster = time.strftime('final_%Y%m%d_%H%M%S')
+        rasters_dir = os.path.join(self.base_dir, site, 'rasters', raster)
+        pgm = os.path.join(rasters_dir, raster + '.pgm')
+        rospy.loginfo('mapping_manager: raster_on_stop — snapshotting %s/%s',
+                      site, raster)
+        # band_projector.cb_save -> full_save(name): octomap_saver + regenerate
+        # (writes the .ot AND the raster). The pipeline is still running here.
+        self.pub_mapping_save.publish(String(raster))
+        deadline = time.time() + self.raster_on_stop_timeout_s
+        while time.time() < deadline:
+            if os.path.exists(pgm):
+                rospy.loginfo('mapping_manager: raster_on_stop wrote %s', pgm)
+                return raster
+            time.sleep(0.5)
+        rospy.logwarn('mapping_manager: raster_on_stop timed out (%ss) — no '
+                      'raster for %s; falling back to octomap-only save',
+                      self.raster_on_stop_timeout_s, site)
+        return None
+
     def stop_proc(self):
         rospy.logwarn('mapping_manager: stopping %s (pid %s)',
                       self.site, self.proc.pid)
+        # REPORT 2: snapshot a raster BEFORE tearing the pipeline down, so the
+        # just-mapped session is immediately servable (and auto-served below).
+        # full_save also writes the .ot, so the octomap-only save that follows
+        # is redundant on success but kept as a cheap fallback.
+        if self.raster_on_stop:
+            try:
+                self._snapshot_raster_on_stop(self.site)
+            except Exception as e:
+                rospy.logwarn('mapping_manager: raster_on_stop failed: %s', e)
         # save the in-RAM octomap before killing the pipeline, so the next
         # start of this site continues instead of losing the 3D archive
         # (trajectory_dem saves its DEM on shutdown by itself)
@@ -390,8 +439,8 @@ class MappingManager:
             if not payload:
                 site = self._newest_site_with_raster()
                 if site is None:
-                    rospy.logwarn('mapping_manager: serve_site: no site has '
-                                  'a raster yet')
+                    self._serve_reject('no site has a raster yet — Snapshot '
+                                       'or Stop a mapping session first')
                     return
                 raster = self._newest_raster_in(site)
             elif '/' in payload:
@@ -400,13 +449,33 @@ class MappingManager:
                 site = payload
                 raster = self._newest_raster_in(site)
                 if raster is None:
-                    rospy.logwarn('mapping_manager: serve_site: site %s has '
-                                  'no raster', site)
+                    # REPORT 2(b): the common failure — site mapped (.ot) but
+                    # never snapshotted, so it has no raster. Tell the UI WHY
+                    # instead of a silent logwarn.
+                    has_ot = os.path.exists(
+                        os.path.join(self.base_dir, site, 'garden.ot'))
+                    if has_ot:
+                        self._serve_reject(
+                            'site "%s" has no raster — press Snapshot while '
+                            'mapping, or it is written automatically on Stop'
+                            % site)
+                    else:
+                        self._serve_reject('site "%s" has no raster (and no '
+                                           '3D map)' % site)
                     return
             self._publish_site_map(site, raster)
         except Exception as e:
             rospy.logerr('mapping_manager: serve_site %r failed: %s',
                          payload, e)
+            self._serve_reject('serve of %r failed: %s' % (payload, e))
+
+    def _serve_reject(self, reason):
+        """Record a serve_site rejection reason for the UI and log it. The
+        reason is published in the status JSON (serve_error) and shown by
+        mapping.js; it is cleared on the next successful serve."""
+        self.serve_error = reason
+        rospy.logwarn('mapping_manager: serve_site rejected: %s', reason)
+        self.tick_status(None)   # push the reason to the UI immediately
 
     # ---- last-served persistence (bootfix2) ---------------------------------
     def _last_served_path(self):
@@ -510,6 +579,7 @@ class MappingManager:
 
         self.serving = {'site': site, 'raster': raster,
                         'mtime': int(os.path.getmtime(pgm_path))}
+        self.serve_error = None   # a successful serve clears any prior rejection
         self.save_last_served(site, raster)
         # Keep the canonical site-datum symlink following the SERVED site, not
         # just the last MAPPED one (2026-07-11 review). Previously link_site_datum
@@ -559,6 +629,7 @@ class MappingManager:
             'pid': self.proc.pid if self.running() else None,
             'sites': [self.site_info(n) for n in sites],
             'serving': self.serving,
+            'serve_error': self.serve_error,
         }
         self.pub_status.publish(String(json.dumps(status)))
 

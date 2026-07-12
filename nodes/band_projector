@@ -74,6 +74,14 @@ class BandProjectorNode:
         # (2D-lidar-only) cells; the thin lidar plane gives ~1-2 voxels/cell.
         self.borrowed_min_evidence = int(
             rospy.get_param('~borrowed_min_evidence', 2))
+        # REPORT 1 (freeserve 2026-07-12): extend the ground-borrow to FREE, so
+        # driveable surroundings of the driven ribbon are FREE, not UNKNOWN,
+        # after the DEM tightening. free_ground_radius_m defaults to
+        # ground_ref_radius_m (kept in sync unless overridden separately).
+        self.free_via_borrowed_ground = bool(
+            rospy.get_param('~free_via_borrowed_ground', True))
+        self.free_ground_radius_m = float(
+            rospy.get_param('~free_ground_radius_m', self.ground_ref_radius_m))
         self.fill_percentile = float(rospy.get_param('~fill_percentile', 1.5))
         self.fill_min_pts = int(rospy.get_param('~fill_min_pts', 6))
         self.max_slope_deg = float(rospy.get_param('~max_slope_deg', 35.0))
@@ -134,6 +142,8 @@ class BandProjectorNode:
         d['min_cluster_cells'] = self.min_cluster_cells
         d['ground_ref_radius_m'] = round(self.ground_ref_radius_m, 2)
         d['borrowed_min_evidence'] = self.borrowed_min_evidence
+        d['free_via_borrowed_ground'] = self.free_via_borrowed_ground
+        d['free_ground_radius_m'] = round(self.free_ground_radius_m, 2)
         self.pub_status.publish(String(json.dumps(d)))
 
     # ---- classifier settings (live tuning) ----------------------------------
@@ -162,7 +172,10 @@ class BandProjectorNode:
                            'min_evidence': self.min_evidence,
                            'min_cluster_cells': self.min_cluster_cells,
                            'ground_ref_radius_m': self.ground_ref_radius_m,
-                           'borrowed_min_evidence': self.borrowed_min_evidence},
+                           'borrowed_min_evidence': self.borrowed_min_evidence,
+                           'free_via_borrowed_ground':
+                               self.free_via_borrowed_ground,
+                           'free_ground_radius_m': self.free_ground_radius_m},
                           f, indent=1)
         except Exception as e:
             rospy.logwarn('band_projector: could not save band overrides: %s', e)
@@ -181,6 +194,10 @@ class BandProjectorNode:
                                        self.ground_ref_radius_m))
             borrowed_ev = int(req.get('borrowed_min_evidence',
                                       self.borrowed_min_evidence))
+            free_borrow = bool(req.get('free_via_borrowed_ground',
+                                       self.free_via_borrowed_ground))
+            free_radius = float(req.get('free_ground_radius_m',
+                                        self.free_ground_radius_m))
         except (TypeError, ValueError) as e:
             return None, 'non-numeric value: %s' % e
         if not (0.0 <= band_min < band_max <= 2.0):
@@ -197,17 +214,24 @@ class BandProjectorNode:
         if not (1 <= borrowed_ev <= 20):
             return None, ('borrowed_min_evidence out of range 1..20: %s'
                           % borrowed_ev)
+        if not (0.0 <= free_radius <= 5.0):
+            return None, ('free_ground_radius_m out of range 0..5: %s'
+                          % free_radius)
         self.band_min = band_min
         self.band_max = band_max
         self.min_evidence = min_evidence
         self.min_cluster_cells = min_cluster
         self.ground_ref_radius_m = ground_ref
         self.borrowed_min_evidence = borrowed_ev
+        self.free_via_borrowed_ground = free_borrow
+        self.free_ground_radius_m = free_radius
         applied = {'band_min': band_min, 'band_max': band_max,
                    'min_evidence': min_evidence,
                    'min_cluster_cells': min_cluster,
                    'ground_ref_radius_m': ground_ref,
-                   'borrowed_min_evidence': borrowed_ev}
+                   'borrowed_min_evidence': borrowed_ev,
+                   'free_via_borrowed_ground': free_borrow,
+                   'free_ground_radius_m': free_radius}
         if log:
             rospy.loginfo('band_projector: classifier settings -> %s',
                           json.dumps(applied))
@@ -330,7 +354,9 @@ class BandProjectorNode:
                                         self.band_max, self.min_evidence,
                                         self.min_cluster_cells,
                                         self.ground_ref_radius_m,
-                                        self.borrowed_min_evidence)
+                                        self.borrowed_min_evidence,
+                                        self.free_via_borrowed_ground,
+                                        self.free_ground_radius_m)
             info.update({'fill_cells': filled, 'fill_dropped_slope': dropped,
                          'inpainted_cells': inpainted, 'points': len(pts),
                          'took_s': round(time.monotonic() - t0, 1)})
