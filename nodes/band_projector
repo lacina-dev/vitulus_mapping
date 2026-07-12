@@ -12,6 +12,9 @@ Pipeline per regeneration (all on a COPY of the canonical DEM):
 Interfaces (relative to /mapping):
   in   octomap_point_cloud_centers  sensor_msgs/PointCloud2 (from octomap_server)
   trig regenerate          std_msgs/String ('' or raster name)
+  trig set_band            std_msgs/String JSON {band_min?, band_max?,
+                           min_evidence?, min_cluster_cells?} — live classifier
+                           tuning; validated, persisted per-site, auto-regen
   trig regenerate_srv      std_srvs/Trigger (returns stats JSON)
   trig save                std_msgs/String — full snapshot: garden.ot (via
                            octomap_saver) + dem.npz + fresh raster
@@ -54,6 +57,10 @@ class BandProjectorNode:
         self.output_dir = os.path.expanduser(rospy.get_param(
             '~output_dir', '~/.vitulus/mapping_v3/default'))
         self.dem_path = os.path.join(self.output_dir, 'dem.npz')
+        self.overrides_path = os.path.join(self.output_dir,
+                                           'band_overrides.json')
+        # per-site classifier overrides persist across sessions for this site
+        self.load_band_overrides()
 
         self.centers_msg = None
         self.last_raster = None      # (raster, dem_copy) for compare
@@ -71,6 +78,7 @@ class BandProjectorNode:
         rospy.Subscriber('octomap_point_cloud_centers', PointCloud2,
                          self.cb_centers, queue_size=1, buff_size=2 ** 26)
         rospy.Subscriber('regenerate', String, self.cb_regenerate, queue_size=1)
+        rospy.Subscriber('set_band', String, self.cb_set_band, queue_size=1)
         rospy.Subscriber('save', String, self.cb_save, queue_size=1)
         rospy.Subscriber('compare', String, self.cb_compare, queue_size=1)
         rospy.Subscriber('clear', String, self.cb_clear, queue_size=1)
@@ -94,7 +102,100 @@ class BandProjectorNode:
         d = dict(self.last_state)
         c = self.centers_msg
         d['octomap_points'] = c.width * c.height if c is not None else 0
+        # always advertise the live classifier settings so the UI can prefill
+        # its controls and show the currently-applied values
+        d['band_min'] = round(self.band_min, 3)
+        d['band_max'] = round(self.band_max, 3)
+        d['min_evidence'] = self.min_evidence
+        d['min_cluster_cells'] = self.min_cluster_cells
         self.pub_status.publish(String(json.dumps(d)))
+
+    # ---- classifier settings (live tuning) ----------------------------------
+    def load_band_overrides(self):
+        """Load per-site classifier overrides saved by a previous session for
+        this site, so the obstacle band the user tuned survives restarts."""
+        try:
+            if not os.path.exists(self.overrides_path):
+                return
+            with open(self.overrides_path) as f:
+                ov = json.load(f)
+            ok, _err = self.apply_band_settings(ov, persist=False,
+                                                 regen=False, log=False)
+            if ok:
+                rospy.loginfo('band_projector: loaded per-site band overrides '
+                              '%s from %s', json.dumps(ok), self.overrides_path)
+        except Exception as e:
+            rospy.logwarn('band_projector: could not load band overrides: %s', e)
+
+    def save_band_overrides(self):
+        try:
+            os.makedirs(self.output_dir, exist_ok=True)
+            with open(self.overrides_path, 'w') as f:
+                json.dump({'band_min': self.band_min,
+                           'band_max': self.band_max,
+                           'min_evidence': self.min_evidence,
+                           'min_cluster_cells': self.min_cluster_cells},
+                          f, indent=1)
+        except Exception as e:
+            rospy.logwarn('band_projector: could not save band overrides: %s', e)
+
+    def apply_band_settings(self, req, persist=True, regen=True, log=True):
+        """Validate + apply a partial {band_min, band_max, min_evidence,
+        min_cluster_cells} dict. Returns (applied_dict|None, error|None).
+        Ranges: 0<=band_min<band_max<=2.0; evidence/cluster in 1..20."""
+        try:
+            band_min = float(req.get('band_min', self.band_min))
+            band_max = float(req.get('band_max', self.band_max))
+            min_evidence = int(req.get('min_evidence', self.min_evidence))
+            min_cluster = int(req.get('min_cluster_cells',
+                                      self.min_cluster_cells))
+        except (TypeError, ValueError) as e:
+            return None, 'non-numeric value: %s' % e
+        if not (0.0 <= band_min < band_max <= 2.0):
+            return None, ('band out of range (need 0<=min<max<=2.0), got '
+                          '[%s, %s]' % (band_min, band_max))
+        if not (1 <= min_evidence <= 20):
+            return None, 'min_evidence out of range 1..20: %s' % min_evidence
+        if not (1 <= min_cluster <= 20):
+            return None, ('min_cluster_cells out of range 1..20: %s'
+                          % min_cluster)
+        self.band_min = band_min
+        self.band_max = band_max
+        self.min_evidence = min_evidence
+        self.min_cluster_cells = min_cluster
+        applied = {'band_min': band_min, 'band_max': band_max,
+                   'min_evidence': min_evidence,
+                   'min_cluster_cells': min_cluster}
+        if log:
+            rospy.loginfo('band_projector: classifier settings -> %s',
+                          json.dumps(applied))
+        if persist:
+            self.save_band_overrides()
+        if regen:
+            # re-raster (in-memory, no disk snapshot) so the effect is
+            # immediately visible in the UI live grid
+            threading.Thread(target=self.regenerate,
+                             kwargs={'write_files': False},
+                             daemon=True).start()
+        return applied, None
+
+    def cb_set_band(self, msg):
+        try:
+            req = json.loads(msg.data) if msg.data.strip() else {}
+        except ValueError as e:
+            rospy.logwarn('band_projector: set_band bad JSON: %s', e)
+            self.status('error', {'error': 'set_band bad JSON: %s' % e})
+            return
+        if not isinstance(req, dict):
+            rospy.logwarn('band_projector: set_band payload not an object')
+            return
+        applied, err = self.apply_band_settings(req)
+        if err:
+            rospy.logwarn('band_projector: set_band rejected: %s', err)
+            self.status('error', {'error': 'set_band: ' + err})
+        else:
+            # refresh the latched status so the UI reflects the new values now
+            self.tick_status(None)
 
     def cb_centers(self, msg):
         self.centers_msg = msg
