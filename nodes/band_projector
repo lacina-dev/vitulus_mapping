@@ -65,6 +65,15 @@ class BandProjectorNode:
         self.band_max = float(rospy.get_param('~band_max', 0.60))
         self.min_evidence = int(rospy.get_param('~min_evidence', 6))
         self.min_cluster_cells = int(rospy.get_param('~min_cluster_cells', 3))
+        # ISSUE A fix (lidarsync 2026-07-12): reference lidar-only vertical
+        # obstacles in undriven columns against the nearest real ground within
+        # this radius (see band.project_band). 0 = strict same-column only.
+        self.ground_ref_radius_m = float(
+            rospy.get_param('~ground_ref_radius_m', 1.0))
+        # ISSUE A part 2: lower per-cell evidence floor for borrowed-ground
+        # (2D-lidar-only) cells; the thin lidar plane gives ~1-2 voxels/cell.
+        self.borrowed_min_evidence = int(
+            rospy.get_param('~borrowed_min_evidence', 2))
         self.fill_percentile = float(rospy.get_param('~fill_percentile', 1.5))
         self.fill_min_pts = int(rospy.get_param('~fill_min_pts', 6))
         self.max_slope_deg = float(rospy.get_param('~max_slope_deg', 35.0))
@@ -123,6 +132,8 @@ class BandProjectorNode:
         d['band_max'] = round(self.band_max, 3)
         d['min_evidence'] = self.min_evidence
         d['min_cluster_cells'] = self.min_cluster_cells
+        d['ground_ref_radius_m'] = round(self.ground_ref_radius_m, 2)
+        d['borrowed_min_evidence'] = self.borrowed_min_evidence
         self.pub_status.publish(String(json.dumps(d)))
 
     # ---- classifier settings (live tuning) ----------------------------------
@@ -149,7 +160,9 @@ class BandProjectorNode:
                 json.dump({'band_min': self.band_min,
                            'band_max': self.band_max,
                            'min_evidence': self.min_evidence,
-                           'min_cluster_cells': self.min_cluster_cells},
+                           'min_cluster_cells': self.min_cluster_cells,
+                           'ground_ref_radius_m': self.ground_ref_radius_m,
+                           'borrowed_min_evidence': self.borrowed_min_evidence},
                           f, indent=1)
         except Exception as e:
             rospy.logwarn('band_projector: could not save band overrides: %s', e)
@@ -164,6 +177,10 @@ class BandProjectorNode:
             min_evidence = int(req.get('min_evidence', self.min_evidence))
             min_cluster = int(req.get('min_cluster_cells',
                                       self.min_cluster_cells))
+            ground_ref = float(req.get('ground_ref_radius_m',
+                                       self.ground_ref_radius_m))
+            borrowed_ev = int(req.get('borrowed_min_evidence',
+                                      self.borrowed_min_evidence))
         except (TypeError, ValueError) as e:
             return None, 'non-numeric value: %s' % e
         if not (0.0 <= band_min < band_max <= 2.0):
@@ -174,13 +191,23 @@ class BandProjectorNode:
         if not (1 <= min_cluster <= 20):
             return None, ('min_cluster_cells out of range 1..20: %s'
                           % min_cluster)
+        if not (0.0 <= ground_ref <= 5.0):
+            return None, ('ground_ref_radius_m out of range 0..5: %s'
+                          % ground_ref)
+        if not (1 <= borrowed_ev <= 20):
+            return None, ('borrowed_min_evidence out of range 1..20: %s'
+                          % borrowed_ev)
         self.band_min = band_min
         self.band_max = band_max
         self.min_evidence = min_evidence
         self.min_cluster_cells = min_cluster
+        self.ground_ref_radius_m = ground_ref
+        self.borrowed_min_evidence = borrowed_ev
         applied = {'band_min': band_min, 'band_max': band_max,
                    'min_evidence': min_evidence,
-                   'min_cluster_cells': min_cluster}
+                   'min_cluster_cells': min_cluster,
+                   'ground_ref_radius_m': ground_ref,
+                   'borrowed_min_evidence': borrowed_ev}
         if log:
             rospy.loginfo('band_projector: classifier settings -> %s',
                           json.dumps(applied))
@@ -301,7 +328,9 @@ class BandProjectorNode:
             inpainted = work.inpaint(self.inpaint_max_dist_m)
             raster, info = project_band(work, pts, self.band_min,
                                         self.band_max, self.min_evidence,
-                                        self.min_cluster_cells)
+                                        self.min_cluster_cells,
+                                        self.ground_ref_radius_m,
+                                        self.borrowed_min_evidence)
             info.update({'fill_cells': filled, 'fill_dropped_slope': dropped,
                          'inpainted_cells': inpainted, 'points': len(pts),
                          'took_s': round(time.monotonic() - t0, 1)})

@@ -93,6 +93,23 @@ band_projector:
   min_evidence: 6                    # voxels in band per cell (production-tuned
                                      # 2026-07-12: -73% ghosts, structures kept)
   min_cluster_cells: 3               # drop smaller obstacle clusters (speckles)
+  # ISSUE A fix (lidarsync 2026-07-12): a 2D-lidar-only vertical obstacle in an
+  # UNDRIVEN column (garage wall/fence/trunk at the dock) has no ground voxel in
+  # its own column, so it was dropped as 'unreferenced' and never reached the
+  # obstacle raster ("lidar adds no obstacles"). Reference such columns against
+  # the nearest REAL (traj/fill, never inpaint) ground within this radius; the
+  # robot drives on continuous ground right next to the wall. Measured at the
+  # dock: 154 -> ~800 obstacle cells, garage walls recovered. 0 = strict
+  # same-column-only (old behaviour).
+  ground_ref_radius_m: 1.0
+  # ISSUE A part 2 (lidarsync 2026-07-12): the 2D lidar paints ONE thin scan
+  # plane, so a solid wall yields only ~1-2 occupied voxels per 5 cm cell — far
+  # below the depth-tuned min_evidence=6 (dense depth stacks many voxels/cell).
+  # Cells whose in-band evidence came from a borrowed-ground (lidar-only) column
+  # use this lower floor; depth cells keep min_evidence. The cluster filter
+  # still culls sparse lidar speckle (a wall is a big contiguous cluster), so
+  # this recovers garage walls/fences without admitting noise.
+  borrowed_min_evidence: 2
   fill_percentile: 1.5               # low envelope of octree column z; lower =
                                      # more resistant to tall grass reading as
                                      # ground (audit 2026-07-12, was 5.0)
