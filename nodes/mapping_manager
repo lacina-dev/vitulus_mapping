@@ -124,12 +124,49 @@ class MappingManager:
         self.proc = subprocess.Popen(cmd, start_new_session=True)
         self.site = site
         self.started_at = time.time()
-        self.link_site_datum(site)
+        # servesync (2026-07-12): serving must be CONSISTENT with the active
+        # mapping session. Two cases at start-of-session for site X:
+        #  (a) X has rasters (continuation, e.g. garden) -> auto-serve X's newest
+        #      raster so the tracker anchors on the previous version while we
+        #      remap (desired). _publish_site_map also relinks the datum to X.
+        #  (b) X has NO rasters (fresh site) -> CLEAR serving: publish an explicit
+        #      EMPTY OccupancyGrid on site_map, status serving:null, drop
+        #      .last_served. This stops the OLD site's raster from staying latched
+        #      under the NEW site's datum (the reported georef mismatch). gloc's
+        #      cb_grid rejects <20 occupied cells -> tracker goes no_map/idle
+        #      (correct during fresh mapping); navi_man's site_map callback treats
+        #      the empty grid as no-raster and falls back to its bootstrap map.
+        raster = self._newest_raster_in(site)
+        if raster is not None:
+            rospy.loginfo('mapping_manager: start %s (continuation) — '
+                          'auto-serving newest raster %s', site, raster)
+            self._publish_site_map(site, raster)   # relinks datum to X
+        else:
+            rospy.loginfo('mapping_manager: start %s (fresh, no raster) — '
+                          'clearing serving (empty site_map)', site)
+            self._publish_empty_site_map()
+            # DATUM INVARIANT: normally the datum symlink follows the SERVED site.
+            # The one exception is an ACTIVE fresh session: there is no served
+            # raster, yet insertion_gate is capturing THIS site's datum right now,
+            # so the link must point at X. Relink explicitly here (the empty
+            # publish does not touch the datum link).
+            self.link_site_datum(site)
 
     def link_site_datum(self, site):
         """Point the canonical site-datum path at this site's datum.yaml so
         navi_transform picks it up (POSE_DATUM_PLAN 1b). The link may dangle
-        until insertion_gate captures the georef — that is fine."""
+        until insertion_gate captures the georef — that is fine.
+
+        DATUM INVARIANT (servesync 2026-07-12): the datum symlink must follow the
+        SERVED site so navi_transform's fallback georef matches the raster gloc is
+        localizing against. It is relinked from every serving path:
+          - _publish_site_map (serve_site, stop auto-serve, stop restore-
+            fallback, boot auto-serve, start continuation) -> follows the
+            served site;
+          - cb_start FRESH branch -> the ONE exception: no raster is served, but
+            insertion_gate is capturing THIS active site's datum, so the link
+            points at the active site instead.
+        There is no path that serves site A while leaving the link on site B."""
         link = os.path.expanduser(rospy.get_param(
             '~site_datum_link', '~/.vitulus/saves/site_datum.yaml'))
         target = os.path.join(self.base_dir, site, 'datum.yaml')
@@ -189,6 +226,24 @@ class MappingManager:
                 rospy.loginfo('mapping_manager: auto-serving %s/%s after stop',
                               stopped, raster)
                 self._publish_site_map(stopped, raster)
+            else:
+                # servesync (2026-07-12): the stopped session saved NO raster
+                # (e.g. aborted fresh site). Serving was cleared at start (empty
+                # grid), so restore it to the newest site that has a raster
+                # (typically the map served before the session) instead of
+                # leaving the empty grid latched. _publish_site_map also
+                # re-syncs the datum symlink to the served site (invariant).
+                site = self._newest_site_with_raster()
+                if site is not None:
+                    raster = self._newest_raster_in(site)
+                    rospy.loginfo('mapping_manager: stopped %s saved no raster '
+                                  '— restoring serving to %s/%s',
+                                  stopped, site, raster)
+                    self._publish_site_map(site, raster)
+                else:
+                    rospy.loginfo('mapping_manager: stopped %s saved no raster '
+                                  'and no site has one — serving stays empty',
+                                  stopped)
 
     def cb_remove(self, msg):
         site = msg.data.strip()
@@ -397,6 +452,38 @@ class MappingManager:
         rospy.loginfo('mapping_manager: auto-serving last site_map %s/%s at boot',
                       site, raster)
         self._publish_site_map(site, raster)
+
+    def _publish_empty_site_map(self):
+        """Publish an explicit EMPTY (header-only, 0x0) OccupancyGrid on
+        /mapping_manager/site_map and clear all serving state. Used when a fresh
+        site (no rasters) starts mapping: keeps serving CONSISTENT with the active
+        session instead of leaving the previous site's raster latched.
+
+        Downstream: gloc's cb_grid rejects grids with <20 occupied cells (0 here)
+        -> tracker goes no_map/idle (correct while a fresh site is being mapped);
+        navi_man's callback_site_map detects the empty/tiny grid and falls back to
+        its truthful bootstrap map instead of the stale raster."""
+        grid = OccupancyGrid()
+        grid.header.stamp = rospy.Time.now()
+        grid.header.frame_id = self.map_frame
+        grid.info.resolution = 0.0
+        grid.info.width = 0
+        grid.info.height = 0
+        grid.info.origin.orientation.w = 1.0
+        grid.data = []
+        self.pub_site_map.publish(grid)
+        self.serving = None
+        # Drop the persisted last-served so a respawn during the fresh session does
+        # not re-latch the old raster at boot (auto_serve_last would otherwise pick
+        # it up again). It gets rewritten when a real raster is next served.
+        try:
+            p = self._last_served_path()
+            if os.path.exists(p):
+                os.remove(p)
+        except OSError as e:
+            rospy.logwarn('mapping_manager: could not clear last_served: %s', e)
+        rospy.loginfo('mapping_manager: site_map <- EMPTY (fresh session, '
+                      'serving cleared)')
 
     def _publish_site_map(self, site, raster):
         base = os.path.join(self.base_dir, site, 'rasters', raster, raster)
