@@ -233,6 +233,18 @@ class MappingManager:
                 info['terrain'] = True
                 info['z_range'] = [round(z, 2) for z in zr] if zr else None
                 info['area_m2'] = dem.stats()['area_traj_m2']
+                # World bounds of the terrain PNG so the web UI can drop it
+                # as a textured plane in the 3D view. Cell (ix,iy) min corner
+                # world = (ox+ix*res, oy+iy*res); bbox is inclusive so the
+                # rendered slice spans [x0 .. x1+1) cells. terrain_png is
+                # dem_to_png(_orient(elev)) => image col=x asc, row=y desc.
+                res = dem.res
+                info['terrain_bounds'] = {
+                    'min_x': round(dem.ox + x0 * res, 3),
+                    'min_y': round(dem.oy + y0 * res, 3),
+                    'max_x': round(dem.ox + (x1 + 1) * res, 3),
+                    'max_y': round(dem.oy + (y1 + 1) * res, 3),
+                }
 
         rasters = os.path.join(d, 'rasters')
         if os.path.isdir(rasters):

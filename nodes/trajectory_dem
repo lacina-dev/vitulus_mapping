@@ -186,6 +186,18 @@ class TrajectoryDemNode:
             'z_range': [round(z, 2) for z in self.z_range]
                        if self.z_range else None,
         })
+        # World bounds of the live terrain_png (same slice as publish_png), so
+        # the web UI can place it as a textured plane in the 3D view.
+        bbox = self.dem.valid_bbox()
+        if bbox is not None:
+            x0, y0, x1, y1 = bbox
+            res = self.dem.res
+            st['terrain_bounds'] = {
+                'min_x': round(self.dem.ox + x0 * res, 3),
+                'min_y': round(self.dem.oy + y0 * res, 3),
+                'max_x': round(self.dem.ox + (x1 + 1) * res, 3),
+                'max_y': round(self.dem.oy + (y1 + 1) * res, 3),
+            }
         self.pub_status.publish(String(json.dumps(st)))
 
     def tick_autosave(self, _evt):
