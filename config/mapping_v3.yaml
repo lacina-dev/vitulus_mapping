@@ -61,9 +61,14 @@ band_projector:
   auto_regen_period_s: 10.0          # live raster for the UI (0 = off)
   band_min: 0.10                     # obstacles 0.10-0.60 m above LOCAL ground
   band_max: 0.60
-  min_evidence: 3                    # voxels in band per cell (field-tuned)
+  min_evidence: 6                    # voxels in band per cell (production-tuned
+                                     # 2026-07-12: -73% ghosts, structures kept)
   min_cluster_cells: 3               # drop smaller obstacle clusters (speckles)
-  fill_percentile: 5.0
-  fill_min_pts: 3
+  fill_percentile: 1.5               # low envelope of octree column z; lower =
+                                     # more resistant to tall grass reading as
+                                     # ground (audit 2026-07-12, was 5.0)
+  fill_min_pts: 6                    # need more voxels before trusting a fill
   max_slope_deg: 35.0
-  inpaint_max_dist_m: 0.5
+  inpaint_max_dist_m: 0.15           # inpaint invents ground; keep it a thin
+                                     # crack-filler, not a gap-inventor (audit
+                                     # 2026-07-12, was 0.5 -> ~29k invented cells)

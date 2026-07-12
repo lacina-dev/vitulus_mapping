@@ -136,19 +136,32 @@ class DemGrid:
             filled += 1
         return filled
 
-    def slope_filter_fills(self, max_slope_deg=35.0, radius_m=0.30):
-        """Drop percentile fills that disagree with nearby trajectory cells
-        beyond the max plausible slope (2D-lidar-mows-the-ground guard)."""
+    def slope_filter_fills(self, max_slope_deg=35.0, radius_m=0.30,
+                           coherence_max_dz_m=0.30, coherence_radius_m=1.0):
+        """Drop percentile fills that disagree with nearby trajectory cells.
+        Two guards, both anchored on the nearest measured trajectory cell:
+          * slope: |dz| must stay under the max plausible ground slope
+            (2D-lidar-mows-the-ground guard);
+          * spatial coherence: a fill within coherence_radius_m of trajectory
+            whose |dz| from that trajectory exceeds coherence_max_dz_m is
+            rejected as tall vegetation mistaken for ground (audit 2026-07-12).
+        The single EDT to trajectory is shared by both, so the coherence guard
+        is free."""
         traj = self.source == SRC_TRAJ
         fill = self.source == SRC_FILL
         if not traj.any() or not fill.any():
             return 0
         dist, (jx, jy) = ndimage.distance_transform_edt(
             ~traj, return_indices=True, sampling=self.res)
-        near = fill & (dist <= radius_m * 4)    # only judge fills near evidence
         dz = np.abs(self.elev - self.elev[jx, jy])
+        near = fill & (dist <= radius_m * 4)    # only judge fills near evidence
         max_dz = np.tan(math.radians(max_slope_deg)) * np.maximum(dist, self.res)
         bad = near & (dz > max_dz)
+        # spatial-coherence guard: close to a real ground sample but too far off
+        # in height -> tall grass, not ground
+        if coherence_max_dz_m is not None:
+            close = fill & (dist <= coherence_radius_m)
+            bad |= close & (dz > coherence_max_dz_m)
         self.elev[bad] = np.nan
         self.source[bad] = SRC_NONE
         return int(bad.sum())

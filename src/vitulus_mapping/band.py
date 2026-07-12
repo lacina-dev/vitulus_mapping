@@ -9,14 +9,14 @@ Output raster values follow nav_msgs/OccupancyGrid convention:
 import numpy as np
 from scipy import ndimage
 
-from .demgrid import SRC_NONE
+from .demgrid import SRC_INPAINT, SRC_NONE
 
 OCC = 100
 FREE = 0
 UNKNOWN = -1
 
 
-def project_band(dem, pts_xyz, band_min=0.10, band_max=0.60, min_evidence=3,
+def project_band(dem, pts_xyz, band_min=0.10, band_max=0.60, min_evidence=6,
                  min_cluster_cells=3):
     """dem: DemGrid (already filled/inpainted copy), pts_xyz: Nx3 occupied
     voxel centers in map frame. Returns (raster int8 [ix, iy], info dict).
@@ -29,20 +29,30 @@ def project_band(dem, pts_xyz, band_min=0.10, band_max=0.60, min_evidence=3,
     nx, ny = dem.elev.shape
     evidence = np.zeros((nx, ny), np.int32)
     unref = 0
+    # Inpainted DEM cells are INVENTED ground (diffused from neighbours, no
+    # measurement). They must never serve as a ground reference: a voxel over
+    # an inpainted cell cannot be honestly classified obstacle-vs-free, because
+    # the "ground" it is compared against is fabricated. Treat such columns as
+    # unreferenced (audit 2026-07-12).
+    real_ground = (dem.source != SRC_NONE) & (dem.source != SRC_INPAINT)
     if len(pts_xyz):
         ix = np.floor((pts_xyz[:, 0] - dem.ox) / dem.res).astype(np.int64)
         iy = np.floor((pts_xyz[:, 1] - dem.oy) / dem.res).astype(np.int64)
         ok = (ix >= 0) & (ix < nx) & (iy >= 0) & (iy < ny)
         ix, iy, zs = ix[ok], iy[ok], pts_xyz[:, 2][ok]
         ground = dem.elev[ix, iy]
-        has_ground = ~np.isnan(ground)
+        # a column is referenceable only if its ground cell is REAL (traj/fill),
+        # not NaN and not inpaint-invented
+        has_ground = ~np.isnan(ground) & real_ground[ix, iy]
         dz = zs - ground
         in_band = has_ground & (dz >= band_min) & (dz <= band_max)
         np.add.at(evidence, (ix[in_band], iy[in_band]), 1)
-        # occupied columns we cannot classify (no ground reference)
+        # occupied columns we cannot classify (no real ground reference)
         unref = int((~has_ground).sum())
 
     raster = np.full((nx, ny), UNKNOWN, np.int8)
+    # inpainted ground is shown as FREE (it is a plausible driveable surface for
+    # display/nav continuity) but, per above, it never anchors obstacle claims
     known_ground = dem.source != SRC_NONE
     raster[known_ground] = FREE
     obstacle = evidence >= min_evidence

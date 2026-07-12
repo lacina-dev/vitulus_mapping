@@ -9,6 +9,21 @@ Pipeline per regeneration (all on a COPY of the canonical DEM):
   3. slope-consistency filter of fills + bounded inpainting
   4. band classification -> raster; publish + export map_server pgm/yaml
 
+EVIDENCE SOURCE (audit 2026-07-12, finding #4). This node's obstacle evidence
+comes from octomap_point_cloud_centers = ALL occupied voxels, ground included:
+insertion_gate merges /ground_cloud + /obstacles_cloud into one octomap, so the
+ground-vs-obstacle split that EXISTS at the source is already destroyed before
+we see it. Reconstructing an obstacle-only stream consumer-side is therefore
+NOT clean. The clean consumer-side ground-peel we CAN do is done here: band
+evidence is anchored only on REAL ground (trajectory/percentile-fill, never
+inpaint-invented ground; see band.project_band) and min_evidence=6, which
+suppresses near-ground z-noise leak without a blunt band_min raise (measured:
+band_min 0.10 vs 0.12 identical on garden.ot after real-ground anchoring).
+NOTE FOR insertion_gate OWNER: a truly obstacle-pure archive would require a
+source-side change — insert /obstacles_cloud into a SEPARATE octomap (or tag
+voxels by source cloud) so band evidence can consume obstacle voxels only. That
+is out of this tier's scope and left to the insertion_gate/octomap owner.
+
 Interfaces (relative to /mapping):
   in   octomap_point_cloud_centers  sensor_msgs/PointCloud2 (from octomap_server)
   trig regenerate          std_msgs/String ('' or raster name)
@@ -48,12 +63,12 @@ class BandProjectorNode:
         self.map_frame = rospy.get_param('~map_frame', 'map')
         self.band_min = float(rospy.get_param('~band_min', 0.10))
         self.band_max = float(rospy.get_param('~band_max', 0.60))
-        self.min_evidence = int(rospy.get_param('~min_evidence', 3))
+        self.min_evidence = int(rospy.get_param('~min_evidence', 6))
         self.min_cluster_cells = int(rospy.get_param('~min_cluster_cells', 3))
-        self.fill_percentile = float(rospy.get_param('~fill_percentile', 5.0))
-        self.fill_min_pts = int(rospy.get_param('~fill_min_pts', 3))
+        self.fill_percentile = float(rospy.get_param('~fill_percentile', 1.5))
+        self.fill_min_pts = int(rospy.get_param('~fill_min_pts', 6))
         self.max_slope_deg = float(rospy.get_param('~max_slope_deg', 35.0))
-        self.inpaint_max_dist_m = float(rospy.get_param('~inpaint_max_dist_m', 0.5))
+        self.inpaint_max_dist_m = float(rospy.get_param('~inpaint_max_dist_m', 0.15))
         self.output_dir = os.path.expanduser(rospy.get_param(
             '~output_dir', '~/.vitulus/mapping_v3/default'))
         self.dem_path = os.path.join(self.output_dir, 'dem.npz')
