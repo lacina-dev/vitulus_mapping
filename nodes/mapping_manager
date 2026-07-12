@@ -92,6 +92,13 @@ class MappingManager:
         rospy.on_shutdown(self.shutdown)
         self.show_site('')            # newest saved map visible right away
         rospy.loginfo('mapping_manager up, base_dir=%s', self.base_dir)
+        # Boot race fix (bootfix2, 2026-07-12): 'serving' is in-memory only, so a
+        # respawn/restart leaves /mapping_manager/site_map with NO latched msg —
+        # navi_man's octomap source then has nothing to republish and the whole
+        # costmap/MBF chain fails to come up. Auto-serve the last-served site (from
+        # the persisted .last_served state) so site_map is latched immediately at
+        # boot, without waiting for anyone to send serve_site.
+        self.auto_serve_last()
 
     # ---- lifecycle -----------------------------------------------------------
     def running(self):
@@ -324,6 +331,51 @@ class MappingManager:
             rospy.logerr('mapping_manager: serve_site %r failed: %s',
                          payload, e)
 
+    # ---- last-served persistence (bootfix2) ---------------------------------
+    def _last_served_path(self):
+        return os.path.join(self.base_dir, '.last_served')
+
+    def save_last_served(self, site, raster):
+        """Persist the currently-served site/raster so we can auto-serve it on
+        the next boot (survives restarts / respawns)."""
+        try:
+            with open(self._last_served_path(), 'w') as f:
+                json.dump({'site': site, 'raster': raster}, f)
+        except Exception as e:
+            rospy.logwarn('mapping_manager: could not persist last_served: %s', e)
+
+    def load_last_served(self):
+        """Return (site, raster) from the persisted state, or (None, None)."""
+        try:
+            with open(self._last_served_path()) as f:
+                d = json.load(f)
+            return d.get('site'), d.get('raster')
+        except Exception:
+            return None, None
+
+    def auto_serve_last(self):
+        """At boot, re-serve the last-served site (if it still has a raster) so
+        /mapping_manager/site_map is latched immediately. Falls back to the newest
+        site with any raster. No-op (logged) when nothing has a raster yet."""
+        site, raster = self.load_last_served()
+        # Validate the persisted raster still exists; otherwise refresh to newest.
+        if site is not None:
+            if raster is None or not os.path.exists(
+                    os.path.join(self.base_dir, site, 'rasters', raster,
+                                 raster + '.pgm')):
+                raster = self._newest_raster_in(site)
+        if site is None or raster is None:
+            site = self._newest_site_with_raster()
+            if site is not None:
+                raster = self._newest_raster_in(site)
+        if site is None or raster is None:
+            rospy.loginfo('mapping_manager: auto_serve_last: no site has a '
+                          'raster yet — site_map not served at boot')
+            return
+        rospy.loginfo('mapping_manager: auto-serving last site_map %s/%s at boot',
+                      site, raster)
+        self._publish_site_map(site, raster)
+
     def _publish_site_map(self, site, raster):
         base = os.path.join(self.base_dir, site, 'rasters', raster, raster)
         pgm_path = base + '.pgm'
@@ -349,6 +401,7 @@ class MappingManager:
 
         self.serving = {'site': site, 'raster': raster,
                         'mtime': int(os.path.getmtime(pgm_path))}
+        self.save_last_served(site, raster)
         # Keep the canonical site-datum symlink following the SERVED site, not
         # just the last MAPPED one (2026-07-11 review). Previously link_site_datum
         # ran only from start_proc (mapping), so serving site A's raster to gloc
