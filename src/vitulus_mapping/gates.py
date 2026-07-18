@@ -26,6 +26,7 @@ constant indoors and the frozen offset remains valid on flat ground).
 """
 
 import math
+import threading
 from dataclasses import dataclass, field
 
 
@@ -111,6 +112,10 @@ class InsertionGate:
         # cumulative correction-rate pause
         self._corr_hist = []
         self._corr_rate_mps = 0.0     # last computed windowed rate
+        # M2: feed_map_odom (5 Hz tick thread) and evaluate (tick thread + 3
+        # concurrent cloud subscriber threads via the stamped path) both touch
+        # _corr_hist/_corr_rate_mps. Guard them; only the tick path prunes.
+        self._corr_lock = threading.Lock()
 
     @property
     def mode(self):
@@ -165,13 +170,14 @@ class InsertionGate:
         # cumulative correction-rate tracking: accumulate every step (however
         # small) over a sliding window; the sum / window is the rate the
         # evaluate() pause gates on. This catches the gentle multi-Hz tracker
-        # slew that never trips the per-step watchdog above.
-        self._corr_hist.append((t, d))
-        cutoff = t - self.cfg.map_corr_window_s
-        while self._corr_hist and self._corr_hist[0][0] < cutoff:
-            self._corr_hist.pop(0)
-        win = max(self.cfg.map_corr_window_s, 1e-3)
-        self._corr_rate_mps = sum(s for _tt, s in self._corr_hist) / win
+        # slew that never trips the per-step watchdog above. (M2: guarded.)
+        with self._corr_lock:
+            self._corr_hist.append((t, d))
+            cutoff = t - self.cfg.map_corr_window_s
+            while self._corr_hist and self._corr_hist[0][0] < cutoff:
+                self._corr_hist.pop(0)
+            win = max(self.cfg.map_corr_window_s, 1e-3)
+            self._corr_rate_mps = sum(s for _tt, s in self._corr_hist) / win
 
     def corr_rate_mps(self):
         """Cumulative |map->odom| translation over the last map_corr_window_s,
@@ -224,7 +230,7 @@ class InsertionGate:
         return self._z_corr
 
     # ---- decision ----------------------------------------------------------
-    def evaluate(self, now, stamped_pose=None):
+    def evaluate(self, now, stamped_pose=None, wall_now=None):
         """Evaluate the insertion decision at time `now`.
 
         stamped_pose (item 7, gate-at-cloud-stamp): when the caller has looked
@@ -233,12 +239,23 @@ class InsertionGate:
         gates (pose freshness, heading agreement) then judge the pose that
         actually produced the cloud, not the latest 5 Hz tick — so a cloud
         stamped mid-correction is rejected on ITS own pose, not a newer good
-        one. When None, the latest fed pose is used (5 Hz tick path)."""
+        one. When None, the latest fed pose is used (5 Hz tick path).
+
+        wall_now (M11): the sensor-QUALITY feeds (navpvt / heading / gps-odom /
+        pose-src) are timestamped on the RECEIPT (wall) clock, so their
+        staleness must be judged against wall-clock now — not the cloud stamp,
+        which on the stamped path lies in the past and yields spuriously
+        NEGATIVE ages that never trip the rtk-mode staleness gates. The stamped
+        path passes wall_now=Time.now(); the 5 Hz tick path leaves it None (so
+        wall_now==now and behaviour is byte-identical). Pose freshness keeps
+        using `now` because the pose IS the stamped pose."""
         cfg = self.cfg
         mode = self.mode
         reasons = []
         info = {'mode': mode}
         pose = stamped_pose if stamped_pose is not None else self._pose
+        if wall_now is None:
+            wall_now = now
 
         if mode == 'off':
             return GateDecision(False, ['mode_off'], info)
@@ -249,7 +266,7 @@ class InsertionGate:
             rtk_reasons.append('no_gps')
         else:
             t, fix_ok, carr_fixed, hacc, vacc = self._navpvt
-            gps_age = now - t
+            gps_age = wall_now - t          # M11: receipt-clock age
             info.update({'gps_age_s': round(gps_age, 2), 'rtk_fixed': carr_fixed,
                          'hacc_mm': hacc, 'vacc_mm': vacc})
             if gps_age > cfg.max_gps_age_s:
@@ -264,7 +281,7 @@ class InsertionGate:
         if self._z_corr_t is None:
             info['z_source'] = 'none'
             rtk_reasons.append('no_rtk_altitude')
-        elif now - self._z_corr_t <= cfg.max_gps_odom_age_s:
+        elif wall_now - self._z_corr_t <= cfg.max_gps_odom_age_s:   # M11
             info['z_source'] = 'rtk'
         else:
             info['z_source'] = 'frozen'
@@ -276,7 +293,7 @@ class InsertionGate:
             rtk_reasons.append('pose_src_unknown')
         else:
             t, src = self._pose_src
-            stale = now - t > cfg.max_pose_src_age_s
+            stale = wall_now - t > cfg.max_pose_src_age_s    # M11
             info['pose_src'] = src
             if stale:
                 rtk_reasons.append('pose_src_stale')
@@ -287,7 +304,7 @@ class InsertionGate:
             info['heading_rtk'] = None
         else:
             t, carr_fixed = self._heading_navpvt
-            fresh = now - t <= cfg.max_heading_age_s
+            fresh = wall_now - t <= cfg.max_heading_age_s    # M11
             info['heading_rtk'] = bool(carr_fixed and fresh)
             if not info['heading_rtk']:
                 rtk_reasons.append('heading_receiver_no_rtk')
@@ -296,7 +313,7 @@ class InsertionGate:
             rtk_reasons.append('no_heading')
         else:
             t, yaw = self._heading
-            age = now - t
+            age = wall_now - t              # M11: receipt-clock age
             info['heading_age_s'] = round(age, 2)
             if age > cfg.max_heading_age_s:
                 rtk_reasons.append('heading_stale')
@@ -325,12 +342,20 @@ class InsertionGate:
         # corrected. Recompute the windowed rate against `now` so it decays to
         # 0 once feed_map_odom stops delivering corrections (stale samples age
         # out of the window even without a new feed).
+        # M2: only the 5 Hz tick path (stamped_pose is None) prunes the shared
+        # window; the concurrent cloud (stamped) threads compute the rate from
+        # a read-only snapshot under the lock, mutating nothing.
         cutoff = now - cfg.map_corr_window_s
-        while self._corr_hist and self._corr_hist[0][0] < cutoff:
-            self._corr_hist.pop(0)
         win = max(cfg.map_corr_window_s, 1e-3)
-        rate = sum(s for _tt, s in self._corr_hist) / win
-        self._corr_rate_mps = rate
+        with self._corr_lock:
+            if stamped_pose is None:
+                while self._corr_hist and self._corr_hist[0][0] < cutoff:
+                    self._corr_hist.pop(0)
+                rate = sum(s for _tt, s in self._corr_hist) / win
+                self._corr_rate_mps = rate
+            else:
+                rate = sum(s for _tt, s in self._corr_hist
+                           if _tt >= cutoff) / win
         info['map_corr_rate_mmps'] = round(rate * 1000.0, 1)
         if rate > cfg.max_maporr_rate_mps:
             reasons.append('map_corr_rate')

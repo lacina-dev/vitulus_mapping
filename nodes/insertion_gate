@@ -45,7 +45,7 @@ from geometry_msgs.msg import TransformStamped
 from laser_geometry import LaserProjection
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import Imu, LaserScan, PointCloud2, PointField
-from std_msgs.msg import Bool, String
+from std_msgs.msg import Bool, Float32, String
 from tf.transformations import (euler_from_matrix, euler_from_quaternion,
                                 quaternion_matrix)
 from ublox_msgs.msg import NavPVT
@@ -110,8 +110,12 @@ class InsertionGateNode:
         self.pub_gate = rospy.Publisher('gate', Bool, queue_size=1)
         self.pub_status = rospy.Publisher('gate_status', String,
                                           queue_size=1, latch=True)
+        # M4: 5 Hz z_corr for trajectory_dem (its own value is 1 Hz via
+        # gate_status). Unlatched, freshest-wins.
+        self.pub_z_corr = rospy.Publisher('z_corr', Float32, queue_size=1,
+                                          latch=False)
 
-        self.counters = {t: {'in': 0, 'out': 0} for t in self.cloud_topics}
+        self.counters = {t: self._new_counter() for t in self.cloud_topics}
         self.last_pub = {t: 0.0 for t in self.cloud_topics}
         self.last_alias_stamp = {}
         self.alias_lock = threading.Lock()   # cloud cbs run concurrently
@@ -164,7 +168,7 @@ class InsertionGateNode:
         # the same cb_cloud gate under a synthetic topic name (so it gets its
         # own in/out counters and the lidar range cap).
         if self.lidar_enabled:
-            self.counters[self._lidar_topic_name] = {'in': 0, 'out': 0}
+            self.counters[self._lidar_topic_name] = self._new_counter()
             self.last_pub[self._lidar_topic_name] = 0.0
             rospy.Subscriber(self.lidar_scan_topic, LaserScan, self.cb_scan,
                              queue_size=1, buff_size=2 ** 20)
@@ -174,6 +178,13 @@ class InsertionGateNode:
         rospy.loginfo('insertion_gate up: mode=%s clouds=%s -> %s',
                       cfg.mode, self.cloud_topics,
                       rospy.resolve_name('cloud_in'))
+
+    def _new_counter(self):
+        """M3: split per-topic cloud outcomes. 'in' counts arrivals BEFORE the
+        throttle, so in/out alone was meaningless; the rest attribute each
+        dropped/passed cloud to a cause. 'out' kept == 'passed' for compat."""
+        return {'in': 0, 'throttled': 0, 'stamped_reject': 0,
+                'gate_closed': 0, 'passed': 0, 'out': 0}
 
     # ---- sensor feeds -------------------------------------------------------
     def cb_navpvt(self, msg):
@@ -387,6 +398,9 @@ class InsertionGateNode:
         self.sample_pose()
         dec = self.gate.evaluate(rospy.Time.now().to_sec())
         self.pub_gate.publish(Bool(dec.passed))
+        # M4: publish z_corr at the 5 Hz gate tick so trajectory_dem samples the
+        # current ground offset, not a value up to 1 s stale from gate_status.
+        self.pub_z_corr.publish(Float32(self.gate.z_correction()))
         if dec.passed != self.last_passed:
             (rospy.loginfo if dec.passed else rospy.logwarn)(
                 'insertion_gate: %s %s',
@@ -406,6 +420,10 @@ class InsertionGateNode:
                   'lidar_enabled': self.lidar_enabled,
                   'counters': self.counters}
         status.update(dec.info)
+        # M9: surface datum capture so a silent no-datum session is visible.
+        with self._datum_lock:
+            status['datum_samples'] = len(self._datum_samples)
+        status['datum_captured'] = self._georef_done
         self.pub_status.publish(String(json.dumps(status)))
         self.try_capture_georef(dec)
 
@@ -608,25 +626,32 @@ class InsertionGateNode:
         q = tr.transform.rotation
         yaw = euler_from_quaternion([q.x, q.y, q.z, q.w])[2]
         stamped_pose = (tr.header.stamp.to_sec(), t.x, t.y, t.z, yaw)
-        return self.gate.evaluate(tsec, stamped_pose=stamped_pose)
+        # M11: judge the quality-feed staleness against the wall clock (receipt
+        # clock the feeds are stamped on), not the past cloud stamp.
+        return self.gate.evaluate(tsec, stamped_pose=stamped_pose,
+                                  wall_now=rospy.Time.now().to_sec())
 
     def cb_cloud(self, msg, topic):
-        self.counters[topic]['in'] += 1
+        c = self.counters[topic]
+        c['in'] += 1
         now = time.monotonic()
         if now - self.last_pub[topic] < 1.0 / self.max_rate_hz:
+            c['throttled'] += 1          # M3
             return
         # Item 7: judge the pose that ACTUALLY produced this cloud (at
-        # msg.header.stamp), reusing the same decision machinery. Fall back to
-        # the latest tick decision only if the stamp is too old/new for TF (in
-        # which case the stamped lookup returns None -> reject).
+        # msg.header.stamp), reusing the same decision machinery. If the stamp
+        # is too old/new for TF the stamped lookup returns None -> reject.
         dec = self._stamped_decision(msg.header.stamp)
         if dec is None:
-            tick = getattr(self, '_last_decision', None)
-            if tick is not None:
-                self.log_decision(msg, topic, tick)
+            # M3: a REJECTED cloud. Log it as its OWN decision (pass=0,
+            # reason=stamp_extrapolation) instead of the last tick's decision,
+            # which could read pass=1 for a pose this cloud never rode on.
+            c['stamped_reject'] += 1
+            self.log_stamped_reject(msg, topic)
             return                       # reject on extrapolation
         self.log_decision(msg, topic, dec)
         if not dec.passed:
+            c['gate_closed'] += 1        # M3
             return
 
         # Item 3: per-source range cap before forwarding (lidar already cut at
@@ -669,7 +694,8 @@ class InsertionGateNode:
         gated.is_dense = msg.is_dense
         self.pub_cloud.publish(gated)
         self.last_pub[topic] = now
-        self.counters[topic]['out'] += 1
+        c['passed'] += 1                 # M3
+        c['out'] += 1
 
     # ---- logging ------------------------------------------------------------
     def _open_csv(self):
@@ -693,6 +719,17 @@ class InsertionGateNode:
              i.get('vacc_mm', ''), i.get('heading_diff_deg', ''),
              i.get('z_source', ''), round(self.gate.z_correction(), 3),
              i.get('map_corrections', 0), i.get('map_corr_rate_mmps', '')])
+        self._csv.flush()
+
+    def log_stamped_reject(self, msg, topic):
+        """M3: a cloud whose TF pose at its OWN stamp could not be resolved
+        (extrapolation) is rejected — log it as pass=0 reason=stamp_extrapolation
+        rather than borrowing the last tick's (possibly passing) decision. Same
+        14 columns as log_decision; quality fields blank (no pose to judge)."""
+        self._csv_writer.writerow(
+            [f'{msg.header.stamp.to_sec():.3f}', topic, 0,
+             'stamp_extrapolation', self.gate.mode, '', '', '', '', '', '',
+             round(self.gate.z_correction(), 3), self.gate.corrections, ''])
         self._csv.flush()
 
 

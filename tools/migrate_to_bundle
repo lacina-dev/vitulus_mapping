@@ -1,0 +1,364 @@
+#!/usr/bin/env python3
+"""
+migrate_to_bundle -- one-shot migration of legacy pickle world -> site bundle.
+
+Reads:
+  waypoints+paths : ~/.vitulus/saves/maps_data/<navi-map>.pkl   (MapData; MAP
+                    frame poses; datum = utm_x/utm_y + utm_orientation quat)
+  zones+programs  : ~/.vitulus/running/planner_programs.pkl      (vitulus_msgs/
+                    PlannerProgramList; each program carries a zone snapshot in
+                    ITS OWN map frame -> converted via the datum of the map
+                    named in program.map_name)
+  zones (extra)   : ~/.vitulus/saves/planner_data/<navi-map>.pkl (planner
+                    MapData; zones[].msg = MapEditZone) -- merged, program wins.
+
+Writes (under ~/.vitulus/mapping_v3/<site>/):
+  manifest.yaml, waypoints.geojson, paths.geojson, zones.geojson, programs.yaml
+  (canonical geometry in UTM metres; generated coverage paths are NOT stored).
+
+DRY-RUN by default (prints everything it would write, full detail).  --apply
+writes.  Refuses to overwrite existing bundle files unless --force.
+
+RUN with ROS env sourced (needs vitulus_msgs to unpickle programs):
+  source /opt/ros/noetic/setup.bash
+  source ~/catkin_ws/devel/setup.bash
+  rosrun vitulus_mapping migrate_to_bundle --site novamapa \
+      --navi-map 'GARDEN_2026***env*OUTDOOR'
+"""
+import argparse
+import math
+import os
+import pickle
+import sys
+
+# --- make our libs + the pickle classes importable ------------------------
+_MAP_SRC = "/home/vitulus/catkin_ws/src/vitulus/vitulus_mapping/src"
+_NAVI_SRC = "/home/vitulus/catkin_ws/src/vitulus/vitulus_navi/src"
+_PLANNER_SRC = "/home/vitulus/catkin_ws/src/vitulus/vitulus_planner/src"
+for p in (_MAP_SRC, _NAVI_SRC, _PLANNER_SRC):
+    if p not in sys.path:
+        sys.path.insert(0, p)
+
+from vitulus_mapping import geo, bundle  # noqa: E402
+
+MAPS_DATA = os.path.expanduser("~/.vitulus/saves/maps_data")
+PLANNER_DATA = os.path.expanduser("~/.vitulus/saves/planner_data")
+PROGRAMS_PKL = os.path.expanduser("~/.vitulus/running/planner_programs.pkl")
+
+UTM_ZONE = 33
+WARNINGS = []
+
+
+def warn(msg):
+    WARNINGS.append(msg)
+    print("  !! WARN: %s" % msg)
+
+
+def load_map_pickle(mapname):
+    """Load a maps_data MapData pickle by map filename (no .pkl)."""
+    from navi_man import mapdata  # noqa: F401  (registers classes for unpickle)
+    path = os.path.join(MAPS_DATA, mapname + ".pkl")
+    if not os.path.exists(path):
+        return None, path
+    with open(path, "rb") as f:
+        return pickle.load(f), path
+
+
+def quat_yaw(o):
+    return geo.quat_to_yaw(o.x, o.y, o.z, o.w)
+
+
+# --------------------------------------------------------------------------
+# waypoints + paths from the navi map pickle
+# --------------------------------------------------------------------------
+def extract_waypoints_paths(md, datum):
+    wps = []
+    for pt in md.points:
+        pos = pt.pose.position
+        e, n = geo.map_to_utm(pos.x, pos.y, datum)
+        yaw_utm = geo.map_yaw_to_utm(quat_yaw(pt.pose.orientation), datum)
+        wp = {"name": pt.name, "e": round(e, 4), "n": round(n, 4),
+              "yaw_rad": round(yaw_utm, 6)}
+        if abs(pos.z) > 1e-9:
+            wp["z"] = round(pos.z, 4)
+        wps.append(wp)
+    paths = []
+    for pa in md.paths:
+        verts = []
+        yaws = []
+        for pose in pa.poses:
+            e, n = geo.map_to_utm(pose.position.x, pose.position.y, datum)
+            verts.append((round(e, 4), round(n, 4)))
+            yaws.append(round(geo.map_yaw_to_utm(quat_yaw(pose.orientation),
+                                                 datum), 6))
+        paths.append({"name": pa.name, "vertices": verts, "yaws": yaws})
+    return wps, paths
+
+
+# --------------------------------------------------------------------------
+# zones + programs from planner_programs.pkl
+# --------------------------------------------------------------------------
+ZONE_PROP_KEYS = ["type", "cut_height", "rpm", "coverage_angle",
+                  "paths_distance", "simplify", "border_paths", "area",
+                  "length"]
+
+
+def zone_msg_to_bundle(zmsg, datum):
+    """MapEditZone -> {name, polygon(UTM), props}."""
+    poly = []
+    for p32 in zmsg.polygon.polygon.points:
+        e, n = geo.map_to_utm(p32.x, p32.y, datum)
+        poly.append((round(e, 4), round(n, 4)))
+    props = {}
+    for k in ZONE_PROP_KEYS:
+        if hasattr(zmsg, k):
+            v = getattr(zmsg, k)
+            props[k] = round(v, 4) if isinstance(v, float) else v
+    return {"name": zmsg.name, "polygon": poly, "props": props}
+
+
+def extract_programs_zones(programs_override_map):
+    """Return (programs_list, zones_by_name, datum_cache_report)."""
+    from vitulus_msgs.msg import PlannerProgramList  # noqa: F401
+    with open(PROGRAMS_PKL, "rb") as f:
+        plist = pickle.load(f)
+    progs = plist.program_list
+
+    datum_cache = {}   # mapname -> datum dict or None (missing)
+    datum_paths = {}
+
+    def datum_for(mapname):
+        src = programs_override_map or mapname
+        if src not in datum_cache:
+            md, path = load_map_pickle(src)
+            datum_paths[src] = path
+            if md is None:
+                datum_cache[src] = None
+            else:
+                datum_cache[src] = geo.from_pickle_datum(md)
+        return src, datum_cache[src]
+
+    out_programs = []
+    zones_by_name = {}
+    zone_conflicts = []
+
+    for pr in progs:
+        src_map, datum = datum_for(pr.map_name)
+        zone_names = []
+        if datum is None:
+            warn("program %r references map %r whose maps_data pickle is "
+                 "MISSING (%s) -- zone geometry NOT converted; program kept "
+                 "with zone_names but zones skipped"
+                 % (pr.name, pr.map_name, datum_paths.get(src_map)))
+        for zmsg in pr.zone_list:
+            zone_names.append(zmsg.name)
+            if datum is None:
+                continue
+            zb = zone_msg_to_bundle(zmsg, datum)
+            zb["props"]["source_map"] = src_map
+            if zb["name"] in zones_by_name:
+                prev = zones_by_name[zb["name"]]
+                if prev["polygon"] != zb["polygon"]:
+                    zone_conflicts.append((zb["name"], pr.name))
+                # program snapshot wins: keep first-seen program snapshot
+                continue
+            zones_by_name[zb["name"]] = zb
+        out_programs.append({
+            "name": pr.name,
+            "source_map": pr.map_name,
+            "zone_names": zone_names,
+            "speed": pr.speed,
+            "rpm": pr.rpm,
+            "cut_height": pr.cut_height,
+            "override_zone": bool(pr.override_zone),
+            "last_result": pr.last_result,
+        })
+
+    for zname, pname in zone_conflicts:
+        warn("zone %r appears in multiple programs with DIFFERING geometry "
+             "(conflict at program %r) -- kept the first program snapshot"
+             % (zname, pname))
+    return out_programs, zones_by_name, datum_paths
+
+
+def merge_planner_data_zones(navi_map, zones_by_name):
+    """Merge zones from planner_data/<navi-map>.pkl (program snapshot wins)."""
+    path = os.path.join(PLANNER_DATA, navi_map + ".pkl")
+    if not os.path.exists(path):
+        print("  planner_data pickle absent (%s) -- no extra zones" % path)
+        return
+    try:
+        from node_planner import planner_data  # noqa: F401
+        md, _ = load_map_pickle(navi_map)   # for its datum
+        with open(path, "rb") as f:
+            pd = pickle.load(f)
+    except Exception as exc:
+        warn("could not load planner_data zones (%s): %s" % (path, exc))
+        return
+    if md is None:
+        warn("planner_data zones present but navi map pickle missing -- "
+             "cannot georeference them; skipped")
+        return
+    datum = geo.from_pickle_datum(md)
+    n_added = 0
+    for z in getattr(pd, "zones", []):
+        zb = zone_msg_to_bundle(z.msg, datum)
+        zb["props"]["source_map"] = navi_map + " (planner_data)"
+        if zb["name"] in zones_by_name:
+            print("    planner_data zone %r already provided by a program "
+                  "snapshot -> program wins" % zb["name"])
+            continue
+        zones_by_name[zb["name"]] = zb
+        n_added += 1
+    print("  merged %d extra zone(s) from planner_data" % n_added)
+
+
+# --------------------------------------------------------------------------
+# datum-delta report
+# --------------------------------------------------------------------------
+def datum_delta_report(navi_datum, site):
+    import yaml
+    dpath = os.path.join(bundle.site_dir(site), "datum.yaml")
+    print("\n== Datum-delta report (navi pickle vs site datum.yaml) ==")
+    if not os.path.exists(dpath):
+        print("  site datum.yaml absent (%s) -- skipping delta" % dpath)
+        return
+    with open(dpath) as f:
+        sd = yaml.safe_load(f)
+    site_datum = geo.from_datum_yaml(sd)
+    de, dn, dalt, dyaw = geo.datum_delta(navi_datum, site_datum)
+    print("  navi pickle datum: E=%.3f N=%.3f yaw=%.6f rad"
+          % (navi_datum["utm_e"], navi_datum["utm_n"], navi_datum["yaw_rad"]))
+    print("  site  datum.yaml : E=%.3f N=%.3f yaw=%.6f rad"
+          % (site_datum["utm_e"], site_datum["utm_n"], site_datum["yaw_rad"]))
+    print("  delta (site-navi): dE=%.4f m  dN=%.4f m  dAlt=%s  dYaw=%.6f rad "
+          "(%.3f mrad)"
+          % (de, dn, ("%.4f m" % dalt) if dalt is not None else "n/a",
+             dyaw, dyaw * 1000.0))
+    if abs(de) > 0.05 or abs(dn) > 0.05:
+        warn("datum E/N delta > 0.05 m (dE=%.4f dN=%.4f) -- INFORMATIONAL: "
+             "bundle waypoints use the NAVI PICKLE datum, not site datum.yaml"
+             % (de, dn))
+    if abs(dyaw) > 0.002:
+        warn("datum yaw delta > 2 mrad (%.3f mrad) -- INFORMATIONAL: bundle "
+             "geometry uses the source pickle datum" % (dyaw * 1000.0))
+
+
+# --------------------------------------------------------------------------
+# printing / writing
+# --------------------------------------------------------------------------
+def print_section(title, items, fmt):
+    print("\n== %s (%d) ==" % (title, len(items)))
+    for it in items:
+        print("   " + fmt(it))
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Migrate legacy pickles -> site "
+                                             "bundle (dry-run by default).")
+    ap.add_argument("--site", required=True)
+    ap.add_argument("--navi-map", required=True,
+                    help="map filename (no .pkl) in saves/maps_data/")
+    ap.add_argument("--programs-map", default=None,
+                    help="override source map whose datum converts ALL program "
+                         "geometry (default: per-program map_name)")
+    ap.add_argument("--apply", action="store_true",
+                    help="actually write bundle files (default: dry-run)")
+    ap.add_argument("--force", action="store_true",
+                    help="overwrite existing bundle files under --apply")
+    args = ap.parse_args()
+
+    mode = "APPLY" if args.apply else "DRY-RUN"
+    print("=" * 70)
+    print("migrate_to_bundle  [%s]  site=%s  navi_map=%s%s"
+          % (mode, args.site, args.navi_map,
+             ("  programs-map=%s" % args.programs_map)
+             if args.programs_map else ""))
+    print("=" * 70)
+
+    # --- navi map pickle (waypoints + paths) ---
+    md, mdpath = load_map_pickle(args.navi_map)
+    if md is None:
+        print("FATAL: navi map pickle not found: %s" % mdpath)
+        return 2
+    navi_datum = geo.from_pickle_datum(md)
+    print("navi map pickle: %s" % mdpath)
+    print("  internal map_name field = %r (IGNORED; keyed by filename)"
+          % md.map_name)
+    print("  datum: E=%.3f N=%.3f alt=%s yaw=%.6f rad (%.4f deg)"
+          % (navi_datum["utm_e"], navi_datum["utm_n"],
+             ("%.3f" % navi_datum.get("alt")) if "alt" in navi_datum else "n/a",
+             navi_datum["yaw_rad"], math.degrees(navi_datum["yaw_rad"])))
+
+    wps, paths = extract_waypoints_paths(md, navi_datum)
+
+    # --- programs + zones ---
+    programs, zones_by_name, datum_paths = extract_programs_zones(
+        args.programs_map)
+    merge_planner_data_zones(args.navi_map, zones_by_name)
+    zones = list(zones_by_name.values())
+
+    # --- manifest ---
+    manifest = {"site": args.site, "version": 1, "utm_zone": UTM_ZONE,
+                "navi_map": args.navi_map,
+                "source_maps_data": os.path.basename(mdpath),
+                "source_programs": os.path.basename(PROGRAMS_PKL),
+                "note": "Canonical geometry in UTM metres (EPSG:%d). "
+                        "Generated coverage paths are NOT stored."
+                        % bundle.epsg_for_zone(UTM_ZONE)}
+
+    # --- report ---
+    print_section("waypoints", wps,
+                  lambda w: "%-14s E=%.3f N=%.3f yaw=%.4f%s"
+                  % (w["name"], w["e"], w["n"], w["yaw_rad"],
+                     (" z=%.3f" % w["z"]) if "z" in w else ""))
+    print_section("paths", paths,
+                  lambda p: "%-14s %d vertices" % (p["name"],
+                                                   len(p["vertices"])))
+    print_section("zones", zones,
+                  lambda z: "%-20s %d pts  props=%s"
+                  % (z["name"], len(z["polygon"]), z["props"]))
+    print_section("programs", programs,
+                  lambda p: "%-26s src=%s zones=%s speed=%s rpm=%s cut=%s "
+                  "ovr=%s last=%r"
+                  % (p["name"], p["source_map"], p["zone_names"], p["speed"],
+                     p["rpm"], p["cut_height"], p["override_zone"],
+                     p["last_result"]))
+
+    datum_delta_report(navi_datum, args.site)
+
+    print("\nManifest to write:")
+    for k, v in manifest.items():
+        print("   %-18s %s" % (k, v))
+
+    # --- write / refuse ---
+    files = bundle.bundle_files(args.site)
+    print("\nTarget bundle dir: %s" % bundle.site_dir(args.site))
+    if not args.apply:
+        print("\n[DRY-RUN] no files written. Re-run with --apply to write "
+              "(add --force to overwrite existing).")
+    else:
+        existing = [p for p in files.values() if os.path.exists(p)]
+        if existing and not args.force:
+            print("\nREFUSING to overwrite existing bundle files (use "
+                  "--force):")
+            for p in existing:
+                print("   %s" % p)
+            return 3
+        bundle.save_manifest(args.site, manifest)
+        bundle.save_waypoints(args.site, wps, utm_zone=UTM_ZONE)
+        bundle.save_paths(args.site, paths, utm_zone=UTM_ZONE)
+        bundle.save_zones(args.site, zones, utm_zone=UTM_ZONE)
+        bundle.save_programs(args.site, programs)
+        print("\n[APPLY] wrote:")
+        for k, p in files.items():
+            print("   %-10s %s" % (k, p))
+
+    if WARNINGS:
+        print("\n%d WARNING(S) above." % len(WARNINGS))
+    print("\nDone (%s)." % mode)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

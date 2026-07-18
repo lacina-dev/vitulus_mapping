@@ -1,0 +1,228 @@
+#!/usr/bin/env python3
+"""
+Offline unit test for vitulus_mapping.geo + vitulus_mapping.bundle.
+
+NO ROS required.  Checks:
+  1. map->utm->map roundtrip < 1e-3 m over random points with a NONZERO datum
+     yaw (~0.1 rad), and the yaw heading roundtrip.
+  2. bundle save->load equality for waypoints / paths / zones / programs /
+     manifest.
+  3. atomicity smoke: after a write no *.tmp.* files are left behind.
+  4. REALITY check against the live pickle + site datum (no assert, prints):
+     the 'docked' waypoint of GARDEN_2026***env*OUTDOOR converted with the
+     pickle's own datum vs with novamapa/datum.yaml -- quantifies the
+     pickle-vs-site datum delta on a real point.
+
+Exit code 0 on pass, non-zero on failure.
+"""
+import math
+import os
+import random
+import sys
+import tempfile
+
+SRC = "/home/vitulus/catkin_ws/src/vitulus/vitulus_mapping/src"
+sys.path.insert(0, SRC)
+
+from vitulus_mapping import geo, bundle  # noqa: E402
+
+FAILS = []
+
+
+def check(cond, msg):
+    if cond:
+        print("  ok  : %s" % msg)
+    else:
+        print("  FAIL: %s" % msg)
+        FAILS.append(msg)
+
+
+def test_roundtrip():
+    print("[1] geo map<->utm roundtrip (nonzero yaw)")
+    datum = {"utm_e": 493075.9, "utm_n": 5540714.8, "yaw_rad": 0.1}  # ~5.7 deg
+    random.seed(1234)
+    worst = 0.0
+    worst_yaw = 0.0
+    for _ in range(2000):
+        x = random.uniform(-500, 500)
+        y = random.uniform(-500, 500)
+        e, n = geo.map_to_utm(x, y, datum)
+        x2, y2 = geo.utm_to_map(e, n, datum)
+        worst = max(worst, math.hypot(x2 - x, y2 - y))
+        ym = random.uniform(-math.pi, math.pi)
+        yu = geo.map_yaw_to_utm(ym, datum)
+        ym2 = geo.utm_yaw_to_map(yu, datum)
+        worst_yaw = max(worst_yaw, abs(geo.wrap_pi(ym2 - ym)))
+    print("      worst position error = %.3e m ; worst yaw error = %.3e rad"
+          % (worst, worst_yaw))
+    check(worst < 1e-3, "position roundtrip < 1e-3 m")
+    check(worst_yaw < 1e-9, "yaw roundtrip exact")
+
+    # a known hand-computed point: map (1,0) at yaw=90deg -> +N
+    d90 = {"utm_e": 0.0, "utm_n": 0.0, "yaw_rad": math.pi / 2}
+    e, n = geo.map_to_utm(1.0, 0.0, d90)
+    check(abs(e) < 1e-9 and abs(n - 1.0) < 1e-9,
+          "map (1,0)@90deg -> (0,1) UTM (CCW rotation sign)")
+
+    # datum-schema normalization equivalence
+    pickle_like = {"utm_x": 493075.9, "utm_y": 5540714.8,
+                   "utm_orientation_z": math.sin(0.05),
+                   "utm_orientation_w": math.cos(0.05)}
+    yaml_like = {"utm_e": 493075.9, "utm_n": 5540714.8, "yaw_rad": 0.1}
+    ea, na = geo.map_to_utm(3.0, 4.0, pickle_like)
+    eb, nb = geo.map_to_utm(3.0, 4.0, yaml_like)
+    check(abs(ea - eb) < 1e-9 and abs(na - nb) < 1e-9,
+          "pickle-schema and yaml-schema datums agree")
+
+
+def test_bundle_io():
+    print("[2] bundle save->load equality + [3] atomicity smoke")
+    random.seed(42)
+    prev_root = bundle.SITES_ROOT
+    tmp = tempfile.mkdtemp(prefix="bundle_test_")
+    bundle.SITES_ROOT = tmp
+    site = "unittest"
+    try:
+        man = bundle.save_manifest(site, {"navi_map": "FAKE***env*OUTDOOR",
+                                          "utm_zone": 33, "version": 1})
+        man2 = bundle.load_manifest(site)
+        check(man2["utm_zone"] == 33 and man2["navi_map"] == man["navi_map"],
+              "manifest roundtrip")
+
+        wps = []
+        for i in range(20):
+            wp = {"name": "wp%d" % i,
+                  "e": 493000 + random.uniform(-50, 50),
+                  "n": 5540700 + random.uniform(-50, 50),
+                  "yaw_rad": random.uniform(-math.pi, math.pi)}
+            if i % 3 == 0:
+                wp["z"] = random.uniform(-1, 1)
+            wps.append(wp)
+        bundle.save_waypoints(site, wps)
+        got = bundle.load_waypoints(site)
+        okw = len(got) == len(wps) and all(
+            g["name"] == w["name"]
+            and abs(g["e"] - w["e"]) < 1e-6 and abs(g["n"] - w["n"]) < 1e-6
+            and abs(g["yaw_rad"] - w["yaw_rad"]) < 1e-9
+            and (("z" not in w) or abs(g.get("z", 1e9) - w["z"]) < 1e-6)
+            for g, w in zip(got, wps))
+        check(okw, "waypoints roundtrip (incl optional z)")
+
+        paths = []
+        for i in range(5):
+            nv = random.randint(2, 8)
+            verts = [(493000 + random.uniform(-50, 50),
+                      5540700 + random.uniform(-50, 50)) for _ in range(nv)]
+            yaws = [random.uniform(-math.pi, math.pi) for _ in range(nv)]
+            paths.append({"name": "path%d" % i, "vertices": verts, "yaws": yaws})
+        bundle.save_paths(site, paths)
+        gp = bundle.load_paths(site)
+        okp = len(gp) == len(paths) and all(
+            g["name"] == p["name"] and len(g["vertices"]) == len(p["vertices"])
+            and all(abs(a[0] - b[0]) < 1e-6 and abs(a[1] - b[1]) < 1e-6
+                    for a, b in zip(g["vertices"], p["vertices"]))
+            and all(abs(a - b) < 1e-9 for a, b in zip(g["yaws"], p["yaws"]))
+            for g, p in zip(gp, paths))
+        check(okp, "paths roundtrip (vertices + yaws)")
+
+        zones = []
+        for i in range(4):
+            nv = random.randint(3, 7)
+            poly = [(493000 + random.uniform(-50, 50),
+                     5540700 + random.uniform(-50, 50)) for _ in range(nv)]
+            zones.append({"name": "zone%d" % i, "polygon": poly,
+                          "props": {"cut_height": 50 + i, "rpm": 3000 + i,
+                                    "type": "normal", "area": 12.3 + i}})
+        bundle.save_zones(site, zones)
+        gz = bundle.load_zones(site)
+        okz = len(gz) == len(zones) and all(
+            g["name"] == z["name"] and len(g["polygon"]) == len(z["polygon"])
+            and all(abs(a[0] - b[0]) < 1e-6 and abs(a[1] - b[1]) < 1e-6
+                    for a, b in zip(g["polygon"], z["polygon"]))
+            and g["props"].get("cut_height") == z["props"]["cut_height"]
+            for g, z in zip(gz, zones))
+        check(okz, "zones roundtrip (polygon + props)")
+
+        progs = [{"name": "P%d" % i, "zone_names": ["zone%d" % i],
+                  "speed": "mid", "rpm": 3400, "cut_height": 50,
+                  "override_zone": bool(i % 2), "last_result": "succeeded"}
+                 for i in range(3)]
+        bundle.save_programs(site, progs)
+        gpr = bundle.load_programs(site)
+        check(gpr == progs, "programs roundtrip")
+
+        # atomicity smoke: no leftover tmp files anywhere under the site dir
+        leftovers = [f for f in os.listdir(bundle.site_dir(site))
+                     if ".tmp." in f]
+        check(not leftovers, "no leftover .tmp.* files (atomic writes cleaned)")
+
+        # mtime helper sanity
+        check(bundle.newest_mtime(site) is not None, "newest_mtime returns")
+        check(bundle.file_mtime(site, "zones") is not None,
+              "file_mtime(zones) returns")
+    finally:
+        bundle.SITES_ROOT = prev_root
+
+
+def test_reality():
+    print("[4] REALITY: 'docked' waypoint pickle-datum vs site datum.yaml")
+    import pickle
+    import yaml
+    sys.path.insert(0, "/home/vitulus/catkin_ws/src/vitulus/vitulus_navi/src")
+    pkl = "/home/vitulus/.vitulus/saves/maps_data/GARDEN_2026***env*OUTDOOR.pkl"
+    site_datum_yaml = "/home/vitulus/.vitulus/mapping_v3/novamapa/datum.yaml"
+    try:
+        from navi_man import mapdata  # noqa: F401  (needed to unpickle)
+        with open(pkl, "rb") as f:
+            md = pickle.load(f)
+    except Exception as exc:
+        print("      (skipped: cannot load pickle: %s)" % exc)
+        return
+    pt = None
+    for p in md.points:
+        if p.name == "docked":
+            pt = p
+            break
+    if pt is None:
+        print("      (skipped: no 'docked' waypoint)")
+        return
+    x, y = pt.pose.position.x, pt.pose.position.y
+    pdatum = geo.from_pickle_datum(md)
+    e_p, n_p = geo.map_to_utm(x, y, pdatum)
+    x_b, y_b = geo.utm_to_map(e_p, n_p, pdatum)
+    rt = math.hypot(x_b - x, y_b - y)
+    print("      docked map=(%.3f, %.3f)  pickle datum yaw=%.6f rad"
+          % (x, y, pdatum["yaw_rad"]))
+    print("      -> UTM via pickle datum = (%.3f, %.3f) ; self-roundtrip %.2e m"
+          % (e_p, n_p, rt))
+    check(rt < 1e-3, "real docked point self-roundtrip < 1e-3 m")
+
+    with open(site_datum_yaml) as f:
+        sd = yaml.safe_load(f)
+    sdatum = geo.from_datum_yaml(sd)
+    e_s, n_s = geo.map_to_utm(x, y, sdatum)
+    disc = math.hypot(e_s - e_p, n_s - n_p)
+    de, dn, dalt, dyaw = geo.datum_delta(pdatum, sdatum)
+    print("      -> UTM via site datum.yaml = (%.3f, %.3f)" % (e_s, n_s))
+    print("      DISCREPANCY on 'docked' (pickle vs site datum) = %.4f m"
+          % disc)
+    print("      datum delta site-minus-pickle: dE=%.4f dN=%.4f dAlt=%s "
+          "dYaw=%.6f rad (%.3f mrad)"
+          % (de, dn, ("%.4f" % dalt) if dalt is not None else "n/a",
+             dyaw, dyaw * 1000.0))
+
+
+def main():
+    test_roundtrip()
+    test_bundle_io()
+    test_reality()
+    print()
+    if FAILS:
+        print("RESULT: %d FAILURE(S)" % len(FAILS))
+        return 1
+    print("RESULT: ALL PASS")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

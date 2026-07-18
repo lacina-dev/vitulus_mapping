@@ -89,6 +89,9 @@ class BandProjectorNode:
         self.output_dir = os.path.expanduser(rospy.get_param(
             '~output_dir', '~/.vitulus/mapping_v3/default'))
         self.dem_path = os.path.join(self.output_dir, 'dem.npz')
+        # M5: how long load_dem waits for trajectory_dem's save to land
+        # (mtime advance) before giving up and loading whatever exists.
+        self.dem_save_wait_s = float(rospy.get_param('~dem_save_wait_s', 15.0))
         self.overrides_path = os.path.join(self.output_dir,
                                            'band_overrides.json')
         # per-site classifier overrides persist across sessions for this site
@@ -277,8 +280,22 @@ class BandProjectorNode:
                                message=json.dumps(info or {}))
 
     def cb_save(self, msg):
+        # M10: payload is either a plain raster name (legacy) or a JSON object
+        # {name?, write_ot?}. raster_on_stop sends write_ot=False so it does NOT
+        # mint an extra final_<ts>.ot (mapping_manager writes garden.ot itself),
+        # which otherwise orphaned one .ot per Stop.
+        payload = msg.data.strip()
+        name, write_ot = (payload or None), True
+        if payload.startswith('{'):
+            try:
+                req = json.loads(payload)
+                name = req.get('name') or None
+                write_ot = bool(req.get('write_ot', True))
+            except ValueError as e:
+                rospy.logwarn('band_projector: save bad JSON: %s', e)
+                return
         threading.Thread(target=self.full_save,
-                         args=(msg.data.strip() or None,), daemon=True).start()
+                         args=(name, write_ot), daemon=True).start()
 
     def cb_compare(self, msg):
         threading.Thread(target=self.compare, daemon=True).start()
@@ -310,9 +327,29 @@ class BandProjectorNode:
 
     # ---- core ---------------------------------------------------------------
     def load_dem(self):
-        """Ask the DEM node for a fresh save, then load it."""
+        """Ask the DEM node for a fresh save, then load it once the file is
+        actually rewritten. M5: the old fixed 2 s sleep raced ahead of a big
+        DEM's save (trajectory_dem snapshots + compresses a hectare) and read a
+        STALE dem.npz. Poll the mtime (0.2 s) until it advances past what it was
+        before the save request, or dem_save_wait_s elapses (then load whatever
+        exists). trajectory_dem writes atomically via os.replace, so the mtime
+        jump is a reliable 'new file landed' signal."""
+        try:
+            mtime0 = os.path.getmtime(self.dem_path)
+        except OSError:
+            mtime0 = 0.0
         self.pub_save_dem.publish(String(''))
-        time.sleep(2.0)
+        deadline = time.monotonic() + self.dem_save_wait_s
+        while time.monotonic() < deadline:
+            try:
+                if os.path.getmtime(self.dem_path) > mtime0:
+                    break
+            except OSError:
+                pass
+            time.sleep(0.2)
+        else:
+            rospy.logwarn('band_projector: DEM save not observed within %.1fs '
+                          '— loading existing dem.npz', self.dem_save_wait_s)
         if not os.path.exists(self.dem_path):
             rospy.logerr('band_projector: no DEM at %s', self.dem_path)
             return None
@@ -412,20 +449,25 @@ class BandProjectorNode:
         img.data = png
         self.pub_png.publish(img)
 
-    def full_save(self, name=None):
-        """Snapshot: .ot archive + DEM + fresh raster into output_dir."""
-        ot_path = os.path.join(self.output_dir,
-                               (name or 'garden') + '.ot')
-        os.makedirs(self.output_dir, exist_ok=True)
-        ns = rospy.get_namespace().rstrip('/') or '/mapping'
-        cmd = ['rosrun', 'octomap_server', 'octomap_saver', '-f', ot_path,
-               '__ns:=' + ns]
-        try:
-            subprocess.run(cmd, check=True, timeout=120,
-                           stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
-            rospy.loginfo('band_projector: octomap saved %s', ot_path)
-        except Exception as e:
-            rospy.logerr('band_projector: octomap_saver failed: %s', e)
+    def full_save(self, name=None, write_ot=True):
+        """Snapshot: .ot archive (optional) + DEM + fresh raster into
+        output_dir. M10: write_ot=False skips minting a final_<ts>.ot — used by
+        raster_on_stop, where mapping_manager saves garden.ot separately, so the
+        per-Stop .ot was just orphaned cruft."""
+        if write_ot:
+            ot_path = os.path.join(self.output_dir,
+                                   (name or 'garden') + '.ot')
+            os.makedirs(self.output_dir, exist_ok=True)
+            ns = rospy.get_namespace().rstrip('/') or '/mapping'
+            cmd = ['rosrun', 'octomap_server', 'octomap_saver', '-f', ot_path,
+                   '__ns:=' + ns]
+            try:
+                subprocess.run(cmd, check=True, timeout=120,
+                               stdout=subprocess.DEVNULL,
+                               stderr=subprocess.STDOUT)
+                rospy.loginfo('band_projector: octomap saved %s', ot_path)
+            except Exception as e:
+                rospy.logerr('band_projector: octomap_saver failed: %s', e)
         self.regenerate(name)
 
     def compare(self):

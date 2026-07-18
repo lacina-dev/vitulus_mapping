@@ -43,11 +43,14 @@ import time
 
 import cv2
 import numpy as np
+import rosnode
 import rospy
+import yaml
 from nav_msgs.msg import OccupancyGrid
 from sensor_msgs.msg import CompressedImage
 from std_msgs.msg import String
 
+from vitulus_mapping import bundle, editmask, geo
 from vitulus_mapping.demgrid import DemGrid
 from vitulus_mapping.pgmio import load_occupancy_pgm
 from vitulus_mapping.preview import dem_to_png
@@ -58,6 +61,9 @@ class MappingManager:
         self.base_dir = os.path.expanduser(rospy.get_param(
             '~base_dir', '~/.vitulus/mapping_v3'))
         os.makedirs(self.base_dir, exist_ok=True)
+        # WP-D1: keep bundle's site root aligned with our base_dir so
+        # bundle.load_edits/save_edits resolve the same <site> dirs we serve.
+        bundle.SITES_ROOT = self.base_dir
         self.proc = None
         self.site = None
         self.started_at = None
@@ -66,6 +72,15 @@ class MappingManager:
                                 # successfully published site_map, or None
         self.serve_error = None  # last serve_site rejection reason (str) for
                                  # the UI; cleared on the next successful serve
+        self.datum_warning = None  # M9: set at Stop when the just-ended session
+                                   # captured NO georef datum (UI observability)
+        self._last_gate_datum = None  # M9: last {samples, captured} seen on
+                                      # /mapping/gate_status
+        self._dem_m2_cache = {}    # M12: name -> (mtime, dem_m2)
+        self.session_resolution = None  # M13: resolution the active session
+                                        # started with (None when stopped)
+        self.edits_applied = 0     # WP-D1: number of human edits composited
+                                   # onto the currently-served raster (status)
         # REPORT 2 (freeserve 2026-07-12): every stopped mapping session should be
         # immediately servable. stop_proc used to autosave ONLY the octomap (.ot),
         # never a raster, so a just-mapped site had has_ot=true / rasters=0 and
@@ -94,6 +109,10 @@ class MappingManager:
         self.pub_site_map = rospy.Publisher('/mapping_manager/site_map',
                                             OccupancyGrid, queue_size=1,
                                             latch=True)
+        # WP-D1: latched list of human edits for the serving site (MAP frame),
+        # republished on every edit change and on every serve.
+        self.pub_edit_list = rospy.Publisher('/mapping_manager/edit_list',
+                                             String, queue_size=1, latch=True)
         rospy.Subscriber('/mapping_manager/start', String, self.cb_start,
                          queue_size=1)
         rospy.Subscriber('/mapping_manager/stop', String, self.cb_stop,
@@ -104,10 +123,24 @@ class MappingManager:
                          self.cb_show, queue_size=1)
         rospy.Subscriber('/mapping_manager/serve_site', String,
                          self.cb_serve_site, queue_size=1)
+        # WP-D1: human map-edit API (save/remove; edit_list is latched output).
+        rospy.Subscriber('/mapping_manager/save_edit', String,
+                         self.cb_save_edit, queue_size=4)
+        rospy.Subscriber('/mapping_manager/remove_edit', String,
+                         self.cb_remove_edit, queue_size=4)
+        # M9: watch the pipeline's gate_status so Stop can tell whether the
+        # session ever captured a georef datum.
+        rospy.Subscriber('/mapping/gate_status', String, self.cb_gate_status,
+                         queue_size=1)
         rospy.Timer(rospy.Duration(1.0), self.tick_status)
         rospy.on_shutdown(self.shutdown)
         self.show_site('')            # newest saved map visible right away
         rospy.loginfo('mapping_manager up, base_dir=%s', self.base_dir)
+        # M8: a manager restart leaves self.proc None, but a previous instance
+        # may have died mid-session leaving the /mapping pipeline running. Those
+        # orphans hold the octomap/gate topics and collide with the next start —
+        # detect and kill them ONCE at boot before declaring no session.
+        self._kill_orphan_pipeline()
         # Boot race fix (bootfix2, 2026-07-12): 'serving' is in-memory only, so a
         # respawn/restart leaves /mapping_manager/site_map with NO latched msg —
         # navi_man's octomap source then has nothing to republish and the whole
@@ -115,10 +148,51 @@ class MappingManager:
         # the persisted .last_served state) so site_map is latched immediately at
         # boot, without waiting for anyone to send serve_site.
         self.auto_serve_last()
+        # WP-D1: ensure edit_list is latched even if nothing is served at boot
+        # (auto_serve_last -> _publish_site_map already publishes it when a site
+        # was restored). Republish for the restored serving site, else empty.
+        if self.serving:
+            self._publish_edit_list(self.serving.get('site'))
+        else:
+            self.pub_edit_list.publish(String(json.dumps([])))
 
     # ---- lifecycle -----------------------------------------------------------
     def running(self):
         return self.proc is not None and self.proc.poll() is None
+
+    def cb_gate_status(self, msg):
+        """M9: track the pipeline's datum-capture progress so Stop can warn on a
+        session that never got a georef (no sustained RTK)."""
+        try:
+            s = json.loads(msg.data)
+        except (ValueError, TypeError):
+            return
+        if 'datum_samples' in s or 'datum_captured' in s:
+            self._last_gate_datum = {'samples': s.get('datum_samples', 0),
+                                     'captured': bool(s.get('datum_captured'))}
+
+    def _kill_orphan_pipeline(self):
+        """M8: kill a /mapping pipeline left running by a dead previous manager
+        instance (self.proc is None here, so it is not ours). Runs once at boot
+        (called from __init__). Uses rosnode.kill_nodes — we do not own the
+        orphans' process group, so os.killpg is not an option."""
+        session_nodes = ['/mapping/insertion_gate', '/mapping/trajectory_dem',
+                         '/mapping/band_projector', '/mapping/octomap_server']
+        try:
+            live = set(rosnode.get_node_names())
+        except Exception as e:
+            rospy.logwarn('mapping_manager: orphan check failed: %s', e)
+            return
+        orphans = [n for n in session_nodes if n in live]
+        if not orphans:
+            return
+        rospy.logwarn('mapping_manager: found ORPHANED mapping pipeline %s with '
+                      'no manager child — killing (a restart left it running)',
+                      orphans)
+        try:
+            rosnode.kill_nodes(orphans)
+        except Exception as e:
+            rospy.logwarn('mapping_manager: orphan kill failed: %s', e)
 
     def cb_start(self, msg):
         site = msg.data.strip() or 'default'
@@ -132,14 +206,19 @@ class MappingManager:
             self.stop_proc()
         # continue from a saved octomap archive when the site has one
         ot = os.path.join(self.base_dir, site, 'garden.ot')
+        # M13: per-site voxel/raster resolution (site_config.json), default 0.05.
+        res = self._site_resolution(site)
         cmd = ['roslaunch', 'vitulus_mapping', 'mapping_v3.launch',
-               'site:=' + site]
+               'site:=' + site, 'resolution:=%g' % res]
         if os.path.exists(ot):
             cmd.append('octomap:=' + ot)
         rospy.logwarn('mapping_manager: starting %s', ' '.join(cmd))
         self.proc = subprocess.Popen(cmd, start_new_session=True)
         self.site = site
         self.started_at = time.time()
+        self.session_resolution = res      # M13: report in status JSON
+        self.datum_warning = None          # M9: clear stale warning on new run
+        self._last_gate_datum = None
         # servesync (2026-07-12): serving must be CONSISTENT with the active
         # mapping session. Two cases at start-of-session for site X:
         #  (a) X has rasters (continuation, e.g. garden) -> auto-serve X's newest
@@ -167,6 +246,29 @@ class MappingManager:
             # so the link must point at X. Relink explicitly here (the empty
             # publish does not touch the datum link).
             self.link_site_datum(site)
+
+    def _site_resolution(self, site):
+        """M13: per-site voxel/raster resolution from <site>/site_config.json
+        (key 'resolution'), mirroring the band_overrides.json per-site pattern.
+        New/legacy sites without the file default to 0.05 m, so 'garden' (whose
+        garden.ot / rasters are 0.05 m) is unaffected. Out-of-range or malformed
+        values fall back to the default."""
+        default = float(rospy.get_param('~default_resolution', 0.05))
+        cfg = os.path.join(self.base_dir, site, 'site_config.json')
+        try:
+            with open(cfg) as f:
+                v = float(json.load(f).get('resolution', default))
+            if 0.01 <= v <= 1.0:
+                return v
+            rospy.logwarn('mapping_manager: site_config resolution %s out of '
+                          'range 0.01..1.0 for %s — using %.3f', v, site,
+                          default)
+        except FileNotFoundError:
+            pass
+        except (ValueError, TypeError, OSError) as e:
+            rospy.logwarn('mapping_manager: bad site_config for %s: %s — using '
+                          '%.3f', site, e, default)
+        return default
 
     def link_site_datum(self, site):
         """Point the canonical site-datum path at this site's datum.yaml so
@@ -211,9 +313,11 @@ class MappingManager:
         pgm = os.path.join(rasters_dir, raster + '.pgm')
         rospy.loginfo('mapping_manager: raster_on_stop — snapshotting %s/%s',
                       site, raster)
-        # band_projector.cb_save -> full_save(name): octomap_saver + regenerate
-        # (writes the .ot AND the raster). The pipeline is still running here.
-        self.pub_mapping_save.publish(String(raster))
+        # band_projector.cb_save -> full_save(name, write_ot=False): writes the
+        # raster only. M10: we skip its final_<ts>.ot (orphan cruft) because
+        # stop_proc saves garden.ot itself right after this. Pipeline still up.
+        self.pub_mapping_save.publish(String(json.dumps(
+            {'name': raster, 'write_ot': False})))
         deadline = time.time() + self.raster_on_stop_timeout_s
         while time.time() < deadline:
             if os.path.exists(pgm):
@@ -230,8 +334,8 @@ class MappingManager:
                       self.site, self.proc.pid)
         # REPORT 2: snapshot a raster BEFORE tearing the pipeline down, so the
         # just-mapped session is immediately servable (and auto-served below).
-        # full_save also writes the .ot, so the octomap-only save that follows
-        # is redundant on success but kept as a cheap fallback.
+        # M10: the snapshot is raster-only (write_ot=False), so the octomap-only
+        # save below is now the sole writer of garden.ot (no orphan final_*.ot).
         if self.raster_on_stop:
             try:
                 self._snapshot_raster_on_stop(self.site)
@@ -263,6 +367,18 @@ class MappingManager:
         self.proc = None
         self.site = None
         self.started_at = None
+        self.session_resolution = None     # M13
+        # M9: warn if the session captured NO georef datum (no sustained RTK).
+        # Observability only — no behavioural fallback.
+        gd = self._last_gate_datum
+        if gd is not None and not gd.get('captured') \
+                and (gd.get('samples') or 0) == 0:
+            self.datum_warning = (
+                'site "%s" captured NO georef datum this session (no sustained '
+                'RTK) — its map may be mislocated; remap with good GPS' % stopped)
+            rospy.logwarn('mapping_manager: %s', self.datum_warning)
+        else:
+            self.datum_warning = None
         if stopped:
             self.show_site(stopped)   # freshly saved data -> update previews
             # datumfix (2026-07-12): auto-serve the just-mapped site so its
@@ -296,14 +412,36 @@ class MappingManager:
 
     def cb_remove(self, msg):
         site = msg.data.strip()
+        # M1: validate the name (same rule cb_start uses) BEFORE building any
+        # path — a payload like '..' or 'a/../..' would otherwise let rmtree
+        # escape base_dir and delete ~/.vitulus/.
+        if not site or not site.replace('_', '').replace('-', '').isalnum():
+            rospy.logwarn('mapping_manager: refusing to remove invalid site '
+                          'name %r', site)
+            return
         path = os.path.join(self.base_dir, site)
-        if not site or not os.path.isdir(path):
+        # M1: belt-and-suspenders containment — the resolved path MUST stay
+        # strictly under base_dir (rejects symlink escapes too).
+        real = os.path.realpath(path)
+        if not real.startswith(os.path.realpath(self.base_dir) + os.sep):
+            rospy.logwarn('mapping_manager: refusing to remove out-of-tree '
+                          'path %s', real)
+            return
+        if not os.path.isdir(path):
             return
         if self.running() and site == self.site:
             rospy.logwarn('mapping_manager: refusing to remove running site %s',
                           site)
             return
+        # M1: never delete the site currently being served — it would strand
+        # /mapping_manager/site_map + gloc on a deleted raster. Clear serving
+        # (serve another site) first.
+        if self.serving and self.serving.get('site') == site:
+            rospy.logwarn('mapping_manager: refusing to remove currently-'
+                          'serving site %s — serve another site first', site)
+            return
         shutil.rmtree(path)
+        self._dem_m2_cache.pop(site, None)   # M12: drop cache for removed site
         rospy.logwarn('mapping_manager: removed site %s', site)
         self.show_site('')
 
@@ -542,6 +680,8 @@ class MappingManager:
         grid.data = []
         self.pub_site_map.publish(grid)
         self.serving = None
+        self.edits_applied = 0                # WP-D1: nothing served -> no edits
+        self.pub_edit_list.publish(String(json.dumps([])))
         # Drop the persisted last-served so a respawn during the fresh session does
         # not re-latch the old raster at boot (auto_serve_last would otherwise pick
         # it up again). It gets rewritten when a real raster is next served.
@@ -563,6 +703,13 @@ class MappingManager:
             return
         data, resolution, origin_xy = load_occupancy_pgm(base)
         nx, ny = data.shape
+
+        # WP-D1: composite human edits (edits.geojson, canonical UTM) onto the
+        # pristine sensor raster before publishing. Sensor pgms on disk stay
+        # untouched — regenerations never destroy human corrections. Failure
+        # here must NEVER block serving: fall back to the raw raster.
+        self.edits_applied = self._composite_edits(data, site, resolution,
+                                                    origin_xy)
 
         grid = OccupancyGrid()
         grid.header.stamp = rospy.Time.now()
@@ -588,8 +735,211 @@ class MappingManager:
         # navi_transform's fallback datum offset from the served map (garden vs
         # garden2 datums differ ~0.23 m / 0.9 deg). Serving now relinks too.
         self.link_site_datum(site)
-        rospy.loginfo('mapping_manager: site_map <- %s/%s (%dx%d @ %.3f m)',
-                      site, raster, nx, ny, resolution)
+        # WP-D1: publish the edit list for the served site on every serve.
+        self._publish_edit_list(site)
+        rospy.loginfo('mapping_manager: site_map <- %s/%s (%dx%d @ %.3f m, '
+                      '%d edits)', site, raster, nx, ny, resolution,
+                      self.edits_applied)
+
+    # ---- human map edits (WP-D1, SITE_BUNDLE_PLAN edits-mask) -----------------
+    def _load_datum(self, site):
+        """Return the canonical datum dict (geo schema) for <site>/datum.yaml,
+        or None if the site has no (readable) datum. Edits are stored in UTM,
+        so georeferencing them onto the map frame requires this datum."""
+        path = os.path.join(self.base_dir, site, 'datum.yaml')
+        try:
+            with open(path) as f:
+                d = yaml.safe_load(f)
+            if not d or 'utm_e' not in d:
+                return None
+            return geo.from_datum_yaml(d)
+        except (OSError, ValueError, KeyError, TypeError) as e:
+            rospy.logwarn('mapping_manager: datum load failed for %s: %s',
+                          site, e)
+            return None
+
+    def _composite_edits(self, data, site, resolution, origin_xy):
+        """Composite <site>/edits.geojson (UTM) onto the int8 [ix,iy] raster
+        array IN PLACE (last-writer-wins, list order). Returns the number of
+        edits applied (0 when none / no datum / on any failure). NEVER raises —
+        a compositing error must not block serving (raw raster is kept)."""
+        try:
+            edits = bundle.load_edits(site)
+            if not edits:
+                return 0
+            datum = self._load_datum(site)
+            if datum is None:
+                rospy.logwarn('mapping_manager: %s has %d edits but no datum '
+                              '— serving raw raster (edits not georeferenced)',
+                              site, len(edits))
+                return 0
+            edits_map = editmask.edits_to_map(edits, datum)
+            # composite on a copy so a mid-way failure still yields the raw map
+            work = data.copy()
+            applied = editmask.rasterize_edits(work, edits_map, resolution,
+                                               origin_xy)
+            data[...] = work
+            return applied
+        except Exception as e:
+            rospy.logwarn('mapping_manager: edit compositing failed for %s: %s '
+                          '— serving raw raster', site, e)
+            return 0
+
+    def _edit_records_map(self, site):
+        """Return [{name, kind, width_m, points:[[x,y],...] MAP frame}] for the
+        site's edits, converting canonical UTM back to the current map frame.
+        [] if no edits or no datum (edits cannot be placed without a datum)."""
+        edits = bundle.load_edits(site)
+        if not edits:
+            return []
+        datum = self._load_datum(site)
+        if datum is None:
+            return []
+        recs = []
+        for e in edits:
+            pts = [list(geo.utm_to_map(float(vx), float(vy), datum))
+                   for (vx, vy) in e.get('vertices', [])]
+            rec = {'name': e.get('name'), 'kind': e.get('kind'), 'points': pts}
+            if e.get('kind') == 'wall':
+                rec['width_m'] = float(e.get('width_m', 0.10))
+            recs.append(rec)
+        return recs
+
+    def _publish_edit_list(self, site):
+        """Publish the latched edit_list for the given site (MAP frame)."""
+        try:
+            recs = self._edit_records_map(site) if site else []
+        except Exception as e:
+            rospy.logwarn('mapping_manager: edit_list build failed for %s: %s',
+                          site, e)
+            recs = []
+        self.pub_edit_list.publish(String(json.dumps(recs)))
+
+    def _serving_site(self):
+        return self.serving.get('site') if self.serving else None
+
+    def _reserve_current(self):
+        """Re-serve the current raster (re-composites edits + republishes
+        site_map/edit_list). Used after an edit change."""
+        if self.serving:
+            self._publish_site_map(self.serving['site'],
+                                   self.serving['raster'])
+
+    def _next_edit_name(self, edits):
+        """Autogenerate 'edit_<n>' not colliding with existing edit names."""
+        n = 1
+        existing = {e.get('name') for e in edits}
+        while ('edit_%d' % n) in existing:
+            n += 1
+        return 'edit_%d' % n
+
+    def cb_save_edit(self, msg):
+        """Add/replace a human map edit on the SERVING site. Payload JSON:
+        {name?, kind:'obstacle'|'free'|'wall', points:[[x,y],...] MAP frame,
+        width_m? (wall, default 0.10)}. Converts map->UTM via the site datum,
+        upserts by name into edits.geojson, then re-serves (composited)."""
+        site = self._serving_site()
+        if site is None:
+            self._serve_reject('cannot save edit — no site is being served '
+                               '(serve a map first)')
+            return
+        try:
+            req = json.loads(msg.data)
+        except (ValueError, TypeError) as e:
+            self._serve_reject('save_edit: bad JSON: %s' % e)
+            return
+        kind = req.get('kind')
+        if kind not in editmask.KIND_VALUE:
+            self._serve_reject('save_edit: kind must be obstacle|free|wall '
+                               '(got %r)' % kind)
+            return
+        pts = req.get('points') or []
+        need = 1 if kind == 'wall' else 3
+        if len(pts) < need:
+            self._serve_reject('save_edit: %s needs >= %d points (got %d)'
+                               % (kind, need, len(pts)))
+            return
+        datum = self._load_datum(site)
+        if datum is None:
+            self._serve_reject('cannot save edit — served site "%s" has no '
+                               'datum.yaml (edits cannot be georeferenced)'
+                               % site)
+            return
+        try:
+            verts_utm = [geo.map_to_utm(float(p[0]), float(p[1]), datum)
+                         for p in pts]
+        except (ValueError, TypeError, IndexError) as e:
+            self._serve_reject('save_edit: bad points: %s' % e)
+            return
+        edits = bundle.load_edits(site)
+        name = (req.get('name') or '').strip() or self._next_edit_name(edits)
+        rec = {'name': name, 'kind': kind, 'vertices': verts_utm}
+        if kind == 'wall':
+            rec['width_m'] = float(req.get('width_m', 0.10))
+        # upsert by name, preserving order (replace in place, else append)
+        replaced = False
+        for i, e in enumerate(edits):
+            if e.get('name') == name:
+                edits[i] = rec
+                replaced = True
+                break
+        if not replaced:
+            edits.append(rec)
+        try:
+            bundle.save_edits(site, edits,
+                              utm_zone=datum.get('utm_zone'))
+        except Exception as e:
+            self._serve_reject('save_edit: write failed: %s' % e)
+            return
+        rospy.loginfo('mapping_manager: %s edit %r (%s, %d pts) on %s',
+                      'replaced' if replaced else 'added', name, kind,
+                      len(pts), site)
+        self._reserve_current()   # re-composite + republish site_map/edit_list
+
+    def cb_remove_edit(self, msg):
+        """Remove a human edit by name from the SERVING site; payload '*'
+        clears ALL edits. Then re-serves (composited)."""
+        site = self._serving_site()
+        if site is None:
+            self._serve_reject('cannot remove edit — no site is being served')
+            return
+        name = msg.data.strip()
+        if not name:
+            self._serve_reject('remove_edit: empty name')
+            return
+        if name == '*':
+            p = bundle.edits_path(site)
+            try:
+                if os.path.exists(p):
+                    os.remove(p)
+                rospy.loginfo('mapping_manager: cleared ALL edits on %s', site)
+            except OSError as e:
+                self._serve_reject('remove_edit: clear failed: %s' % e)
+                return
+            self._reserve_current()
+            return
+        edits = bundle.load_edits(site)
+        new = [e for e in edits if e.get('name') != name]
+        if len(new) == len(edits):
+            rospy.logwarn('mapping_manager: remove_edit: no edit named %r on '
+                          '%s', name, site)
+            self._publish_edit_list(site)   # UI resync anyway
+            return
+        try:
+            if not new:
+                p = bundle.edits_path(site)
+                if os.path.exists(p):
+                    os.remove(p)
+            else:
+                datum = self._load_datum(site)
+                zone = datum.get('utm_zone') if datum else \
+                    bundle.edits_utm_zone(site)
+                bundle.save_edits(site, new, utm_zone=zone)
+        except Exception as e:
+            self._serve_reject('remove_edit: write failed: %s' % e)
+            return
+        rospy.loginfo('mapping_manager: removed edit %r from %s', name, site)
+        self._reserve_current()
 
     # ---- status --------------------------------------------------------------
     def site_info(self, name):
@@ -599,13 +949,22 @@ class MappingManager:
         dem = os.path.join(d, 'dem.npz')
         if os.path.exists(dem):
             info['dem_kb'] = os.path.getsize(dem) // 1024
-            try:
-                with np.load(dem) as f:
-                    src = f['source']
-                    res = float(f['res'])
-                    info['dem_m2'] = round(int((src != 0).sum()) * res * res, 1)
-            except Exception:
-                pass
+            # M12: dem_m2 needs decompressing the npz — cache it per site keyed
+            # on mtime so the 1 Hz status tick doesn't reload every dem.npz.
+            mtime = os.path.getmtime(dem)
+            cached = self._dem_m2_cache.get(name)
+            if cached is not None and cached[0] == mtime:
+                info['dem_m2'] = cached[1]
+            else:
+                try:
+                    with np.load(dem) as f:
+                        src = f['source']
+                        res = float(f['res'])
+                        m2 = round(int((src != 0).sum()) * res * res, 1)
+                    info['dem_m2'] = m2
+                    self._dem_m2_cache[name] = (mtime, m2)
+                except Exception:
+                    pass
         rasters = os.path.join(d, 'rasters')
         if os.path.isdir(rasters):
             info['rasters'] = len(os.listdir(rasters))
@@ -619,6 +978,7 @@ class MappingManager:
             self.proc = None
             self.site = None
             self.started_at = None
+            self.session_resolution = None    # M13
         sites = sorted(n for n in os.listdir(self.base_dir)
                        if os.path.isdir(os.path.join(self.base_dir, n)))
         status = {
@@ -630,6 +990,9 @@ class MappingManager:
             'sites': [self.site_info(n) for n in sites],
             'serving': self.serving,
             'serve_error': self.serve_error,
+            'resolution': self.session_resolution,   # M13
+            'datum_warning': self.datum_warning,      # M9
+            'edits_applied': self.edits_applied,      # WP-D1
         }
         self.pub_status.publish(String(json.dumps(status)))
 

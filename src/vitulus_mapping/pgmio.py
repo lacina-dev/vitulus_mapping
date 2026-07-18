@@ -2,6 +2,7 @@
 map_server/nav2_map_server unchanged)."""
 
 import os
+import tempfile
 
 import numpy as np
 import yaml
@@ -14,8 +15,14 @@ _PX_UNKNOWN = 205  # gray
 
 def save_occupancy_pgm(path_base, raster, resolution, origin_xy):
     """raster: int8 [ix, iy] natural axes (100/0/-1). Writes <base>.pgm +
-    <base>.yaml. PGM rows top->bottom = +y max -> min, columns = +x."""
-    os.makedirs(os.path.dirname(path_base), exist_ok=True)
+    <base>.yaml. PGM rows top->bottom = +y max -> min, columns = +x.
+
+    M7: atomic + ORDERED. Both files are written to temp names in the same dir
+    and renamed into place with the .yaml FIRST, then the .pgm. Readers gate on
+    the .pgm existing (mapping_manager) and then need the sibling .yaml, so
+    'pgm exists' now guarantees a complete .yaml — no torn/half-written reads."""
+    d = os.path.dirname(path_base)
+    os.makedirs(d, exist_ok=True)
     nx, ny = raster.shape
     img = np.full((ny, nx), _PX_UNKNOWN, np.uint8)
     flipped = raster.T[::-1, :]                 # rows: y desc, cols: x asc
@@ -23,10 +30,7 @@ def save_occupancy_pgm(path_base, raster, resolution, origin_xy):
     img[flipped == 0] = _PX_FREE
 
     pgm_path = path_base + '.pgm'
-    with open(pgm_path, 'wb') as f:
-        f.write(b'P5\n%d %d\n255\n' % (nx, ny))
-        f.write(img.tobytes())
-
+    yaml_path = path_base + '.yaml'
     meta = {
         'image': os.path.basename(pgm_path),
         'resolution': float(resolution),
@@ -35,8 +39,17 @@ def save_occupancy_pgm(path_base, raster, resolution, origin_xy):
         'occupied_thresh': 0.65,
         'free_thresh': 0.196,
     }
-    with open(path_base + '.yaml', 'w') as f:
+
+    fd, tmp_pgm = tempfile.mkstemp(dir=d, suffix='.pgm')
+    with os.fdopen(fd, 'wb') as f:
+        f.write(b'P5\n%d %d\n255\n' % (nx, ny))
+        f.write(img.tobytes())
+    fd, tmp_yaml = tempfile.mkstemp(dir=d, suffix='.yaml')
+    with os.fdopen(fd, 'w') as f:
         yaml.safe_dump(meta, f, default_flow_style=False)
+    # publish the .yaml FIRST, then the .pgm -> pgm-exists implies yaml-complete
+    os.replace(tmp_yaml, yaml_path)
+    os.replace(tmp_pgm, pgm_path)
     return pgm_path
 
 
