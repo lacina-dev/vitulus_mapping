@@ -1066,6 +1066,27 @@ class MappingManager:
         # garden2 datums differ ~0.23 m / 0.9 deg). Serving now relinks too.
         self.link_site_datum(site)
         # WP-D1: publish the edit list for the served site on every serve.
+        # FRESH-SITE manifest (2026-07-19): manifests used to exist only via
+        # the one-time migration; bundle saves need utm_zone from somewhere
+        # stable. Auto-create a minimal manifest on first serve.
+        try:
+            mf = os.path.join(self.base_dir, site, 'manifest.yaml')
+            if not os.path.exists(mf):
+                dz = 33
+                try:
+                    with open(os.path.join(self.base_dir, site, 'datum.yaml')) as f:
+                        dz = int((yaml.safe_load(f) or {}).get('utm_zone', 33))
+                except Exception:
+                    pass
+                with open(mf + '.tmp', 'w') as f:
+                    yaml.safe_dump({'site': site, 'version': 1, 'utm_zone': dz,
+                                    'created': time.strftime('%Y-%m-%d %H:%M:%S'),
+                                    'note': 'auto-created at first serve'}, f)
+                os.replace(mf + '.tmp', mf)
+                rospy.loginfo('mapping_manager: manifest.yaml auto-created for '
+                              'site %s (utm_zone %d)', site, dz)
+        except Exception as e:
+            rospy.logwarn('mapping_manager: manifest auto-create failed: %s', e)
         self._publish_edit_list(site)
         # PROTOCOL 2026-07-19: republish the persisted tracker baseline for this
         # served raster so gloc seeds its rms baseline at map load.

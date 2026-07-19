@@ -204,8 +204,19 @@ def _utm_zone_for(site, utm_zone):
     m = load_manifest(site)
     if m and m.get("utm_zone") is not None:
         return int(m["utm_zone"])
-    raise ValueError("utm_zone not given and manifest has none for site %r"
-                     % site)
+    # FRESH-SITE FIX (2026-07-19 night): virgin sites have no manifest (those
+    # were only ever written by the one-time migration), which made EVERY
+    # bundle save on a new site raise here — the silent killer of the
+    # auto-saved 'docked' waypoint. The session datum.yaml carries the zone;
+    # fall back to it, then to the robot's home zone.
+    try:
+        with open(os.path.join(site_dir(site), "datum.yaml")) as f:
+            d = yaml.safe_load(f) or {}
+        if d.get("utm_zone") is not None:
+            return int(d["utm_zone"])
+    except Exception:
+        pass
+    return 33   # robot's home UTM zone (Czechia)
 
 
 # --------------------------------------------------------------------------
