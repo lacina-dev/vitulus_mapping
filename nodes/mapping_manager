@@ -13,8 +13,9 @@ Interfaces (absolute, UI-friendly):
   in   /mapping_manager/show_site    std_msgs/String  site name ('' = newest) ->
                                      renders saved previews from disk
   out  /mapping_manager/status       std_msgs/String  latched JSON 1 Hz:
-       {running, site, uptime_s, pid, sites: [{name, dem_kb, dem_cells?,
-        rasters, has_ot, mtime}]}
+       {running, site, uptime_s, pid, serving, previewing, sites:
+        [{name, dem_kb, dem_m2?, rasters, has_ot, mtime, raster_list:
+          [{name, mtime, cells_free, cells_obstacle}] up to 12 newest}]}
   out  /mapping_manager/terrain_png  sensor_msgs/CompressedImage (latched)
   out  /mapping_manager/raster_png   sensor_msgs/CompressedImage (latched)
   out  /mapping_manager/preview_info std_msgs/String  latched JSON
@@ -26,6 +27,12 @@ Interfaces (absolute, UI-friendly):
   out  /mapping_manager/site_map     nav_msgs/OccupancyGrid  latched, for
                                      gloc_server's ~map_topic (WP1,
                                      LOCALIZATION_V2_PLAN.md)
+  in   /mapping_manager/preview_raster std_msgs/String  'site/raster' to show,
+                                     '' to clear -> raw raster (NO edits)
+  out  /mapping_manager/raster_preview nav_msgs/OccupancyGrid  latched raw
+                                     raster preview (empty 0x0 grid clears)
+  in   /mapping_manager/remove_raster  std_msgs/String  'site/raster' (refuses
+                                     the served raster; clears preview first)
 
 The previews make saved maps visible in the UI at ANY time (the live
 /mapping/* preview topics exist only while the pipeline runs).
@@ -70,6 +77,9 @@ class MappingManager:
         self.map_frame = rospy.get_param('~map_frame', 'map')
         self.serving = None    # {'site', 'raster', 'mtime'} of the last
                                 # successfully published site_map, or None
+        self.previewing = None  # {'site', 'raster'} currently PREVIEWED on
+                                # /mapping_manager/raster_preview, or None
+                                # (raw raster, NO edits composited)
         self.serve_error = None  # last serve_site rejection reason (str) for
                                  # the UI; cleared on the next successful serve
         self.datum_warning = None  # M9: set at Stop when the just-ended session
@@ -77,6 +87,12 @@ class MappingManager:
         self._last_gate_datum = None  # M9: last {samples, captured} seen on
                                       # /mapping/gate_status
         self._dem_m2_cache = {}    # M12: name -> (mtime, dem_m2)
+        # per-raster mgmt: site -> (signature, raster_list). Cached like the
+        # dem_m2 cache so the 1 Hz status tick does not re-parse every raster
+        # *_meta.json; the signature is the cheap (name, pgm-mtime) tuple, so a
+        # new/removed raster (or a rewritten pgm) invalidates it, a meta parse
+        # does not repeat while unchanged.
+        self._raster_list_cache = {}
         self.session_resolution = None  # M13: resolution the active session
                                         # started with (None when stopped)
         self.edits_applied = 0     # WP-D1: number of human edits composited
@@ -113,6 +129,12 @@ class MappingManager:
         # republished on every edit change and on every serve.
         self.pub_edit_list = rospy.Publisher('/mapping_manager/edit_list',
                                              String, queue_size=1, latch=True)
+        # per-raster mgmt: latched RAW-raster preview (NO edits composited), for
+        # side-by-side comparison of raster versions in the UI 3D view. An empty
+        # 0x0 grid clears it (same clears-pattern as site_map).
+        self.pub_raster_preview = rospy.Publisher(
+            '/mapping_manager/raster_preview', OccupancyGrid, queue_size=1,
+            latch=True)
         rospy.Subscriber('/mapping_manager/start', String, self.cb_start,
                          queue_size=1)
         rospy.Subscriber('/mapping_manager/stop', String, self.cb_stop,
@@ -123,6 +145,11 @@ class MappingManager:
                          self.cb_show, queue_size=1)
         rospy.Subscriber('/mapping_manager/serve_site', String,
                          self.cb_serve_site, queue_size=1)
+        # per-raster mgmt: preview a raw raster / remove a raster.
+        rospy.Subscriber('/mapping_manager/preview_raster', String,
+                         self.cb_preview_raster, queue_size=1)
+        rospy.Subscriber('/mapping_manager/remove_raster', String,
+                         self.cb_remove_raster, queue_size=1)
         # WP-D1: human map-edit API (save/remove; edit_list is latched output).
         rospy.Subscriber('/mapping_manager/save_edit', String,
                          self.cb_save_edit, queue_size=4)
@@ -155,6 +182,9 @@ class MappingManager:
             self._publish_edit_list(self.serving.get('site'))
         else:
             self.pub_edit_list.publish(String(json.dumps([])))
+        # per-raster mgmt: latch an empty raster_preview at boot so subscribers
+        # (the UI 3D preview layer) always get an initial message.
+        self._clear_preview()
 
     # ---- lifecycle -----------------------------------------------------------
     def running(self):
@@ -442,6 +472,7 @@ class MappingManager:
             return
         shutil.rmtree(path)
         self._dem_m2_cache.pop(site, None)   # M12: drop cache for removed site
+        self._raster_list_cache.pop(site, None)   # per-raster mgmt cache too
         rospy.logwarn('mapping_manager: removed site %s', site)
         self.show_site('')
 
@@ -614,6 +645,126 @@ class MappingManager:
         self.serve_error = reason
         rospy.logwarn('mapping_manager: serve_site rejected: %s', reason)
         self.tick_status(None)   # push the reason to the UI immediately
+
+    # ---- per-raster management (preview / remove) ----------------------------
+    def _validate_raster_ref(self, payload):
+        """Parse+validate a 'site/raster' reference with the same discipline as
+        serve_site / the hardened remove_site: both name parts must be non-empty
+        alnum (with _ and -), and the resolved raster dir MUST stay strictly
+        under base_dir (rejects '..' / symlink escapes). Returns
+        (site, raster, base) where base is the '<...>/<raster>' path prefix that
+        load_occupancy_pgm consumes. Raises ValueError on any violation."""
+        if '/' not in payload:
+            raise ValueError('expected "site/raster"')
+        site, raster = payload.split('/', 1)
+        for part in (site, raster):
+            if not part or not part.replace('_', '').replace('-', '').isalnum():
+                raise ValueError('invalid name %r' % part)
+        rdir = os.path.join(self.base_dir, site, 'rasters', raster)
+        real = os.path.realpath(rdir)
+        if not real.startswith(os.path.realpath(self.base_dir) + os.sep):
+            raise ValueError('out-of-tree path %s' % real)
+        return site, raster, os.path.join(rdir, raster)
+
+    def _clear_preview(self):
+        """Publish an explicit EMPTY (0x0) OccupancyGrid on raster_preview to
+        clear the UI preview layer, and drop the previewing state. Same
+        empty-grid-clears pattern as _publish_empty_site_map."""
+        grid = OccupancyGrid()
+        grid.header.stamp = rospy.Time.now()
+        grid.header.frame_id = self.map_frame
+        grid.info.resolution = 0.0
+        grid.info.width = 0
+        grid.info.height = 0
+        grid.info.origin.orientation.w = 1.0
+        grid.data = []
+        self.pub_raster_preview.publish(grid)
+        if self.previewing is not None:
+            self.previewing = None
+            rospy.loginfo('mapping_manager: raster_preview <- EMPTY (cleared)')
+
+    def cb_preview_raster(self, msg):
+        """Show a RAW raster (pgm+yaml, NO edits composited — raw is the point
+        of comparison) latched on /mapping_manager/raster_preview. Payload
+        'site/raster' to show, '' to clear. Validation mirrors serve_site."""
+        payload = msg.data.strip()
+        if not payload:
+            self._clear_preview()
+            self.tick_status(None)
+            return
+        try:
+            site, raster, base = self._validate_raster_ref(payload)
+        except ValueError as e:
+            self._serve_reject('preview: %s' % e)
+            return
+        if not os.path.exists(base + '.pgm'):
+            self._serve_reject('preview: no such raster %s' % payload)
+            return
+        try:
+            data, resolution, origin_xy = load_occupancy_pgm(base)
+        except Exception as e:
+            self._serve_reject('preview: load failed for %s: %s'
+                               % (payload, e))
+            return
+        nx, ny = data.shape
+        grid = OccupancyGrid()
+        grid.header.stamp = rospy.Time.now()
+        grid.header.frame_id = self.map_frame
+        grid.info.resolution = resolution
+        grid.info.width = nx
+        grid.info.height = ny
+        grid.info.origin.position.x = origin_xy[0]
+        grid.info.origin.position.y = origin_xy[1]
+        grid.info.origin.orientation.w = 1.0
+        grid.data = data.T.ravel().tolist()   # row-major over y, matches serve
+        self.pub_raster_preview.publish(grid)
+        self.previewing = {'site': site, 'raster': raster}
+        rospy.loginfo('mapping_manager: raster_preview <- %s (%dx%d @ %.3f m)',
+                      payload, nx, ny, resolution)
+        self.tick_status(None)   # push previewing to the UI immediately
+
+    def cb_remove_raster(self, msg):
+        """Delete a single raster dir. Refuses the currently SERVED raster;
+        clears the preview first if it targets the removed raster. Name
+        validation + realpath containment (hardened remove_site discipline),
+        then shutil.rmtree, then republish status."""
+        payload = msg.data.strip()
+        try:
+            site, raster, base = self._validate_raster_ref(payload)
+        except ValueError as e:
+            self._serve_reject('remove_raster: %s' % e)
+            return
+        rdir = os.path.join(self.base_dir, site, 'rasters', raster)
+        if not os.path.isdir(rdir):
+            self._serve_reject('remove_raster: no such raster %s' % payload)
+            return
+        # never delete the raster gloc/costmaps are localizing against
+        if self.serving and self.serving.get('site') == site \
+                and self.serving.get('raster') == raster:
+            self._serve_reject('cannot delete the SERVED raster %s — serve '
+                               'another first' % payload)
+            return
+        # clearing the preview first avoids leaving a latched grid pointing at a
+        # just-deleted raster
+        if self.previewing and self.previewing.get('site') == site \
+                and self.previewing.get('raster') == raster:
+            self._clear_preview()
+        # belt-and-suspenders containment re-check right before rmtree
+        real = os.path.realpath(rdir)
+        if not real.startswith(os.path.realpath(self.base_dir) + os.sep):
+            rospy.logwarn('mapping_manager: refusing to remove out-of-tree '
+                          'raster %s', real)
+            return
+        try:
+            shutil.rmtree(rdir)
+        except OSError as e:
+            self._serve_reject('remove_raster: delete failed for %s: %s'
+                               % (payload, e))
+            return
+        self._raster_list_cache.pop(site, None)   # drop stale cached list
+        rospy.logwarn('mapping_manager: removed raster %s/%s', site, raster)
+        self.show_site(site)     # refresh disk previews (raster png may change)
+        self.tick_status(None)   # push updated raster_list/status to the UI
 
     # ---- last-served persistence (bootfix2) ---------------------------------
     def _last_served_path(self):
@@ -942,6 +1093,44 @@ class MappingManager:
         self._reserve_current()
 
     # ---- status --------------------------------------------------------------
+    def _raster_list(self, site, limit=12):
+        """Up to `limit` newest rasters (by .pgm mtime) under <site>/rasters,
+        each {name, mtime, cells_free, cells_obstacle}. cells come from the
+        raster's <name>_meta.json when present (None when missing/unreadable).
+        Cached per site keyed on the cheap (name, pgm-mtime) signature so the
+        1 Hz status tick does not re-parse every meta.json (M12 dem_m2 pattern).
+        """
+        rasters = os.path.join(self.base_dir, site, 'rasters')
+        if not os.path.isdir(rasters):
+            return []
+        entries = []
+        for name in os.listdir(rasters):
+            pgm = os.path.join(rasters, name, name + '.pgm')
+            if not os.path.exists(pgm):
+                continue
+            entries.append((name, os.path.getmtime(pgm)))
+        entries.sort(key=lambda e: e[1], reverse=True)
+        entries = entries[:limit]
+        sig = tuple(entries)
+        cached = self._raster_list_cache.get(site)
+        if cached is not None and cached[0] == sig:
+            return cached[1]
+        out = []
+        for name, mtime in entries:
+            rec = {'name': name, 'mtime': int(mtime),
+                   'cells_free': None, 'cells_obstacle': None}
+            meta = os.path.join(rasters, name, name + '_meta.json')
+            try:
+                with open(meta) as f:
+                    m = json.load(f)
+                rec['cells_free'] = m.get('cells_free')
+                rec['cells_obstacle'] = m.get('cells_obstacle')
+            except (OSError, ValueError):
+                pass
+            out.append(rec)
+        self._raster_list_cache[site] = (sig, out)
+        return out
+
     def site_info(self, name):
         d = os.path.join(self.base_dir, name)
         info = {'name': name, 'dem_kb': 0, 'rasters': 0, 'has_ot': False,
@@ -969,6 +1158,8 @@ class MappingManager:
         if os.path.isdir(rasters):
             info['rasters'] = len(os.listdir(rasters))
         info['has_ot'] = any(f.endswith('.ot') for f in os.listdir(d))
+        # per-raster mgmt: up to 12 newest rasters w/ cell counts (cached).
+        info['raster_list'] = self._raster_list(name)
         return info
 
     def tick_status(self, _evt):
@@ -989,6 +1180,7 @@ class MappingManager:
             'pid': self.proc.pid if self.running() else None,
             'sites': [self.site_info(n) for n in sites],
             'serving': self.serving,
+            'previewing': self.previewing,            # per-raster mgmt
             'serve_error': self.serve_error,
             'resolution': self.session_resolution,   # M13
             'datum_warning': self.datum_warning,      # M9
