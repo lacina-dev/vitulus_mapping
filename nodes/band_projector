@@ -113,6 +113,32 @@ class BandProjectorNode:
         # (Measured on novaTestovaciMapa: 0.90 removes 222 more false cells at
         # zero real-cluster loss; real clusters bottom out at cmax=0.927.)
         self.min_occupancy = float(rospy.get_param('~min_occupancy', 0.90))
+        # --- classifier v5 (2026-07-19, forensic round-3) -------------------
+        # Ground-contact / floating-sheet gate. A real static obstacle grows from
+        # the ground up; the RTK-altitude-excursion phantom is a sheet floating
+        # ~0.5 m up with raytraced-FREE space beneath (impossible for a grounded
+        # column). Drop an obstacle CLUSTER iff it barely reaches the ground
+        # (contact fraction < gc_min_contact_frac) AND is either a broad areal
+        # sheet (minor width >= gc_sheet_min_width_m) OR has a free-below majority
+        # (> gc_min_free_below_frac) — unless it is a thin, linear cluster at the
+        # 2D-lidar plane (lidar-only wall exemption). Confidence-independent, so it
+        # removes the dwell-hammered high-occupancy phantom the min_occupancy gate
+        # cannot. See band.project_band (CLASSIFIER v5). gc_gate=False disables.
+        self.gc_gate = bool(rospy.get_param('~gc_gate', True))
+        self.gc_contact_max_h = float(rospy.get_param('~gc_contact_max_h', 0.30))
+        self.gc_min_contact_frac = float(
+            rospy.get_param('~gc_min_contact_frac', 0.35))
+        self.gc_free_gap_m = float(rospy.get_param('~gc_free_gap_m', 0.15))
+        self.gc_min_free_below_frac = float(
+            rospy.get_param('~gc_min_free_below_frac', 0.50))
+        self.gc_sheet_min_width_m = float(
+            rospy.get_param('~gc_sheet_min_width_m', 0.30))
+        self.gc_exempt_max_width_m = float(
+            rospy.get_param('~gc_exempt_max_width_m', 0.20))
+        self.gc_exempt_min_elong = float(
+            rospy.get_param('~gc_exempt_min_elong', 4.0))
+        self.gc_exempt_plane_h = float(
+            rospy.get_param('~gc_exempt_plane_h', 0.42))
         # D3: the ot_dump helper reads octomap FREE leaves off the saved
         # garden.ot (octomap_server publishes only OCCUPIED centres on the wire).
         self.ot_dump_timeout_s = float(
@@ -189,6 +215,10 @@ class BandProjectorNode:
         d['cluster_min_ztop_m'] = round(self.cluster_min_ztop_m, 2)
         d['cluster_traj_dist_m'] = round(self.cluster_traj_dist_m, 2)
         d['min_occupancy'] = round(self.min_occupancy, 2)
+        d['gc_gate'] = self.gc_gate
+        d['gc_min_contact_frac'] = round(self.gc_min_contact_frac, 2)
+        d['gc_min_free_below_frac'] = round(self.gc_min_free_below_frac, 2)
+        d['gc_sheet_min_width_m'] = round(self.gc_sheet_min_width_m, 2)
         self.pub_status.publish(String(json.dumps(d)))
 
     # ---- classifier settings (live tuning) ----------------------------------
@@ -227,7 +257,16 @@ class BandProjectorNode:
                            'cluster_min_size': self.cluster_min_size,
                            'cluster_min_ztop_m': self.cluster_min_ztop_m,
                            'cluster_traj_dist_m': self.cluster_traj_dist_m,
-                           'min_occupancy': self.min_occupancy},
+                           'min_occupancy': self.min_occupancy,
+                           'gc_gate': self.gc_gate,
+                           'gc_contact_max_h': self.gc_contact_max_h,
+                           'gc_min_contact_frac': self.gc_min_contact_frac,
+                           'gc_free_gap_m': self.gc_free_gap_m,
+                           'gc_min_free_below_frac': self.gc_min_free_below_frac,
+                           'gc_sheet_min_width_m': self.gc_sheet_min_width_m,
+                           'gc_exempt_max_width_m': self.gc_exempt_max_width_m,
+                           'gc_exempt_min_elong': self.gc_exempt_min_elong,
+                           'gc_exempt_plane_h': self.gc_exempt_plane_h},
                           f, indent=1)
         except Exception as e:
             rospy.logwarn('band_projector: could not save band overrides: %s', e)
@@ -260,6 +299,20 @@ class BandProjectorNode:
             cl_tdist = float(req.get('cluster_traj_dist_m',
                                      self.cluster_traj_dist_m))
             min_occ = float(req.get('min_occupancy', self.min_occupancy))
+            gc_gate = bool(req.get('gc_gate', self.gc_gate))
+            gc_contact = float(req.get('gc_contact_max_h', self.gc_contact_max_h))
+            gc_minc = float(req.get('gc_min_contact_frac',
+                                    self.gc_min_contact_frac))
+            gc_gap = float(req.get('gc_free_gap_m', self.gc_free_gap_m))
+            gc_minf = float(req.get('gc_min_free_below_frac',
+                                    self.gc_min_free_below_frac))
+            gc_shw = float(req.get('gc_sheet_min_width_m',
+                                   self.gc_sheet_min_width_m))
+            gc_exw = float(req.get('gc_exempt_max_width_m',
+                                   self.gc_exempt_max_width_m))
+            gc_exe = float(req.get('gc_exempt_min_elong',
+                                   self.gc_exempt_min_elong))
+            gc_exp = float(req.get('gc_exempt_plane_h', self.gc_exempt_plane_h))
         except (TypeError, ValueError) as e:
             return None, 'non-numeric value: %s' % e
         if not (0.0 <= band_min < band_max <= 2.0):
@@ -291,6 +344,23 @@ class BandProjectorNode:
                           % cl_tdist)
         if not (0.0 <= min_occ <= 1.0):
             return None, ('min_occupancy out of range 0..1: %s' % min_occ)
+        if not (0.0 <= gc_contact <= 2.0):
+            return None, ('gc_contact_max_h out of range 0..2: %s' % gc_contact)
+        if not (0.0 <= gc_minc <= 1.0):
+            return None, ('gc_min_contact_frac out of range 0..1: %s' % gc_minc)
+        if not (0.0 <= gc_gap <= 2.0):
+            return None, ('gc_free_gap_m out of range 0..2: %s' % gc_gap)
+        if not (0.0 <= gc_minf <= 1.1):
+            return None, ('gc_min_free_below_frac out of range 0..1.1: %s'
+                          % gc_minf)
+        if not (0.0 <= gc_shw <= 10.0):
+            return None, ('gc_sheet_min_width_m out of range 0..10: %s' % gc_shw)
+        if not (0.0 <= gc_exw <= 10.0):
+            return None, ('gc_exempt_max_width_m out of range 0..10: %s' % gc_exw)
+        if not (0.0 <= gc_exe <= 1e6):
+            return None, ('gc_exempt_min_elong out of range 0..1e6: %s' % gc_exe)
+        if not (0.0 <= gc_exp <= 2.0):
+            return None, ('gc_exempt_plane_h out of range 0..2: %s' % gc_exp)
         self.band_min = band_min
         self.band_max = band_max
         self.min_evidence = min_evidence
@@ -306,6 +376,15 @@ class BandProjectorNode:
         self.cluster_min_ztop_m = cl_ztop
         self.cluster_traj_dist_m = cl_tdist
         self.min_occupancy = min_occ
+        self.gc_gate = gc_gate
+        self.gc_contact_max_h = gc_contact
+        self.gc_min_contact_frac = gc_minc
+        self.gc_free_gap_m = gc_gap
+        self.gc_min_free_below_frac = gc_minf
+        self.gc_sheet_min_width_m = gc_shw
+        self.gc_exempt_max_width_m = gc_exw
+        self.gc_exempt_min_elong = gc_exe
+        self.gc_exempt_plane_h = gc_exp
         applied = {'band_min': band_min, 'band_max': band_max,
                    'min_evidence': min_evidence,
                    'min_cluster_cells': min_cluster,
@@ -318,7 +397,16 @@ class BandProjectorNode:
                    'cluster_min_size': cl_size,
                    'cluster_min_ztop_m': cl_ztop,
                    'cluster_traj_dist_m': cl_tdist,
-                   'min_occupancy': min_occ}
+                   'min_occupancy': min_occ,
+                   'gc_gate': gc_gate,
+                   'gc_contact_max_h': gc_contact,
+                   'gc_min_contact_frac': gc_minc,
+                   'gc_free_gap_m': gc_gap,
+                   'gc_min_free_below_frac': gc_minf,
+                   'gc_sheet_min_width_m': gc_shw,
+                   'gc_exempt_max_width_m': gc_exw,
+                   'gc_exempt_min_elong': gc_exe,
+                   'gc_exempt_plane_h': gc_exp}
         if log:
             rospy.loginfo('band_projector: classifier settings -> %s',
                           json.dumps(applied))
@@ -566,7 +654,16 @@ class BandProjectorNode:
                                         cluster_min_ztop_m=self.cluster_min_ztop_m,
                                         cluster_traj_dist_m=self.cluster_traj_dist_m,
                                         occ_prob_xyz=occ_prob_xyz,
-                                        min_occupancy=self.min_occupancy)
+                                        min_occupancy=self.min_occupancy,
+                                        gc_gate=self.gc_gate,
+                                        gc_contact_max_h=self.gc_contact_max_h,
+                                        gc_min_contact_frac=self.gc_min_contact_frac,
+                                        gc_free_gap_m=self.gc_free_gap_m,
+                                        gc_min_free_below_frac=self.gc_min_free_below_frac,
+                                        gc_sheet_min_width_m=self.gc_sheet_min_width_m,
+                                        gc_exempt_max_width_m=self.gc_exempt_max_width_m,
+                                        gc_exempt_min_elong=self.gc_exempt_min_elong,
+                                        gc_exempt_plane_h=self.gc_exempt_plane_h)
             info.update({'fill_cells': filled, 'fill_dropped_slope': dropped,
                          'inpainted_cells': inpainted, 'points': len(pts),
                          'took_s': round(time.monotonic() - t0, 1)})

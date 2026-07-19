@@ -24,7 +24,12 @@ def project_band(dem, pts_xyz, band_min=0.10, band_max=0.60, min_evidence=6,
                  free_borrow_legacy=False,
                  cluster_min_size=15, cluster_min_ztop_m=0.30,
                  cluster_traj_dist_m=0.6,
-                 occ_prob_xyz=None, min_occupancy=0.0):
+                 occ_prob_xyz=None, min_occupancy=0.0,
+                 gc_gate=True, gc_contact_max_h=0.30,
+                 gc_min_contact_frac=0.35, gc_free_gap_m=0.15,
+                 gc_min_free_below_frac=0.50, gc_sheet_min_width_m=0.30,
+                 gc_exempt_max_width_m=0.20, gc_exempt_min_elong=4.0,
+                 gc_exempt_plane_h=0.42):
     """dem: DemGrid (already filled/inpainted copy), pts_xyz: Nx3 occupied
     voxel centers in map frame. Returns (raster int8 [ix, iy], info dict).
 
@@ -119,7 +124,46 @@ def project_band(dem, pts_xyz, band_min=0.10, band_max=0.60, min_evidence=6,
     `occ_prob_xyz` (Nx4 x,y,z,occ, from the ot_dump helper). min_occupancy=0
     disables the gate (backward compatible); a cluster with no occupancy coverage
     at all (cmax==0, e.g. occ_prob_xyz snapshot mismatch) is KEPT, never dropped
-    — the gate is strictly evidence-additive."""
+    — the gate is strictly evidence-additive.
+
+    CLASSIFIER v5 (2026-07-19, forensic round-3) — ground-contact / floating-sheet
+    gate. After v4's occ<0.9 post-filter, part of the phantom survived: an RTK
+    altitude-excursion COPY of the ground ~+0.5 m up that the robot dwelled on
+    during docking, ramming its occupancy to saturation so the min_occupancy gate
+    can no longer see it (dwell-hammered high-occ cells). Confidence cannot
+    separate it further, but PHYSICS can: a real static obstacle is occupied from
+    ~ground upward (its lowest in-band voxel reaches DOWN toward local ground),
+    while the phantom sheet has in-band voxels only around h~0.4-0.6 with a
+    raytraced-FREE gap BELOW — impossible for a grounded column. Per surviving
+    obstacle cluster this gate computes, using own-else-borrowed real ground:
+      (a) ground-contact fraction — share of columns whose LOWEST in-band occupied
+          voxel is below gc_contact_max_h (default 0.30 m). Real walls/trunks reach
+          down (frac high); the floating sheet does not (frac ~0).
+      (b) areal-sheet width — the cluster's minor-axis full width (m) from central
+          moments. A broad 2D sheet is wide in BOTH axes; a wall/fence is a thin
+          line. broad iff minor_w >= gc_sheet_min_width_m (default 0.30 m).
+      (c) free-below fraction — share of columns with a raytraced FREE leaf in a
+          genuine vertical GAP (>= gc_free_gap_m, default 0.15 m) between local
+          ground and the lowest in-band occupied voxel. Physically impossible for a
+          grounded obstacle; the phantom floats over free space (frac ~1).
+    A cluster is dropped iff it (a) barely touches ground (contact_frac <
+    gc_min_contact_frac) AND (b OR c) it is a broad sheet OR has a free-below
+    majority (fb_frac > gc_min_free_below_frac) — UNLESS EXEMPT as a 2D-lidar wall:
+    a thin (minor_w <= gc_exempt_max_width_m), linear (elongation >=
+    gc_exempt_min_elong) cluster whose in-band voxels sit at/below the lidar scan
+    plane (75th-pct in-band height <= gc_exempt_plane_h). Overhangs/branches are
+    respected by keeping the test cluster-level and parameterised. Validated on
+    novaTestovaciMapa: removes the full elevated ground-copy sheet (phantom body +
+    fragments, 294 cells / 20 clusters) at ZERO loss of the genuinely grounded real
+    structure (garage 623-cell cluster, walls, thin lidar fences all survive; the
+    only crude-'real'-labelled clusters dropped, id 22 & id 20, ARE the phantom
+    body & a floating copy — the size+ztop 'real' heuristic had mislabelled them).
+    Needs occ_prob_xyz (occupied voxel z); the free-below component additionally
+    needs free_xyz. Each component is disableable: gc_gate=False turns it off;
+    gc_min_free_below_frac>1.0 disables the free-below path; gc_sheet_min_width_m
+    huge disables the broad-sheet path; gc_exempt_max_width_m=0 disables the
+    lidar-wall exemption. A cluster with no in-band occupied coverage is never
+    dropped (contact defaults to 0 only over real evidence)."""
     nx, ny = dem.elev.shape
     evidence = np.zeros((nx, ny), np.int32)
     evidence_borrowed = np.zeros((nx, ny), np.int32)
@@ -323,6 +367,95 @@ def project_band(dem, pts_xyz, band_min=0.10, band_max=0.60, min_evidence=6,
                 occ_gate_clusters = int(drop_o.sum())
                 occ_gate_cells = int(drop_om.sum())
                 obstacle = obstacle & ~drop_om
+
+    # ---- v5: ground-contact / floating-sheet gate ---------------------------
+    # Drop a surviving obstacle cluster that FLOATS: it barely reaches the ground
+    # AND is either a broad areal sheet OR has raytraced FREE space beneath it in
+    # most columns (impossible for a grounded obstacle) — unless it is a thin,
+    # linear cluster at the 2D-lidar scan plane (a lidar-only wall). See the class
+    # docstring (CLASSIFIER v5) for the physics. Confidence-independent, so it
+    # catches the dwell-hammered high-occupancy phantom the min_occupancy gate
+    # cannot. Needs occ_prob_xyz; the free-below component also needs free_xyz.
+    gc_gate_clusters = 0
+    gc_gate_cells = 0
+    if (gc_gate and obstacle.any() and occ_prob_xyz is not None
+            and len(occ_prob_xyz)):
+        gcg = cell_ground_within(ground_ref_radius_m)
+        op = np.asarray(occ_prob_xyz, np.float64)
+        gx = np.floor((op[:, 0] - dem.ox) / dem.res).astype(np.int64)
+        gy = np.floor((op[:, 1] - dem.oy) / dem.res).astype(np.int64)
+        gok = (gx >= 0) & (gx < nx) & (gy >= 0) & (gy < ny)
+        gx, gy, gz = gx[gok], gy[gok], op[gok, 2]
+        gg = gcg[gx, gy]
+        gh = gz - gg
+        gin = np.isfinite(gg) & (gh >= band_min) & (gh <= band_max)
+        # per-cell lowest & highest in-band occupied height above local ground
+        low_h = np.full((nx, ny), np.inf, np.float32)
+        high_h = np.full((nx, ny), -np.inf, np.float32)
+        if gin.any():
+            np.minimum.at(low_h, (gx[gin], gy[gin]), gh[gin].astype(np.float32))
+            np.maximum.at(high_h, (gx[gin], gy[gin]), gh[gin].astype(np.float32))
+        # per-cell free-below flag: a raytraced FREE leaf in a real vertical gap
+        # between local ground and the lowest in-band occupied voxel
+        free_below = np.zeros((nx, ny), bool)
+        if (free_xyz is not None and len(free_xyz)
+                and gc_min_free_below_frac <= 1.0):
+            fx = np.asarray(free_xyz, np.float64)
+            fxi = np.floor((fx[:, 0] - dem.ox) / dem.res).astype(np.int64)
+            fyi = np.floor((fx[:, 1] - dem.oy) / dem.res).astype(np.int64)
+            fok = (fxi >= 0) & (fxi < nx) & (fyi >= 0) & (fyi < ny)
+            fxi, fyi, fz = fxi[fok], fyi[fok], fx[fok, 2]
+            fg = gcg[fxi, fyi]
+            fh = fz - fg
+            clow = low_h[fxi, fyi]
+            gapf = (np.isfinite(fg) & np.isfinite(clow)
+                    & (fh > 0.05) & (fh <= clow - gc_free_gap_m))
+            free_below[fxi[gapf], fyi[gapf]] = True
+        labg, ng = ndimage.label(obstacle, structure=np.ones((3, 3)))
+        if ng:
+            idxg = np.arange(ng + 1)
+            contact = np.where(low_h < gc_contact_max_h, 1.0,
+                               0.0).astype(np.float32)
+            contact_frac = ndimage.mean(contact, labg, idxg)
+            fb_frac = ndimage.mean(free_below.astype(np.float32), labg, idxg)
+            # per-cluster minor-axis width + elongation via central moments
+            cells = np.argwhere(obstacle)
+            ci = labg[cells[:, 0], cells[:, 1]]
+            xs = cells[:, 0].astype(np.float64)
+            ys = cells[:, 1].astype(np.float64)
+            cnt = np.bincount(ci, minlength=ng + 1).astype(np.float64)
+            cc = np.maximum(cnt, 1.0)
+            mx = np.bincount(ci, weights=xs, minlength=ng + 1) / cc
+            my = np.bincount(ci, weights=ys, minlength=ng + 1) / cc
+            mxx = np.bincount(ci, weights=xs * xs, minlength=ng + 1) / cc - mx * mx
+            myy = np.bincount(ci, weights=ys * ys, minlength=ng + 1) / cc - my * my
+            mxy = np.bincount(ci, weights=xs * ys, minlength=ng + 1) / cc - mx * my
+            tr = mxx + myy
+            det = mxx * myy - mxy * mxy
+            disc = np.sqrt(np.maximum(tr * tr / 4.0 - det, 0.0))
+            lam1 = tr / 2.0 + disc              # major-axis variance (cells^2)
+            lam2 = np.maximum(tr / 2.0 - disc, 0.0)   # minor-axis variance
+            minor_w = 2.0 * np.sqrt(3.0) * np.sqrt(lam2) * dem.res
+            elong = np.where(lam2 > 1e-9, lam1 / np.maximum(lam2, 1e-9), np.inf)
+            # 75th-pct in-band height per cluster (lidar-plane exemption test)
+            plane_h = ndimage.labeled_comprehension(
+                high_h, labg, idxg,
+                lambda v: (float(np.percentile(v[np.isfinite(v)], 75))
+                           if np.isfinite(v).any() else np.inf),
+                float, np.inf)
+            low_contact = contact_frac < gc_min_contact_frac
+            broad = minor_w >= gc_sheet_min_width_m
+            free_maj = fb_frac > gc_min_free_below_frac
+            exempt = ((minor_w <= gc_exempt_max_width_m)
+                      & (elong >= gc_exempt_min_elong)
+                      & (plane_h <= gc_exempt_plane_h))
+            drop_g = low_contact & (broad | free_maj) & ~exempt
+            drop_g[0] = False
+            if drop_g.any():
+                dmaskg = drop_g[labg]
+                gc_gate_clusters = int(drop_g.sum())
+                gc_gate_cells = int(dmaskg.sum())
+                obstacle = obstacle & ~dmaskg
     raster[obstacle] = OCC
 
     info = {
@@ -332,6 +465,8 @@ def project_band(dem, pts_xyz, band_min=0.10, band_max=0.60, min_evidence=6,
         'ztop_gate_cells_dropped': ztop_gate_cells,
         'occ_gate_clusters_dropped': occ_gate_clusters,
         'occ_gate_cells_dropped': occ_gate_cells,
+        'gc_gate_clusters_dropped': gc_gate_clusters,
+        'gc_gate_cells_dropped': gc_gate_cells,
         'cells_free': int((raster == FREE).sum()),
         'cells_free_realground': int(real_free_base.sum()),
         'cells_free_octomap': free_octomap,
@@ -351,6 +486,12 @@ def project_band(dem, pts_xyz, band_min=0.10, band_max=0.60, min_evidence=6,
         'cluster_min_ztop_m': cluster_min_ztop_m,
         'cluster_traj_dist_m': cluster_traj_dist_m,
         'min_occupancy': min_occupancy,
+        'gc_gate': bool(gc_gate),
+        'gc_contact_max_h': gc_contact_max_h,
+        'gc_min_contact_frac': gc_min_contact_frac,
+        'gc_free_gap_m': gc_free_gap_m,
+        'gc_min_free_below_frac': gc_min_free_below_frac,
+        'gc_sheet_min_width_m': gc_sheet_min_width_m,
     }
     return raster, info
 
