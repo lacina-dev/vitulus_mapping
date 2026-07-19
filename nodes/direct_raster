@@ -1,0 +1,555 @@
+#!/usr/bin/env python3
+"""direct_raster — a DIRECT 2D occupancy raster mapper (Mapping v3, 2026-07-19).
+
+USER DESIGN (binding): build the obstacle raster DIRECTLY from the per-frame
+segmented clouds, discarding absolute z entirely, so the GLOBAL pose-z drift
+that produced every phantom in the octomap/band chain cannot occur. Three
+live-tunable sources, each with an enable + max range:
+  (1) 2D lidar  (/rplidar/scan_filtered) — hard, sun-immune geometry. A hit
+      gives obstacle evidence at the hit cell plus a 2D free raycast along the
+      beam; a no-return beam frees the whole ray (up to the range cap).
+  (2) camera OBSTACLES (/obstacles_cloud, from rtabmap obstacles_detection) —
+      points already segmented as NOT-ground against the LOCAL plane; each one
+      (within obstacle_max_range) is obstacle evidence at its XY cell.
+  (3) camera FREE/ground (/ground_cloud) — each point (within free_max_range)
+      is free evidence, eroding stale obstacles under freshly-seen ground.
+
+All evidence lands in a per-cell log-odds grid (src/vitulus_mapping/directgrid.py)
+with clamps + a per-cell distinct-frame hit counter; a cell shows OCCUPIED only
+after min_hits frames AND log-odds >= occ_thresh, so transients vanish.
+
+Runs ALONGSIDE the octomap/band pipeline (A/B); writes nothing outside
+/mapping/*. Gating REUSES gates.py in FUSED mode for XY pose quality only
+(pose freshness / jumps / map-correction rate) — the z gates are irrelevant
+here because z is thrown away. Insertion is judged at the CLOUD STAMP TF, like
+insertion_gate.
+
+Interfaces (relative to /mapping):
+  in   <lidar_scan_topic>        sensor_msgs/LaserScan  (default /rplidar/scan_filtered)
+  in   <obstacle_cloud_topic>    sensor_msgs/PointCloud2 (default /obstacles_cloud)
+  in   <ground_cloud_topic>      sensor_msgs/PointCloud2 (default /ground_cloud)
+  in   /nav_tf/odom_status       vitulus_msgs/Navi_transform (pose owner, logged)
+  out  direct_map                nav_msgs/OccupancyGrid (latched, ~1-2 Hz)
+  out  direct_status             std_msgs/String (latched JSON)
+  set  set_direct                std_msgs/String JSON — live control + persist
+  trig save_direct               std_msgs/String — snapshot raster into the site
+"""
+
+import json
+import math
+import os
+import threading
+import time
+
+import numpy as np
+import rospy
+import tf2_ros
+from nav_msgs.msg import OccupancyGrid
+from sensor_msgs.msg import LaserScan, PointCloud2
+from std_msgs.msg import String
+from tf.transformations import (euler_from_quaternion, quaternion_matrix)
+from vitulus_msgs.msg import Navi_transform
+
+from vitulus_mapping.directgrid import DirectGrid
+from vitulus_mapping.gates import GateConfig, InsertionGate
+from vitulus_mapping.pgmio import save_occupancy_pgm
+from vitulus_mapping.roscloud import pointcloud2_to_xyz
+
+
+def _clamp(v, lo, hi):
+    return max(lo, min(hi, v))
+
+
+class DirectRasterNode:
+    def __init__(self):
+        self.map_frame = rospy.get_param('~map_frame', 'map')
+        self.base_frame = rospy.get_param('~base_frame', 'base_link')
+        self.output_dir = os.path.expanduser(rospy.get_param(
+            '~output_dir', '~/.vitulus/mapping_v3/default'))
+        self.enabled = bool(rospy.get_param('~direct_enabled', True))
+        self.res = float(rospy.get_param('~resolution', 0.05))
+        self.refresh_hz = float(rospy.get_param('~refresh_hz', 1.5))
+        self.max_rate_hz = float(rospy.get_param('~max_rate_hz', 6.0))
+
+        # per-source enables + range caps (all live-settable via /set_direct)
+        self.use_lidar = bool(rospy.get_param('~use_lidar', True))
+        self.lidar_max_range_m = float(rospy.get_param('~lidar_max_range_m', 8.0))
+        self.lidar_free_no_hit = bool(rospy.get_param('~lidar_free_no_hit', True))
+        self.use_cam_obstacle = bool(rospy.get_param('~use_cam_obstacle', True))
+        self.obstacle_max_range_m = float(
+            rospy.get_param('~obstacle_max_range_m', 2.8))
+        self.use_cam_free = bool(rospy.get_param('~use_cam_free', True))
+        self.free_max_range_m = float(rospy.get_param('~free_max_range_m', 2.8))
+
+        # log-odds tunables (also live-settable)
+        self.hit_inc = float(rospy.get_param('~hit_inc', 0.5))
+        self.miss_dec = float(rospy.get_param('~miss_dec', 0.4))
+        self.lo_clamp = float(rospy.get_param('~lo_clamp', -2.0))
+        self.hi_clamp = float(rospy.get_param('~hi_clamp', 3.5))
+        self.occ_thresh = float(rospy.get_param('~occ_thresh', 0.85))
+        self.free_thresh = float(rospy.get_param('~free_thresh', -0.4))
+        self.min_hits = int(rospy.get_param('~min_hits', 3))
+
+        self.lidar_scan_topic = rospy.get_param(
+            '~lidar_scan_topic', '/rplidar/scan_filtered')
+        self.obstacle_cloud_topic = rospy.get_param(
+            '~obstacle_cloud_topic', '/obstacles_cloud')
+        self.ground_cloud_topic = rospy.get_param(
+            '~ground_cloud_topic', '/ground_cloud')
+
+        self.grid = DirectGrid(
+            resolution=self.res, hit_inc=self.hit_inc, miss_dec=self.miss_dec,
+            lo_clamp=self.lo_clamp, hi_clamp=self.hi_clamp,
+            occ_thresh=self.occ_thresh, free_thresh=self.free_thresh,
+            min_hits=self.min_hits)
+        self.grid_lock = threading.Lock()
+
+        # per-site persistence of the live control (mirrors band_overrides.json)
+        self.overrides_path = os.path.join(self.output_dir,
+                                           'direct_overrides.json')
+        self._load_overrides()
+
+        # XY-only gate: fused mode blocks on pose freshness / jumps / map-corr
+        # rate, never on z. Pull the tuned XY thresholds from the sibling
+        # insertion_gate params so both paths gate identically; fall back to the
+        # GateConfig defaults when unset.
+        def gp(key, default):
+            return rospy.get_param('/mapping/insertion_gate/' + key, default)
+        cfg = GateConfig(
+            mode='fused',
+            max_pose_age_s=float(gp('max_pose_age_s', 0.7)),
+            max_speed_mps=float(gp('max_speed_mps', 1.0)),
+            jump_margin_m=float(gp('jump_margin_m', 0.25)),
+            jump_cooldown_s=float(gp('jump_cooldown_s', 5.0)),
+            map_corr_xy_m=float(gp('map_corr_xy_m', 0.08)),
+            map_corr_yaw_deg=float(gp('map_corr_yaw_deg', 2.0)),
+            max_maporr_rate_mps=float(gp('max_maporr_rate_mps', 0.02)),
+            map_corr_window_s=float(gp('map_corr_window_s', 1.0)),
+            z_mode='rtk',           # keep the z machinery inert (XY-only gating)
+        )
+        self.gate = InsertionGate(cfg)
+
+        self.tf_buf = tf2_ros.Buffer(rospy.Duration(10.0))
+        self.tf_listener = tf2_ros.TransformListener(self.tf_buf)
+
+        self._counters = {
+            'lidar': self._new_counter(),
+            'cam_obstacle': self._new_counter(),
+            'cam_free': self._new_counter(),
+        }
+        self._last_pub = {k: 0.0 for k in self._counters}
+        self._last_decision = None
+        self._last_grid_stamp = None
+
+        self.pub_map = rospy.Publisher('direct_map', OccupancyGrid,
+                                       queue_size=1, latch=True)
+        self.pub_status = rospy.Publisher('direct_status', String,
+                                          queue_size=1, latch=True)
+
+        rospy.Subscriber('set_direct', String, self.cb_set_direct, queue_size=2)
+        rospy.Subscriber('save_direct', String, self.cb_save_direct,
+                         queue_size=1)
+
+        if not self.enabled:
+            rospy.logwarn('direct_raster: ~direct_enabled=false — idle (no '
+                          'subscriptions); enable and restart to map')
+            self._publish_status()
+            return
+
+        rospy.Subscriber('/nav_tf/odom_status', Navi_transform,
+                         self.cb_pose_src, queue_size=1)
+        if self.use_lidar:
+            rospy.Subscriber(self.lidar_scan_topic, LaserScan, self.cb_scan,
+                             queue_size=1, buff_size=2 ** 20)
+        rospy.Subscriber(self.obstacle_cloud_topic, PointCloud2,
+                         self.cb_cloud, callback_args='cam_obstacle',
+                         queue_size=1, buff_size=2 ** 22)
+        rospy.Subscriber(self.ground_cloud_topic, PointCloud2,
+                         self.cb_cloud, callback_args='cam_free',
+                         queue_size=1, buff_size=2 ** 22)
+
+        rospy.Timer(rospy.Duration(0.2), self.tick_gate)
+        rospy.Timer(rospy.Duration(max(0.1, 1.0 / max(self.refresh_hz, 0.1))),
+                    self.tick_publish)
+        self._publish_status()
+        rospy.loginfo('direct_raster up: res=%.3f lidar=%s(%.1fm) '
+                      'cam_obs=%s(%.1fm) cam_free=%s(%.1fm) -> %s',
+                      self.res, self.use_lidar, self.lidar_max_range_m,
+                      self.use_cam_obstacle, self.obstacle_max_range_m,
+                      self.use_cam_free, self.free_max_range_m,
+                      rospy.resolve_name('direct_map'))
+
+    def _new_counter(self):
+        return {'in': 0, 'throttled': 0, 'gate_closed': 0, 'passed': 0}
+
+    # ---- live control + persistence ----------------------------------------
+    def _load_overrides(self):
+        try:
+            if not os.path.exists(self.overrides_path):
+                return
+            with open(self.overrides_path) as f:
+                ov = json.load(f)
+            applied, err = self._apply_settings(ov, persist=False, log=False)
+            if applied:
+                rospy.loginfo('direct_raster: loaded per-site overrides %s '
+                              'from %s', json.dumps(applied),
+                              self.overrides_path)
+        except Exception as e:
+            rospy.logwarn('direct_raster: could not load overrides: %s', e)
+
+    def _save_overrides(self):
+        try:
+            os.makedirs(self.output_dir, exist_ok=True)
+            with open(self.overrides_path, 'w') as f:
+                json.dump(self._settings_dict(), f, indent=1)
+        except Exception as e:
+            rospy.logwarn('direct_raster: could not save overrides: %s', e)
+
+    def _settings_dict(self):
+        return {
+            'use_lidar': self.use_lidar,
+            'lidar_max_range_m': self.lidar_max_range_m,
+            'lidar_free_no_hit': self.lidar_free_no_hit,
+            'use_cam_obstacle': self.use_cam_obstacle,
+            'obstacle_max_range_m': self.obstacle_max_range_m,
+            'use_cam_free': self.use_cam_free,
+            'free_max_range_m': self.free_max_range_m,
+            'hit_inc': self.hit_inc,
+            'miss_dec': self.miss_dec,
+            'lo_clamp': self.lo_clamp,
+            'hi_clamp': self.hi_clamp,
+            'occ_thresh': self.occ_thresh,
+            'free_thresh': self.free_thresh,
+            'min_hits': self.min_hits,
+        }
+
+    def _apply_settings(self, req, persist=True, log=True):
+        """Validate + apply a partial settings dict. Returns (applied, err)."""
+        s = self._settings_dict()
+        try:
+            use_lidar = bool(req.get('use_lidar', s['use_lidar']))
+            lidar_max = float(req.get('lidar_max_range_m',
+                                      s['lidar_max_range_m']))
+            lidar_free = bool(req.get('lidar_free_no_hit',
+                                      s['lidar_free_no_hit']))
+            use_obs = bool(req.get('use_cam_obstacle', s['use_cam_obstacle']))
+            obs_max = float(req.get('obstacle_max_range_m',
+                                    s['obstacle_max_range_m']))
+            use_free = bool(req.get('use_cam_free', s['use_cam_free']))
+            free_max = float(req.get('free_max_range_m', s['free_max_range_m']))
+            hit_inc = float(req.get('hit_inc', s['hit_inc']))
+            miss_dec = float(req.get('miss_dec', s['miss_dec']))
+            lo_clamp = float(req.get('lo_clamp', s['lo_clamp']))
+            hi_clamp = float(req.get('hi_clamp', s['hi_clamp']))
+            occ_thresh = float(req.get('occ_thresh', s['occ_thresh']))
+            free_thresh = float(req.get('free_thresh', s['free_thresh']))
+            min_hits = int(req.get('min_hits', s['min_hits']))
+        except (TypeError, ValueError) as e:
+            return None, 'non-numeric value: %s' % e
+        for name, v in (('lidar_max_range_m', lidar_max),
+                        ('obstacle_max_range_m', obs_max),
+                        ('free_max_range_m', free_max)):
+            if not (0.5 <= v <= 20.0):
+                return None, '%s out of range 0.5..20: %s' % (name, v)
+        if not (0.05 <= hit_inc <= 5.0):
+            return None, 'hit_inc out of range 0.05..5: %s' % hit_inc
+        if not (0.05 <= miss_dec <= 5.0):
+            return None, 'miss_dec out of range 0.05..5: %s' % miss_dec
+        if not (lo_clamp < 0.0 <= hi_clamp):
+            return None, ('need lo_clamp<0<=hi_clamp, got [%s, %s]'
+                          % (lo_clamp, hi_clamp))
+        if not (free_thresh < occ_thresh):
+            return None, ('need free_thresh<occ_thresh, got [%s, %s]'
+                          % (free_thresh, occ_thresh))
+        if not (1 <= min_hits <= 50):
+            return None, 'min_hits out of range 1..50: %s' % min_hits
+
+        # source enables/ranges apply immediately at the node level
+        self.use_lidar = use_lidar
+        self.lidar_max_range_m = lidar_max
+        self.lidar_free_no_hit = lidar_free
+        self.use_cam_obstacle = use_obs
+        self.obstacle_max_range_m = obs_max
+        self.use_cam_free = use_free
+        self.free_max_range_m = free_max
+        self.hit_inc = hit_inc
+        self.miss_dec = miss_dec
+        self.lo_clamp = lo_clamp
+        self.hi_clamp = hi_clamp
+        self.occ_thresh = occ_thresh
+        self.free_thresh = free_thresh
+        self.min_hits = min_hits
+        with self.grid_lock:
+            self.grid.set_params(hit_inc=hit_inc, miss_dec=miss_dec,
+                                 lo_clamp=lo_clamp, hi_clamp=hi_clamp,
+                                 occ_thresh=occ_thresh, free_thresh=free_thresh,
+                                 min_hits=min_hits)
+        applied = self._settings_dict()
+        if log:
+            rospy.loginfo('direct_raster: settings -> %s', json.dumps(applied))
+        if persist:
+            self._save_overrides()
+        return applied, None
+
+    def cb_set_direct(self, msg):
+        try:
+            req = json.loads(msg.data) if msg.data.strip() else {}
+        except ValueError as e:
+            rospy.logwarn('direct_raster: set_direct bad JSON: %s', e)
+            return
+        if not isinstance(req, dict):
+            rospy.logwarn('direct_raster: set_direct payload not an object')
+            return
+        applied, err = self._apply_settings(req)
+        if err:
+            rospy.logwarn('direct_raster: set_direct rejected: %s', err)
+        else:
+            self._publish_status()
+
+    # ---- gate feeding (XY only) --------------------------------------------
+    def cb_pose_src(self, msg):
+        self.gate.feed_pose_src(rospy.Time.now().to_sec(), msg.status)
+
+    def tick_gate(self, _evt):
+        """Feed TF map->base_link (pose) and map->odom (correction watchdog) to
+        the gate at 5 Hz, then keep the latest decision for status."""
+        try:
+            tr = self.tf_buf.lookup_transform(self.map_frame, self.base_frame,
+                                              rospy.Time(0),
+                                              rospy.Duration(0.05))
+            t, q = tr.transform.translation, tr.transform.rotation
+            yaw = euler_from_quaternion([q.x, q.y, q.z, q.w])[2]
+            self.gate.feed_pose(tr.header.stamp.to_sec(), t.x, t.y, t.z, yaw)
+        except (tf2_ros.LookupException, tf2_ros.ConnectivityException,
+                tf2_ros.ExtrapolationException):
+            pass
+        try:
+            mo = self.tf_buf.lookup_transform(self.map_frame, 'odom',
+                                              rospy.Time(0),
+                                              rospy.Duration(0.05))
+            mt, mq = mo.transform.translation, mo.transform.rotation
+            myaw = euler_from_quaternion([mq.x, mq.y, mq.z, mq.w])[2]
+            self.gate.feed_map_odom(rospy.Time.now().to_sec(),
+                                    mt.x, mt.y, myaw)
+        except (tf2_ros.LookupException, tf2_ros.ConnectivityException,
+                tf2_ros.ExtrapolationException):
+            pass
+        self._last_decision = self.gate.evaluate(rospy.Time.now().to_sec())
+
+    def _stamped_pass(self, stamp):
+        """XY pose-quality decision at THIS cloud's stamp (reuse gates.py).
+        Returns (passed, transform) — transform is map->base_link at the stamp,
+        None on extrapolation (reject)."""
+        tsec = stamp.to_sec()
+        try:
+            tr = self.tf_buf.lookup_transform(self.map_frame, self.base_frame,
+                                              stamp, rospy.Duration(0.05))
+        except (tf2_ros.LookupException, tf2_ros.ConnectivityException,
+                tf2_ros.ExtrapolationException):
+            return None
+        t, q = tr.transform.translation, tr.transform.rotation
+        yaw = euler_from_quaternion([q.x, q.y, q.z, q.w])[2]
+        dec = self.gate.evaluate(tsec, stamped_pose=(tr.header.stamp.to_sec(),
+                                                     t.x, t.y, t.z, yaw),
+                                 wall_now=rospy.Time.now().to_sec())
+        return dec.passed
+
+    # ---- TF helpers --------------------------------------------------------
+    def _lookup_sensor_tf(self, frame, stamp):
+        """4x4 map<-sensor matrix at the cloud stamp, or None."""
+        try:
+            tr = self.tf_buf.lookup_transform(self.map_frame, frame, stamp,
+                                              rospy.Duration(0.2))
+        except (tf2_ros.LookupException, tf2_ros.ConnectivityException,
+                tf2_ros.ExtrapolationException) as e:
+            rospy.logwarn_throttle(10.0, 'direct_raster: TF %s->%s failed: %s',
+                                   self.map_frame, frame, e)
+            return None
+        q = tr.transform.rotation
+        t = tr.transform.translation
+        m = quaternion_matrix([q.x, q.y, q.z, q.w])
+        m[0:3, 3] = [t.x, t.y, t.z]
+        return m
+
+    def _throttle_ok(self, key):
+        now = time.monotonic()
+        if now - self._last_pub[key] < 1.0 / max(self.max_rate_hz, 0.1):
+            self._counters[key]['throttled'] += 1
+            return False
+        self._last_pub[key] = now
+        return True
+
+    # ---- camera clouds -----------------------------------------------------
+    def cb_cloud(self, msg, key):
+        use = self.use_cam_obstacle if key == 'cam_obstacle' else self.use_cam_free
+        if not use:
+            return
+        c = self._counters[key]
+        c['in'] += 1
+        if not self._throttle_ok(key):
+            return
+        passed = self._stamped_pass(msg.header.stamp)
+        if not passed:
+            c['gate_closed'] += 1
+            return
+        m = self._lookup_sensor_tf(msg.header.frame_id, msg.header.stamp)
+        if m is None:
+            return
+        try:
+            xyz = pointcloud2_to_xyz(msg)          # Nx3 sensor frame, finite
+        except Exception as e:
+            rospy.logwarn_throttle(10.0, 'direct_raster: cloud parse failed: %s',
+                                   e)
+            return
+        if xyz.shape[0] == 0:
+            c['passed'] += 1
+            return
+        cap = (self.obstacle_max_range_m if key == 'cam_obstacle'
+               else self.free_max_range_m)
+        rng = np.linalg.norm(xyz, axis=1)
+        xyz = xyz[rng <= cap]
+        if xyz.shape[0] == 0:
+            c['passed'] += 1
+            return
+        # transform to map frame, keep XY (ground-project)
+        pts = np.column_stack([xyz, np.ones(xyz.shape[0])])
+        pm = pts @ m.T                              # Nx4
+        xm, ym = pm[:, 0], pm[:, 1]
+        with self.grid_lock:
+            if key == 'cam_obstacle':
+                self.grid.add_obstacle_points(xm, ym)
+            else:
+                self.grid.add_free_points(xm, ym)
+        c['passed'] += 1
+
+    # ---- 2D lidar ----------------------------------------------------------
+    def cb_scan(self, msg):
+        if not self.use_lidar:
+            return
+        c = self._counters['lidar']
+        c['in'] += 1
+        if not self._throttle_ok('lidar'):
+            return
+        passed = self._stamped_pass(msg.header.stamp)
+        if not passed:
+            c['gate_closed'] += 1
+            return
+        m = self._lookup_sensor_tf(msg.header.frame_id, msg.header.stamp)
+        if m is None:
+            return
+        r = np.asarray(msg.ranges, dtype=np.float64)
+        n = r.shape[0]
+        if n == 0:
+            c['passed'] += 1
+            return
+        ang = msg.angle_min + np.arange(n) * msg.angle_increment
+        cap = self.lidar_max_range_m
+        rmin = float(msg.range_min)
+        rmax = float(msg.range_max)
+        finite = np.isfinite(r)
+        # hit: a real return within [range_min, cap]
+        hit = finite & (r >= rmin) & (r <= cap)
+        # no-return free ray: a genuine max-range / beyond-cap beam (NOT a nan,
+        # which the filter uses for removed beams -> no information, skip).
+        beyond = finite & (r > cap)
+        noreturn = np.isinf(r) | (finite & (r >= rmax))
+        free_ray = self.lidar_free_no_hit & (beyond | noreturn)
+        sel = hit | free_ray
+        if not sel.any():
+            c['passed'] += 1
+            return
+        # endpoint range: the hit distance, else the range cap
+        rr = np.where(hit, r, cap)
+        ex_s = rr * np.cos(ang)
+        ey_s = rr * np.sin(ang)
+        pts = np.column_stack([ex_s, ey_s, np.zeros(n), np.ones(n)])[sel]
+        pm = pts @ m.T
+        ex_m, ey_m = pm[:, 0], pm[:, 1]
+        sx, sy = m[0, 3], m[1, 3]                   # sensor origin in map
+        with self.grid_lock:
+            self.grid.integrate_scan(sx, sy, ex_m, ey_m, hit[sel],
+                                     max_range=cap)
+        c['passed'] += 1
+
+    # ---- outputs -----------------------------------------------------------
+    def tick_publish(self, _evt):
+        with self.grid_lock:
+            raster, ox, oy = self.grid.render()
+            res = self.grid.res
+        self._publish_grid(raster, ox, oy, res)
+        self._publish_status()
+
+    def _publish_grid(self, raster, ox, oy, res):
+        nx, ny = raster.shape
+        msg = OccupancyGrid()
+        stamp = rospy.Time.now()
+        self._last_grid_stamp = stamp
+        msg.header.stamp = stamp
+        msg.header.frame_id = self.map_frame
+        msg.info.resolution = res
+        msg.info.width = nx
+        msg.info.height = ny
+        msg.info.origin.position.x = ox
+        msg.info.origin.position.y = oy
+        msg.info.origin.orientation.w = 1.0
+        msg.data = raster.T.ravel().astype(np.int8).tolist()
+        self.pub_map.publish(msg)
+
+    def _publish_status(self):
+        with self.grid_lock:
+            st = self.grid.stats()
+        dec = self._last_decision
+        status = {
+            'enabled': self.enabled,
+            'pass': bool(dec.passed) if dec is not None else None,
+            'reasons': dec.reasons if dec is not None else [],
+            'counters': self._counters,
+            'settings': self._settings_dict(),
+            'grid': st,
+        }
+        self.pub_status.publish(String(json.dumps(status)))
+
+    # ---- raster snapshot (parallel to band's save flow) --------------------
+    def cb_save_direct(self, msg):
+        payload = msg.data.strip()
+        name = payload or None
+        if payload.startswith('{'):
+            try:
+                name = json.loads(payload).get('name') or None
+            except ValueError as e:
+                rospy.logwarn('direct_raster: save_direct bad JSON: %s', e)
+                return
+        threading.Thread(target=self._save_raster, args=(name,),
+                         daemon=True).start()
+
+    def _save_raster(self, name=None):
+        """Snapshot the current direct raster into <site>/rasters/<name>/ as
+        map_server pgm+yaml + <name>_meta.json (mirrors band_projector's save),
+        so the raster-management UI can preview/serve it like any raster."""
+        try:
+            with self.grid_lock:
+                raster, ox, oy = self.grid.render()
+                res = self.grid.res
+                stats = self.grid.stats()
+            if raster.size == 0 or stats['observed_cells'] == 0:
+                rospy.logwarn('direct_raster: save_direct skipped — no evidence '
+                              'accumulated yet (nothing to snapshot)')
+                return
+            out_name = name or time.strftime('direct_%Y%m%d_%H%M%S')
+            base = os.path.join(self.output_dir, 'rasters', out_name, out_name)
+            save_occupancy_pgm(base, raster, res, (ox, oy))
+            meta = {'source': 'direct_raster', 'settings': self._settings_dict(),
+                    'counters': self._counters}
+            meta.update(stats)
+            with open(base + '_meta.json', 'w') as f:
+                json.dump(meta, f, indent=1)
+            rospy.loginfo('direct_raster: saved raster %s (%s)', base,
+                          json.dumps(stats))
+        except Exception as e:
+            rospy.logerr('direct_raster: save_direct failed: %s', e)
+
+
+if __name__ == '__main__':
+    rospy.init_node('direct_raster')
+    DirectRasterNode()
+    rospy.spin()

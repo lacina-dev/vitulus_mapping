@@ -28,6 +28,7 @@ catkin_install_python(PROGRAMS
   nodes/insertion_gate
   nodes/trajectory_dem
   nodes/band_projector
+  nodes/direct_raster
   nodes/mapping_manager
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )

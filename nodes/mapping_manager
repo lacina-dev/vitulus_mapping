@@ -111,6 +111,11 @@ class MappingManager:
             rospy.get_param('~raster_on_stop_timeout_s', 25.0))
         self.pub_mapping_save = rospy.Publisher('/mapping/save', String,
                                                 queue_size=1)
+        # Direct-raster path (2026-07-19): snapshot the direct 2D raster into the
+        # site in PARALLEL with band's, so the A/B raster is servable too. Non-
+        # fatal — band's final_<ts> stays the auto-served raster.
+        self.pub_mapping_save_direct = rospy.Publisher(
+            '/mapping/save_direct', String, queue_size=1)
 
         self.pub_status = rospy.Publisher('/mapping_manager/status', String,
                                           queue_size=1, latch=True)
@@ -348,14 +353,37 @@ class MappingManager:
         # stop_proc saves garden.ot itself right after this. Pipeline still up.
         self.pub_mapping_save.publish(String(json.dumps(
             {'name': raster, 'write_ot': False})))
+        # PARALLEL: ask direct_raster for its own snapshot (direct_<ts>) into the
+        # SAME rasters/ dir, so the direct 2D map is a servable A/B raster. This
+        # is fire-and-forget relative to the band flow: its success/failure never
+        # changes the return value (band's final_<ts> drives auto-serve).
+        direct_name = time.strftime('direct_%Y%m%d_%H%M%S')
+        direct_pgm = os.path.join(self.base_dir, site, 'rasters', direct_name,
+                                  direct_name + '.pgm')
+        self.pub_mapping_save_direct.publish(String(json.dumps(
+            {'name': direct_name})))
         deadline = time.time() + self.raster_on_stop_timeout_s
+        got_band = None
+        got_direct = False
         while time.time() < deadline:
-            if os.path.exists(pgm):
+            if got_band is None and os.path.exists(pgm):
                 rospy.loginfo('mapping_manager: raster_on_stop wrote %s', pgm)
-                return raster
+                got_band = raster
+            if not got_direct and os.path.exists(direct_pgm):
+                rospy.loginfo('mapping_manager: raster_on_stop wrote direct %s',
+                              direct_pgm)
+                got_direct = True
+            if got_band is not None and got_direct:
+                return got_band
             time.sleep(0.5)
+        if got_band is not None:
+            if not got_direct:
+                rospy.logwarn('mapping_manager: direct raster snapshot not seen '
+                              'for %s (band raster saved; direct is optional A/B)',
+                              site)
+            return got_band
         rospy.logwarn('mapping_manager: raster_on_stop timed out (%ss) — no '
-                      'raster for %s; falling back to octomap-only save',
+                      'band raster for %s; falling back to octomap-only save',
                       self.raster_on_stop_timeout_s, site)
         return None
 

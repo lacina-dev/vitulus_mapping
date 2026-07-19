@@ -160,6 +160,41 @@ trajectory_dem:
   publish_period_s: 5.0
   load_existing: true
 
+# Direct 2D raster mapper (2026-07-19). USER-DESIGNED simplification that bypasses
+# octomap + the DEM-relative z classification entirely: it accumulates 2D log-odds
+# evidence DIRECTLY from the per-frame segmented clouds, discarding absolute z, so
+# global pose-z drift (the whole phantom class) cannot occur. Runs ALONGSIDE the
+# band/octomap pipeline (A/B). All keys below are live-settable via
+# /mapping/set_direct (String JSON) and persisted per-site to direct_overrides.json
+# (loaded on start, layered on top of these). resolution comes from the launch arg.
+direct_raster:
+  direct_enabled: true               # false = node idles cleanly (no subs)
+  refresh_hz: 1.5                    # live /mapping/direct_map publish rate
+  max_rate_hz: 6.0                   # per-source insertion throttle
+  # (1) 2D lidar: sun-immune hard geometry at the scan plane (~0.35 m).
+  use_lidar: true
+  lidar_max_range_m: 8.0             # hits/free-ray capped here
+  lidar_free_no_hit: true           # a max-range/no-return beam frees the ray
+  # (2) camera OBSTACLES: rtabmap obstacles_detection /obstacles_cloud (already
+  # segmented NOT-ground against the LOCAL plane -> pose-z immune).
+  use_cam_obstacle: true
+  obstacle_max_range_m: 2.8         # D435 conservative depth cap
+  # (3) camera FREE/ground: /ground_cloud (erodes stale obstacles).
+  use_cam_free: true
+  free_max_range_m: 2.8
+  # log-odds model. An obstacle cell shows only after min_hits DISTINCT frames
+  # AND log-odds >= occ_thresh; free/miss erodes transients back to unknown/free.
+  hit_inc: 0.5                       # +log-odds per obstacle frame
+  miss_dec: 0.4                      # -log-odds per free/miss frame (erosion)
+  lo_clamp: -2.0
+  hi_clamp: 3.5
+  occ_thresh: 0.85                   # render OCCUPIED at/above this (2 hits)
+  free_thresh: -0.4                  # render FREE at/below this (1 miss)
+  min_hits: 3                        # frames of obstacle evidence before it shows
+  lidar_scan_topic: /rplidar/scan_filtered
+  obstacle_cloud_topic: /obstacles_cloud
+  ground_cloud_topic: /ground_cloud
+
 band_projector:
   auto_regen_period_s: 10.0          # live raster for the UI (0 = off)
   band_min: 0.10                     # obstacles 0.10-0.60 m above LOCAL ground

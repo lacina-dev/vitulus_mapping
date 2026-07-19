@@ -40,5 +40,16 @@
           output="screen">
       <param name="output_dir" value="$(arg output_dir)"/>
     </node>
+
+    <!-- Direct 2D raster mapper (2026-07-19): builds an OccupancyGrid straight
+         from the per-frame segmented clouds (lidar + rtabmap obstacle/ground),
+         discarding absolute z, so it is immune to the global pose-z drift that
+         plagues the octomap/band chain. Runs ALONGSIDE band_projector (A/B);
+         ~direct_enabled=false disables it cleanly. Same per-site resolution. -->
+    <node pkg="vitulus_mapping" type="direct_raster" name="direct_raster"
+          output="screen">
+      <param name="output_dir" value="$(arg output_dir)"/>
+      <param name="resolution" value="$(arg resolution)"/>
+    </node>
   </group>
 </launch>
