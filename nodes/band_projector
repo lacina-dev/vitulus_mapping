@@ -139,6 +139,11 @@ class BandProjectorNode:
             rospy.get_param('~gc_exempt_min_elong', 4.0))
         self.gc_exempt_plane_h = float(
             rospy.get_param('~gc_exempt_plane_h', 0.42))
+        # v6: floating-slab / min-start-height gate (band.project_band). Drops a
+        # cluster whose gc_start_pctl-th pct per-column lowest in-band height is
+        # >= gc_min_start_h (a slab starting high with nothing below). 0 disables.
+        self.gc_min_start_h = float(rospy.get_param('~gc_min_start_h', 0.40))
+        self.gc_start_pctl = float(rospy.get_param('~gc_start_pctl', 10.0))
         # D3: the ot_dump helper reads octomap FREE leaves off the saved
         # garden.ot (octomap_server publishes only OCCUPIED centres on the wire).
         self.ot_dump_timeout_s = float(
@@ -219,6 +224,7 @@ class BandProjectorNode:
         d['gc_min_contact_frac'] = round(self.gc_min_contact_frac, 2)
         d['gc_min_free_below_frac'] = round(self.gc_min_free_below_frac, 2)
         d['gc_sheet_min_width_m'] = round(self.gc_sheet_min_width_m, 2)
+        d['gc_min_start_h'] = round(self.gc_min_start_h, 2)
         self.pub_status.publish(String(json.dumps(d)))
 
     # ---- classifier settings (live tuning) ----------------------------------
@@ -266,7 +272,9 @@ class BandProjectorNode:
                            'gc_sheet_min_width_m': self.gc_sheet_min_width_m,
                            'gc_exempt_max_width_m': self.gc_exempt_max_width_m,
                            'gc_exempt_min_elong': self.gc_exempt_min_elong,
-                           'gc_exempt_plane_h': self.gc_exempt_plane_h},
+                           'gc_exempt_plane_h': self.gc_exempt_plane_h,
+                           'gc_min_start_h': self.gc_min_start_h,
+                           'gc_start_pctl': self.gc_start_pctl},
                           f, indent=1)
         except Exception as e:
             rospy.logwarn('band_projector: could not save band overrides: %s', e)
@@ -313,6 +321,8 @@ class BandProjectorNode:
             gc_exe = float(req.get('gc_exempt_min_elong',
                                    self.gc_exempt_min_elong))
             gc_exp = float(req.get('gc_exempt_plane_h', self.gc_exempt_plane_h))
+            gc_msh = float(req.get('gc_min_start_h', self.gc_min_start_h))
+            gc_spc = float(req.get('gc_start_pctl', self.gc_start_pctl))
         except (TypeError, ValueError) as e:
             return None, 'non-numeric value: %s' % e
         if not (0.0 <= band_min < band_max <= 2.0):
@@ -361,6 +371,10 @@ class BandProjectorNode:
             return None, ('gc_exempt_min_elong out of range 0..1e6: %s' % gc_exe)
         if not (0.0 <= gc_exp <= 2.0):
             return None, ('gc_exempt_plane_h out of range 0..2: %s' % gc_exp)
+        if not (0.0 <= gc_msh <= 2.0):
+            return None, ('gc_min_start_h out of range 0..2: %s' % gc_msh)
+        if not (0.0 <= gc_spc <= 50.0):
+            return None, ('gc_start_pctl out of range 0..50: %s' % gc_spc)
         self.band_min = band_min
         self.band_max = band_max
         self.min_evidence = min_evidence
@@ -385,6 +399,8 @@ class BandProjectorNode:
         self.gc_exempt_max_width_m = gc_exw
         self.gc_exempt_min_elong = gc_exe
         self.gc_exempt_plane_h = gc_exp
+        self.gc_min_start_h = gc_msh
+        self.gc_start_pctl = gc_spc
         applied = {'band_min': band_min, 'band_max': band_max,
                    'min_evidence': min_evidence,
                    'min_cluster_cells': min_cluster,
@@ -406,7 +422,9 @@ class BandProjectorNode:
                    'gc_sheet_min_width_m': gc_shw,
                    'gc_exempt_max_width_m': gc_exw,
                    'gc_exempt_min_elong': gc_exe,
-                   'gc_exempt_plane_h': gc_exp}
+                   'gc_exempt_plane_h': gc_exp,
+                   'gc_min_start_h': gc_msh,
+                   'gc_start_pctl': gc_spc}
         if log:
             rospy.loginfo('band_projector: classifier settings -> %s',
                           json.dumps(applied))
@@ -663,7 +681,9 @@ class BandProjectorNode:
                                         gc_sheet_min_width_m=self.gc_sheet_min_width_m,
                                         gc_exempt_max_width_m=self.gc_exempt_max_width_m,
                                         gc_exempt_min_elong=self.gc_exempt_min_elong,
-                                        gc_exempt_plane_h=self.gc_exempt_plane_h)
+                                        gc_exempt_plane_h=self.gc_exempt_plane_h,
+                                        gc_min_start_h=self.gc_min_start_h,
+                                        gc_start_pctl=self.gc_start_pctl)
             info.update({'fill_cells': filled, 'fill_dropped_slope': dropped,
                          'inpainted_cells': inpainted, 'points': len(pts),
                          'took_s': round(time.monotonic() - t0, 1)})

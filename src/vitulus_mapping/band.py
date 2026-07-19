@@ -29,7 +29,8 @@ def project_band(dem, pts_xyz, band_min=0.10, band_max=0.60, min_evidence=6,
                  gc_min_contact_frac=0.35, gc_free_gap_m=0.15,
                  gc_min_free_below_frac=0.50, gc_sheet_min_width_m=0.30,
                  gc_exempt_max_width_m=0.20, gc_exempt_min_elong=4.0,
-                 gc_exempt_plane_h=0.42):
+                 gc_exempt_plane_h=0.42,
+                 gc_min_start_h=0.40, gc_start_pctl=10.0):
     """dem: DemGrid (already filled/inpainted copy), pts_xyz: Nx3 occupied
     voxel centers in map frame. Returns (raster int8 [ix, iy], info dict).
 
@@ -450,6 +451,31 @@ def project_band(dem, pts_xyz, band_min=0.10, band_max=0.60, min_evidence=6,
                       & (elong >= gc_exempt_min_elong)
                       & (plane_h <= gc_exempt_plane_h))
             drop_g = low_contact & (broad | free_maj) & ~exempt
+            # v6 (2026-07-19): floating-slab / min-start-height gate. A real
+            # obstacle (wall, trunk, HEDGE, bush) grows from the ground, so at
+            # least its lowest-starting columns hold an in-band voxel near the
+            # ground; an elevated slab (awning, tabletop, or a raytraced ground
+            # copy left floating high by a pose/RTK-z excursion) has EVERY column
+            # starting high with nothing below it. Drop a cluster whose
+            # gc_start_pctl-th percentile of per-column lowest in-band height is
+            # >= gc_min_start_h, INDEPENDENT of width and free-below (both
+            # collapse at a free-coverage edge where no rays pass beneath). The
+            # PERCENTILE (not the min) protects a real obstacle whose base is
+            # partly occluded: a few grounded columns keep it. Same thin-linear
+            # lidar-plane exemption. gc_min_start_h<=0 disables. NOTE: on data
+            # where an excursion co-shifted the local ground/DEM together with
+            # the copy, the copy still reads as ground-contacting (starts low)
+            # and is NOT caught here — that is a temporal defect with no local
+            # geometric signature; see forensic report 2026-07-19.
+            if gc_min_start_h and gc_min_start_h > 0.0:
+                def _plow(v):
+                    v = v[np.isfinite(v)]
+                    return (float(np.percentile(v, gc_start_pctl))
+                            if v.size >= 3 else -np.inf)
+                plow = ndimage.labeled_comprehension(
+                    low_h, labg, idxg, _plow, float, -np.inf)
+                start_high = (plow >= gc_min_start_h) & ~exempt
+                drop_g = drop_g | start_high
             drop_g[0] = False
             if drop_g.any():
                 dmaskg = drop_g[labg]
@@ -492,6 +518,8 @@ def project_band(dem, pts_xyz, band_min=0.10, band_max=0.60, min_evidence=6,
         'gc_free_gap_m': gc_free_gap_m,
         'gc_min_free_below_frac': gc_min_free_below_frac,
         'gc_sheet_min_width_m': gc_sheet_min_width_m,
+        'gc_min_start_h': gc_min_start_h,
+        'gc_start_pctl': gc_start_pctl,
     }
     return raster, info
 
