@@ -128,6 +128,27 @@ band_projector:
   # add a free-voxel source if borrow coverage proves insufficient.
   free_via_borrowed_ground: true
   free_ground_radius_m: 1.0          # 0 or false => strict real-ground-only FREE
+  # CLASSIFIER v2 (2026-07-19, forensic redesign). On novaTestovaciMapa the old
+  # free_via_borrowed_ground painted 67.6% of FREE as occlusion-blind 1.0 m rings
+  # (22.4% with no raytraced backing) and counted invented INPAINT ground as FREE.
+  # D1: default FREE = REAL ground (traj/fill, NOT inpaint) UNION an octomap
+  # FREE-band mask (the raytraced free space, read off garden.ot by the ot_dump
+  # helper). A cell is free-band if an octomap free leaf sits in its column with
+  # z-ground in [free_band_min, free_band_max]; no ground reference in range =>
+  # NOT free. free_borrow_legacy=true restores the old ring behaviour (rollback).
+  free_borrow_legacy: false
+  free_band_min: -0.30               # octomap free voxel z-ground acceptance band
+  free_band_max: 0.60
+  ot_dump_timeout_s: 60.0            # subprocess budget for the ot_dump helper
+  # D2: cluster z-top gate. A surviving obstacle cluster is dropped iff ALL of:
+  # size < cluster_min_size AND max column z-top above (own-else-borrowed) ground
+  # < cluster_min_ztop_m AND min distance to a driven trajectory cell >
+  # cluster_traj_dist_m. Separates false lawn/vegetation patches (small, low, far)
+  # from real thin 2D-lidar walls (large, tall, or hugging the driven path).
+  # Measured on novaTestovaciMapa: -262 false cells, 0 real-cluster losses.
+  cluster_min_size: 15
+  cluster_min_ztop_m: 0.30
+  cluster_traj_dist_m: 0.6
   fill_percentile: 1.5               # low envelope of octree column z; lower =
                                      # more resistant to tall grass reading as
                                      # ground (audit 2026-07-12, was 5.0)

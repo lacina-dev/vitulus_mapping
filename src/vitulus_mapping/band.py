@@ -9,7 +9,7 @@ Output raster values follow nav_msgs/OccupancyGrid convention:
 import numpy as np
 from scipy import ndimage
 
-from .demgrid import SRC_INPAINT, SRC_NONE
+from .demgrid import SRC_FILL, SRC_INPAINT, SRC_NONE, SRC_TRAJ
 
 OCC = 100
 FREE = 0
@@ -19,7 +19,11 @@ UNKNOWN = -1
 def project_band(dem, pts_xyz, band_min=0.10, band_max=0.60, min_evidence=6,
                  min_cluster_cells=3, ground_ref_radius_m=1.0,
                  borrowed_min_evidence=2, free_via_borrowed_ground=True,
-                 free_ground_radius_m=None):
+                 free_ground_radius_m=None,
+                 free_xyz=None, free_band_min=-0.30, free_band_max=0.60,
+                 free_borrow_legacy=False,
+                 cluster_min_size=15, cluster_min_ztop_m=0.30,
+                 cluster_traj_dist_m=0.6):
     """dem: DemGrid (already filled/inpainted copy), pts_xyz: Nx3 occupied
     voxel centers in map frame. Returns (raster int8 [ix, iy], info dict).
 
@@ -65,7 +69,32 @@ def project_band(dem, pts_xyz, band_min=0.10, band_max=0.60, min_evidence=6,
     FREE never spreads beyond free_ground_radius_m of a genuine measurement.
     free_ground_radius_m defaults to ground_ref_radius_m when None. Set
     free_via_borrowed_ground=False (or radius 0) to restore the strict
-    real-ground-only FREE behaviour."""
+    real-ground-only FREE behaviour.
+
+    CLASSIFIER v2 (2026-07-19, forensic redesign). Two defects were verified on
+    the novaTestovaciMapa dataset and are fixed here:
+
+    D1 — FREE rework. The old free_via_borrowed_ground painted 67.6% of FREE as
+    1.0 m-radius rings around any real-ground cell IGNORING occlusion (22.4% had
+    no raytraced backing) and counted INPAINT cells (invented ground) as FREE.
+    The octomap FREE leaves — the actual raytraced free space — were never
+    consulted. v2 default: FREE = real-ground cells (SRC_TRAJ|SRC_FILL, NOT
+    inpaint) UNION an octomap-free-band mask, minus obstacles. A cell is
+    free-band if some octomap FREE leaf sits in its column with
+    z - ground(cell) in [free_band_min, free_band_max] (ground = own real ground
+    else nearest borrowed real ground within free_ground_radius_m; no ground
+    reference in range => NOT free). Pass the free leaf centres as `free_xyz`
+    (Nx3, from the ot_dump helper). If free_xyz is None/empty the mask is empty
+    and FREE collapses to real ground only (honest: unmapped => unknown). The old
+    ring behaviour is preserved for rollback behind free_borrow_legacy=True.
+
+    D2 — cluster z-top gate. 92.5% of obstacle cells are borrowed-path 2D-lidar
+    (thin-z by nature — NOT gated on z-extent). Real clusters reach column
+    z-top >= 0.4 m; false lawn patches sit <= 0.2 m. After the existing cluster
+    filter, a cluster is dropped iff ALL of: size < cluster_min_size AND its
+    max column z-top above (own-else-borrowed) ground < cluster_min_ztop_m AND
+    its min distance to a trajectory cell > cluster_traj_dist_m. On this dataset
+    that removes 262 false cells with 0 real-cluster losses."""
     nx, ny = dem.elev.shape
     evidence = np.zeros((nx, ny), np.int32)
     evidence_borrowed = np.zeros((nx, ny), np.int32)
@@ -83,18 +112,29 @@ def project_band(dem, pts_xyz, band_min=0.10, band_max=0.60, min_evidence=6,
     # measured ground cell, and that cell's index). Shared by BOTH the obstacle
     # ground-borrow (below) and the FREE ground-borrow (REPORT 1). Computed once
     # here so the FREE path does not need its own transform.
+    # v2: the free-band mask (D1) and the z-top gate (D2) both need the borrowed
+    # ground reference too, so compute the EDT whenever the grid has any
+    # real-ground and any non-real-ground cell (cheap; a single transform).
     rg_dist = rg_jx = rg_jy = None
-    want_borrow = (ground_ref_radius_m and ground_ref_radius_m > 0.0) \
-        or (free_via_borrowed_ground and free_ground_radius_m
-            and free_ground_radius_m > 0.0)
-    if want_borrow and real_ground.any() and (~real_ground).any():
+    if real_ground.any() and (~real_ground).any():
         rg_dist, (rg_jx, rg_jy) = ndimage.distance_transform_edt(
             ~real_ground, return_indices=True, sampling=dem.res)
+    # near_ground_grid[c] = elevation of the nearest real-ground cell to c
+    # (only meaningful where rg_dist is finite); used to borrow ground for the
+    # free-band mask and the z-top gate.
+    near_ground_grid = None
+    if rg_dist is not None:
+        near_ground_grid = dem.elev[rg_jx, rg_jy]
+
+    # Per-cell max occupied-voxel z (all in-bounds occupied leaves, band-agnostic
+    # — the z-top gate needs the true column top, not just the in-band part).
+    zmax_grid = np.full((nx, ny), -np.inf, np.float32)
     if len(pts_xyz):
         ix = np.floor((pts_xyz[:, 0] - dem.ox) / dem.res).astype(np.int64)
         iy = np.floor((pts_xyz[:, 1] - dem.oy) / dem.res).astype(np.int64)
         ok = (ix >= 0) & (ix < nx) & (iy >= 0) & (iy < ny)
         ix, iy, zs = ix[ok], iy[ok], pts_xyz[:, 2][ok]
+        np.maximum.at(zmax_grid, (ix, iy), zs.astype(np.float32))
         ground = dem.elev[ix, iy]
         # a column is referenceable only if its ground cell is REAL (traj/fill),
         # not NaN and not inpaint-invented
@@ -124,24 +164,54 @@ def project_band(dem, pts_xyz, band_min=0.10, band_max=0.60, min_evidence=6,
         # occupied columns we cannot classify (no real ground reference)
         unref = int((~has_ground).sum())
 
+    def cell_ground_within(radius_m):
+        """Own-else-borrowed REAL ground elevation per cell: own real ground
+        where present, else the nearest real-ground elevation within radius_m
+        (shared EDT), else NaN. Never inpaint. Shared by the free-band mask (D1)
+        and the z-top gate (D2)."""
+        g = np.where(real_ground, dem.elev, np.nan).astype(np.float32)
+        if rg_dist is not None and radius_m and radius_m > 0.0:
+            borrow = (~real_ground) & (rg_dist <= radius_m) \
+                & np.isfinite(near_ground_grid)
+            g[borrow] = near_ground_grid[borrow]
+        return g
+
     raster = np.full((nx, ny), UNKNOWN, np.int8)
-    # inpainted ground is shown as FREE (it is a plausible driveable surface for
-    # display/nav continuity) but, per above, it never anchors obstacle claims
-    known_ground = dem.source != SRC_NONE
-    raster[known_ground] = FREE
-    # REPORT 1 (freeserve 2026-07-12): extend FREE onto cells within
-    # free_ground_radius_m of a real-ground cell (shared EDT), so the driveable
-    # surroundings of the driven trajectory are FREE rather than UNKNOWN after
-    # the DEM tightening shrank real-ground columns to the ribbon. Obstacle
-    # cells (computed below) override this, so only the free-of-evidence borrow
-    # cells become FREE — the honesty rule (never beyond a real measurement's
-    # radius) is preserved by the EDT.
-    free_borrowed = 0
-    if free_via_borrowed_ground and free_ground_radius_m \
-            and free_ground_radius_m > 0.0 and rg_dist is not None:
-        borrow_free = (~known_ground) & (rg_dist <= free_ground_radius_m)
-        free_borrowed = int(borrow_free.sum())
-        raster[borrow_free] = FREE
+    # v2 D1: base FREE is REAL ground only (trajectory + percentile-fill).
+    real_free_base = real_ground
+    free_borrowed = 0        # legacy borrow-ring count (legacy mode only)
+    free_octomap = 0         # octomap-free-band count added (v2 default mode)
+    if free_borrow_legacy:
+        # ---- ROLLBACK PATH (free_borrow_legacy=True) --------------------------
+        # Reproduce the pre-v2 free_via_borrowed_ground behaviour EXACTLY:
+        # inpaint shown as FREE + free_ground_radius_m borrow rings around any
+        # real-ground cell (occlusion-blind; the defect being retired). Kept only
+        # so an operator can fall back if the octomap free mask is unavailable.
+        known_ground = dem.source != SRC_NONE
+        raster[known_ground] = FREE
+        if free_via_borrowed_ground and free_ground_radius_m \
+                and free_ground_radius_m > 0.0 and rg_dist is not None:
+            borrow_free = (~known_ground) & (rg_dist <= free_ground_radius_m)
+            free_borrowed = int(borrow_free.sum())
+            raster[borrow_free] = FREE
+    else:
+        # ---- v2 DEFAULT PATH: real ground UNION octomap-free-band mask --------
+        raster[real_free_base] = FREE
+        free_band_mask = np.zeros((nx, ny), bool)
+        if free_xyz is not None and len(free_xyz):
+            fxyz = np.asarray(free_xyz, np.float64)
+            fx, fy, fz = fxyz[:, 0], fxyz[:, 1], fxyz[:, 2]
+            fxi = np.floor((fx - dem.ox) / dem.res).astype(np.int64)
+            fyi = np.floor((fy - dem.oy) / dem.res).astype(np.int64)
+            inb = (fxi >= 0) & (fxi < nx) & (fyi >= 0) & (fyi < ny)
+            cg = cell_ground_within(free_ground_radius_m)
+            fg = cg[fxi.clip(0, nx - 1), fyi.clip(0, ny - 1)]
+            fdz = fz - fg
+            good = inb & np.isfinite(fg) \
+                & (fdz >= free_band_min) & (fdz <= free_band_max)
+            free_band_mask[fxi[good], fyi[good]] = True
+        free_octomap = int((free_band_mask & ~real_free_base).sum())
+        raster[free_band_mask] = FREE
     # own-ground (depth) cells use the full floor; borrowed-ground (sparse 2D
     # lidar) cells use the lower floor. A cell reaching EITHER floor is obstacle.
     obstacle = (evidence >= min_evidence) \
@@ -155,21 +225,65 @@ def project_band(dem, pts_xyz, band_min=0.10, band_max=0.60, min_evidence=6,
         kept = keep[lab]
         speckles = int(obstacle.sum() - kept.sum())
         obstacle = kept
+
+    # ---- v2 D2: cluster z-top gate ------------------------------------------
+    # Drop a surviving cluster iff ALL of: small (size < cluster_min_size) AND
+    # low (max column z-top above own-else-borrowed ground < cluster_min_ztop_m)
+    # AND far from any driven trajectory cell (min dist > cluster_traj_dist_m).
+    # These three together isolate false lawn/vegetation patches from real thin
+    # 2D-lidar walls (which are large, tall, or hug the driven path).
+    ztop_gate_clusters = 0
+    ztop_gate_cells = 0
+    if obstacle.any() and cluster_min_size and cluster_min_size > 0:
+        obs_ground = cell_ground_within(ground_ref_radius_m)
+        ztop = zmax_grid - obs_ground              # NaN where no ground ref
+        ztop = np.where(np.isfinite(ztop), ztop, -np.inf).astype(np.float32)
+        traj_mask = dem.source == SRC_TRAJ
+        if traj_mask.any():
+            traj_dist = ndimage.distance_transform_edt(
+                ~traj_mask, sampling=dem.res)
+        else:
+            traj_dist = np.full((nx, ny), np.inf, np.float32)
+        lab2, n2 = ndimage.label(obstacle, structure=np.ones((3, 3)))
+        if n2:
+            idx = np.arange(n2 + 1)
+            csize = np.bincount(lab2.ravel(), minlength=n2 + 1)
+            cmaxztop = ndimage.maximum(ztop, lab2, idx)
+            cmintraj = ndimage.minimum(traj_dist, lab2, idx)
+            drop = (csize < cluster_min_size) \
+                & (cmaxztop < cluster_min_ztop_m) \
+                & (cmintraj > cluster_traj_dist_m)
+            drop[0] = False
+            if drop.any():
+                drop_mask = drop[lab2]
+                ztop_gate_clusters = int(drop.sum())
+                ztop_gate_cells = int(drop_mask.sum())
+                obstacle = obstacle & ~drop_mask
     raster[obstacle] = OCC
 
     info = {
         'cells_obstacle': int(obstacle.sum()),
         'speckles_dropped': speckles,
+        'ztop_gate_clusters_dropped': ztop_gate_clusters,
+        'ztop_gate_cells_dropped': ztop_gate_cells,
         'cells_free': int((raster == FREE).sum()),
+        'cells_free_realground': int(real_free_base.sum()),
+        'cells_free_octomap': free_octomap,
         'cells_free_borrowed': free_borrowed,
+        'free_leaves_seen': int(len(free_xyz)) if free_xyz is not None else 0,
+        'free_borrow_legacy': bool(free_borrow_legacy),
         'cells_unknown': int((raster == UNKNOWN).sum()),
         'points_unreferenced': unref,
         'points_ground_borrowed': borrowed,
         'cells_obstacle_lidar': int((evidence_borrowed
                                      >= max(1, borrowed_min_evidence)).sum()),
         'band': [band_min, band_max],
+        'free_band': [free_band_min, free_band_max],
         'min_evidence': min_evidence,
         'borrowed_min_evidence': borrowed_min_evidence,
+        'cluster_min_size': cluster_min_size,
+        'cluster_min_ztop_m': cluster_min_ztop_m,
+        'cluster_traj_dist_m': cluster_traj_dist_m,
     }
     return raster, info
 
