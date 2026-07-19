@@ -350,16 +350,11 @@ class MappingManager:
             # available, captured exactly while GPS-denied at the dock. navi_man
             # add-or-replaces it and the bundle export writes it to
             # waypoints.geojson in UTM (permanent world coords).
-            if pose is not None:
-                try:
-                    self.pub_save_wp_at.publish(String(json.dumps(
-                        {'name': 'docked', 'x': pose['x'], 'y': pose['y'],
-                         'yaw': math.radians(pose['yaw_deg'])})))
-                    rospy.loginfo('mapping_manager: docked waypoint auto-saved '
-                                  'at the stop-in-dock pose.')
-                except Exception as e:
-                    rospy.logwarn('mapping_manager: docked waypoint auto-save '
-                                  'failed: %s', e)
+            # ORDER FIX (2026-07-19 night): publishing here raced the auto-serve
+            # below — navi_man had no serving context yet (export silently
+            # skipped) and the subsequent serving-change import wiped the point.
+            # Stash the pose; stop_proc publishes it AFTER the serve settles.
+            self._pending_dock_wp = pose
         else:
             self._update_site_config(site, {'ended_docked': False})
             why = ('loc_status stale/absent' if not fresh else 'not docked')
@@ -583,6 +578,25 @@ class MappingManager:
                 rospy.loginfo('mapping_manager: auto-serving %s/%s after stop',
                               stopped, raster)
                 self._publish_site_map(stopped, raster)
+                # PROTOCOL order fix: now that the site is SERVED (navi_man has
+                # its serving context + finished the serving-change import),
+                # save the stop-in-dock 'docked' waypoint. 2 s oneshot lets the
+                # import land first; navi_man then adds the point and its
+                # bundle export persists it to waypoints.geojson.
+                wp = getattr(self, '_pending_dock_wp', None)
+                if wp is not None:
+                    self._pending_dock_wp = None
+                    def _pub_dock_wp(_evt, _wp=wp):
+                        try:
+                            self.pub_save_wp_at.publish(String(json.dumps(
+                                {'name': 'docked', 'x': _wp['x'], 'y': _wp['y'],
+                                 'yaw': math.radians(_wp['yaw_deg'])})))
+                            rospy.loginfo('mapping_manager: docked waypoint '
+                                          'auto-saved (post-serve).')
+                        except Exception as e:
+                            rospy.logwarn('mapping_manager: docked waypoint '
+                                          'auto-save failed: %s', e)
+                    rospy.Timer(rospy.Duration(2.0), _pub_dock_wp, oneshot=True)
             else:
                 # servesync (2026-07-12): the stopped session saved NO raster
                 # (e.g. aborted fresh site). Serving was cleared at start (empty
