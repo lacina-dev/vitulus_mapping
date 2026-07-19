@@ -154,6 +154,8 @@ class MappingManager:
         # every serve so gloc_server seeds its rms baseline at map load.
         self.pub_track_baseline = rospy.Publisher(
             '/mapping_manager/track_baseline', String, queue_size=1, latch=True)
+        self.pub_save_wp_at = rospy.Publisher(
+            '/navi_manager/save_waypoint_at', String, queue_size=1)
         rospy.Subscriber('/mapping_manager/start', String, self.cb_start,
                          queue_size=1)
         rospy.Subscriber('/mapping_manager/stop', String, self.cb_stop,
@@ -342,6 +344,22 @@ class MappingManager:
             rospy.loginfo('mapping_manager: session "%s" ended DOCKED — '
                           'dock<->map tie is fresh (map->base %s)', site,
                           json.dumps(pose) if pose else 'unavailable')
+            # PROTOCOL (user design, 2026-07-19): CREATE the 'docked' waypoint
+            # RIGHT NOW — the pose is still continuous with the RTK-anchored
+            # drive, so this is the most accurate WORLD coordinate of the dock
+            # available, captured exactly while GPS-denied at the dock. navi_man
+            # add-or-replaces it and the bundle export writes it to
+            # waypoints.geojson in UTM (permanent world coords).
+            if pose is not None:
+                try:
+                    self.pub_save_wp_at.publish(String(json.dumps(
+                        {'name': 'docked', 'x': pose['x'], 'y': pose['y'],
+                         'yaw': math.radians(pose['yaw_deg'])})))
+                    rospy.loginfo('mapping_manager: docked waypoint auto-saved '
+                                  'at the stop-in-dock pose.')
+                except Exception as e:
+                    rospy.logwarn('mapping_manager: docked waypoint auto-save '
+                                  'failed: %s', e)
         else:
             self._update_site_config(site, {'ended_docked': False})
             why = ('loc_status stale/absent' if not fresh else 'not docked')
