@@ -82,6 +82,34 @@ class GateConfig:
     # the gate just carries the values for echo/persist.
     lidar_max_range_m: float = 8.0
     depth_max_range_m: float = 2.8
+    # --- phantom elevated-geometry hardening (H-POSE-Z, 2026-07-19) -----------
+    # ROOT CAUSE (novaTestovaciMapa 2026-07-19): the inserted cloud z is
+    # TF-z (flat, EKF does not estimate z) + z_correction (RTK altitude - TF-z).
+    # During a GPS-marginal window the RTK altitude EXCURSED ~+0.5 m (still
+    # rtk_fixed, good vAcc — precision != accuracy) and z_correction faithfully
+    # tracked it, so ~1300 ground clouds were painted 0.5 m too high. Where that
+    # coverage meets the correctly-placed ground a phantom STEP appears on flat
+    # concrete. A smaller frozen-z-while-moving error (-0.28 m) occurred too.
+    # Three layered, slope-safe guards (all opt-in; 0/False == legacy):
+    # (1) accept z_correction updates ONLY when the localization arbiter is
+    #     trustworthy (probation_proven), not merely when raw carrier/vAcc look
+    #     good — this is what distinguishes the marginal excursion. Mirrors the
+    #     datum-capture gating already proven for the dock-departure residual.
+    z_corr_require_trust: bool = False
+    # (2) slew guard: real terrain moves z_correction at most ~speed*grade; a
+    #     RTK re-fix / marginal excursion moves it faster. Clamp the accepted
+    #     change to max_rate * dt. NOT flat-world: continuous slope survives.
+    z_corr_max_rate_mps: float = 0.0        # 0 = off; 0.25 recommended
+    # (3) block insertion when z is not confidently fresh AND the robot is
+    #     MOVING (a stale/frozen z is only valid where it froze; driving to new
+    #     terrain with it smears the ground). Stationary re-observation is fine.
+    z_stale_block_when_moving: bool = False
+    max_z_corr_age_s: float = 8.0
+    # standstill dwell throttle (applied in the node): a near-stationary robot
+    # re-inserting the same view hammers voxels and amplifies any z bias.
+    standstill_speed_eps_mps: float = 0.05
+    standstill_after_s: float = 8.0
+    standstill_rate_hz: float = 0.5
 
 
 @dataclass
@@ -112,6 +140,10 @@ class InsertionGate:
         # cumulative correction-rate pause
         self._corr_hist = []
         self._corr_rate_mps = 0.0     # last computed windowed rate
+        # H-POSE-Z hardening state
+        self._speed_mps = 0.0         # EMA of |v| from feed_pose (dwell throttle)
+        self._still_since = None      # t since speed dropped below eps
+        self._loc_ok = None           # arbiter trust flag from node; None=unknown
         # M2: feed_map_odom (5 Hz tick thread) and evaluate (tick thread + 3
         # concurrent cloud subscriber threads via the stamped path) both touch
         # _corr_hist/_corr_rate_mps. Guard them; only the tick path prunes.
@@ -145,11 +177,33 @@ class InsertionGate:
             dt = t - prev[0]
             if dt > 0:
                 d = math.hypot(x - prev[1], y - prev[2])
+                # instantaneous speed (EMA) for the standstill dwell throttle
+                # and the z-stale-while-moving insertion gate.
+                self._speed_mps += 0.5 * (d / dt - self._speed_mps)
+                if self._speed_mps < self.cfg.standstill_speed_eps_mps:
+                    if self._still_since is None:
+                        self._still_since = t
+                else:
+                    self._still_since = None
                 allowed = self.cfg.max_speed_mps * dt + self.cfg.jump_margin_m
                 if d > allowed:
                     self._cooldown_until = t + self.cfg.jump_cooldown_s
                     self._last_jump_m = d
         self._pose = (t, x, y, z, yaw)
+
+    def set_loc_trust(self, ok):
+        """Node feeds the localization arbiter's trust (probation_proven etc.).
+        None = unknown (older navi_transform) -> legacy behaviour."""
+        self._loc_ok = ok
+
+    def speed_mps(self):
+        return self._speed_mps
+
+    def standstill_s(self, now):
+        """Seconds below standstill_speed_eps (0.0 if moving/unknown)."""
+        if self._still_since is None:
+            return 0.0
+        return max(0.0, now - self._still_since)
 
     def feed_map_odom(self, t, x, y, yaw):
         """Watchdog on the map->odom transform: a step here IS a
@@ -205,22 +259,30 @@ class InsertionGate:
                 or not (fix_ok and carr_fixed)
                 or vacc > self.cfg.max_vacc_mm):
             return
+        # H-POSE-Z guard (1): accept the RTK altitude into z_corr ONLY when the
+        # localization arbiter is trustworthy. A marginal-window excursion
+        # (rtk_fixed + good vAcc but WRONG absolute altitude) is what smeared
+        # the ground +0.5 m on 2026-07-19; probation_proven is False in exactly
+        # those windows. None (unknown) keeps legacy behaviour.
+        if self.cfg.z_corr_require_trust and self._loc_ok is False:
+            return                       # freeze z_corr through untrusted window
         new = z - self._pose[3]
-        if self.cfg.z_corr_mode == 'local':
-            # LOCAL: track the current ground offset at THIS position. A light
-            # EMA still removes per-fix cm jitter, but it is fast enough (0.6)
-            # to follow real slope as the robot drives, instead of averaging
-            # the whole site into one flat scalar. Frozen on outage (below).
-            if self._z_corr_t is None:
-                self._z_corr = new
-            else:
-                self._z_corr += 0.6 * (new - self._z_corr)
+        gain = 0.6 if self.cfg.z_corr_mode == 'local' else 0.3
+        if self._z_corr_t is None:
+            self._z_corr = new
         else:
-            # GLOBAL (legacy): one slowly-smoothed scalar for the whole site.
-            if self._z_corr_t is None:
-                self._z_corr = new
+            target = self._z_corr + gain * (new - self._z_corr)
+            # H-POSE-Z guard (2): slew-limit the accepted change. Real slope
+            # moves z at speed*grade (slow); an altitude re-fix teleports.
+            if self.cfg.z_corr_max_rate_mps > 0.0:
+                dt = max(1e-3, t - self._z_corr_t)
+                max_step = self.cfg.z_corr_max_rate_mps * dt
+                dz = target - self._z_corr
+                if abs(dz) > max_step:
+                    dz = math.copysign(max_step, dz)
+                self._z_corr += dz
             else:
-                self._z_corr += 0.3 * (new - self._z_corr)
+                self._z_corr = target
         self._z_corr_t = t
 
     # ---- helpers -----------------------------------------------------------
@@ -337,6 +399,22 @@ class InsertionGate:
             info['last_jump_m'] = round(max(self._last_jump_m,
                                             self._last_corr_m), 2)
         info['map_corrections'] = self.corrections
+
+        # H-POSE-Z guard (3): block insertion when the ground-z reference is not
+        # confidently fresh AND the robot is MOVING. A stale/frozen z_corr is
+        # only valid where it froze; driving to new terrain with it inserts the
+        # ground at the wrong height (the -0.28 m frozen-window error, and the
+        # tail of the excursion). Stationary re-observation of the same spot is
+        # allowed (speed below eps). Slope-safe: it gates on z FRESHNESS, never
+        # on z being non-zero. Opt-in (default off).
+        if self.cfg.z_stale_block_when_moving:
+            moving = self._speed_mps >= self.cfg.standstill_speed_eps_mps
+            z_age = (float('inf') if self._z_corr_t is None
+                     else wall_now - self._z_corr_t)
+            if moving and z_age > cfg.max_z_corr_age_s:
+                reasons.append('z_stale_moving')
+                info['z_corr_age_s'] = (None if self._z_corr_t is None
+                                        else round(z_age, 2))
 
         # rate-based pause: don't map while the map frame is actively being
         # corrected. Recompute the windowed rate against `now` so it decays to

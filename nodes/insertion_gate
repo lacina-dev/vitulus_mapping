@@ -95,7 +95,24 @@ class InsertionGateNode:
             z_corr_mode=rospy.get_param('~z_corr_mode', 'local'),
             lidar_max_range_m=float(rospy.get_param('~lidar_max_range_m', 8.0)),
             depth_max_range_m=float(rospy.get_param('~depth_max_range_m', 2.8)),
+            # H-POSE-Z hardening (2026-07-19)
+            z_corr_require_trust=bool(rospy.get_param(
+                '~z_corr_require_trust', False)),
+            z_corr_max_rate_mps=float(rospy.get_param(
+                '~z_corr_max_rate_mps', 0.0)),
+            z_stale_block_when_moving=bool(rospy.get_param(
+                '~z_stale_block_when_moving', False)),
+            max_z_corr_age_s=float(rospy.get_param('~max_z_corr_age_s', 8.0)),
+            standstill_speed_eps_mps=float(rospy.get_param(
+                '~standstill_speed_eps_mps', 0.05)),
+            standstill_after_s=float(rospy.get_param(
+                '~standstill_after_s', 8.0)),
+            standstill_rate_hz=float(rospy.get_param(
+                '~standstill_rate_hz', 0.5)),
         )
+        # standstill dwell throttle enable (node-level; uses gate speed)
+        self.standstill_throttle = bool(rospy.get_param(
+            '~standstill_throttle', False))
         self.gate = InsertionGate(cfg)
         self.laser_proj = LaserProjection()
         # runtime range caps persist per-site like band_overrides (item 3)
@@ -396,6 +413,9 @@ class InsertionGateNode:
     # ---- gate ticks ---------------------------------------------------------
     def tick_gate(self, _evt):
         self.sample_pose()
+        # H-POSE-Z: feed the localization arbiter trust so z_corr updates are
+        # only accepted when GPS ownership is fully proven (None -> legacy).
+        self.gate.set_loc_trust(self._loc_trustworthy() if self._loc else None)
         dec = self.gate.evaluate(rospy.Time.now().to_sec())
         self.pub_gate.publish(Bool(dec.passed))
         # M4: publish z_corr at the 5 Hz gate tick so trajectory_dem samples the
@@ -635,7 +655,18 @@ class InsertionGateNode:
         c = self.counters[topic]
         c['in'] += 1
         now = time.monotonic()
-        if now - self.last_pub[topic] < 1.0 / self.max_rate_hz:
+        # H-POSE-Z: standstill dwell throttle. A near-stationary robot re-inserts
+        # the same view thousands of times, amplifying any z bias into a dense
+        # sheet. After standstill_after_s below eps speed, drop to
+        # standstill_rate_hz; moving resumes full rate. De-biases dwells anywhere
+        # (dock included), not just this artifact.
+        min_interval = 1.0 / self.max_rate_hz
+        if self.standstill_throttle and self.gate.cfg.standstill_rate_hz > 0:
+            still = self.gate.standstill_s(rospy.Time.now().to_sec())
+            if still > self.gate.cfg.standstill_after_s:
+                min_interval = max(min_interval,
+                                   1.0 / self.gate.cfg.standstill_rate_hz)
+        if now - self.last_pub[topic] < min_interval:
             c['throttled'] += 1          # M3
             return
         # Item 7: judge the pose that ACTUALLY produced this cloud (at

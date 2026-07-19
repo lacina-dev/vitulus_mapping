@@ -49,6 +49,35 @@ insertion_gate:
   # {lidar_max_m?, depth_max_m?} (0.5..20 m), persisted per-site.
   lidar_max_range_m: 8.0             # lidar cut at projection (range_cutoff)
   depth_max_range_m: 2.8            # D435 depth points beyond this are dropped
+  # --- phantom elevated-geometry hardening (H-POSE-Z, 2026-07-19) -------------
+  # DIAGNOSIS (novaTestovaciMapa, today's drive): the inserted ground cloud was
+  # painted ~+0.5 m too high for ~1300 insertions during a GPS-MARGINAL window
+  # (t=205-299 s; owner flipping gps<->dr). The RTK altitude excursed while
+  # still rtk_fixed with good vAcc (precision != accuracy), and z_correction
+  # tracked it, so the ground got a second copy 0.5 m up -> phantom step on flat
+  # concrete where that coverage meets the correctly-placed ground. A smaller
+  # frozen-z-while-moving error (-0.28 m, 237 ins) also occurred. NOT a camera
+  # tilt/range-noise artifact (those are secondary; see report). Fixes below act
+  # on FUTURE sessions; validate on the next drive (watch gate_status z_corr and
+  # the z_stale_moving counter). depth_max_range_m stays 2.8 m (already the
+  # research-recommended conservative D435 value; it excludes the worst stereo
+  # noise >3.5 m -- do NOT lower further, it would cost coverage).
+  z_corr_require_trust: true          # accept RTK altitude into z_corr ONLY when
+                                      # the arbiter is trusted (probation_proven)
+  z_corr_max_rate_mps: 0.25           # slew-limit z_corr (slope-safe; 0=off)
+  z_stale_block_when_moving: true     # skip insertion when z stale/frozen AND
+                                      # moving (stationary re-observe still OK)
+  max_z_corr_age_s: 8.0               # z considered stale for the block above
+  standstill_throttle: true           # de-bias dwells (dock incl.)
+  standstill_after_s: 8.0
+  standstill_rate_hz: 0.5             # insert rate while parked (full rate moving)
+  standstill_speed_eps_mps: 0.05
+  # CALIBRATION NOTE (report to orchestrator): the D435 has a measured ~1.8 deg
+  # systematic pitch extrinsic error (live, flat concrete: ground reconstructed
+  # tilting 1.8 deg, 2 mm residual; slope/SE=15 -> unambiguous). It contributes
+  # only ~0.05 m over the 2.8 m depth range (secondary), but should be corrected
+  # in the URDF (d435_link mount, RPY currently [0,0,0]). No silent rotation is
+  # applied here.
   max_hacc_mm: 50.0
   max_vacc_mm: 80.0
   max_gps_age_s: 1.5
