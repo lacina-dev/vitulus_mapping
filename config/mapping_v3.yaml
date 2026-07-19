@@ -149,6 +149,18 @@ band_projector:
   cluster_min_size: 15
   cluster_min_ztop_m: 0.30
   cluster_traj_dist_m: 0.6
+  # v3 (2026-07-19): cluster occupancy-probability gate. octomap stores log-odds
+  # per voxel — real structure (walls, trunks, posts) is hit by many rays and
+  # saturates toward the clamp, transients (a walking operator, swaying grass,
+  # drive-by noise) get few hits and stay near the 0.5 threshold. An obstacle
+  # CLUSTER whose MAX in-band occupancy never reached min_occupancy was never
+  # ray-confirmed and is dropped (per-cell occupancy would kill real thin walls;
+  # the cluster max is the discriminator). Uses the occupied leaf probabilities
+  # the ot_dump helper reads off garden.ot. 0 disables. Measured on
+  # novaTestovaciMapa: 0.90 removes 222 more false cells at ZERO real-cluster
+  # loss (real clusters bottom out at cmax=0.927; a cluster with no occupancy
+  # coverage is kept, never dropped).
+  min_occupancy: 0.90
   fill_percentile: 1.5               # low envelope of octree column z; lower =
                                      # more resistant to tall grass reading as
                                      # ground (audit 2026-07-12, was 5.0)

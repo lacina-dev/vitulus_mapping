@@ -7,10 +7,17 @@
 //
 //   usage: ot_dump in.ot out.bin [no_expand]
 //
-// Output: little-endian float32 records [x, y, z, size, occ] per leaf, where
-// occ = 1.0 for occupied, 0.0 for free. By default the tree is expand()-ed so
-// pruned free space is emitted at full leaf resolution (pass a 3rd arg "0" or
-// "no_expand" to skip). Progress/summary is printed to stderr; stdout is empty.
+// Output: little-endian float32 records [x, y, z, size, occ_prob] per leaf,
+// where occ_prob = getOccupancy() = the leaf's occupancy PROBABILITY in [0, 1]
+// (classifier v3, 2026-07-19). This is backward compatible with the v2 reader:
+// free leaves sit below and occupied leaves at/above the tree's occupancy
+// threshold (0.5 by default), so the free/occupied split (occ_prob < 0.5) is
+// unchanged, while consumers that want it now get the real probability — real
+// structure saturates near the clamp under many rays, transients stay near 0.5,
+// which band's v3 cluster occupancy gate (min_occupancy) exploits. By default
+// the tree is expand()-ed so pruned free space is emitted at full leaf
+// resolution (pass a 3rd arg "0" or "no_expand" to skip). Progress/summary is
+// printed to stderr; stdout is empty.
 //
 // Derived from the forensic harness dump_all.cpp (reused per the classifier v2
 // design). Built by CMake (add_executable) into
@@ -47,10 +54,10 @@ int main(int argc, char** argv) {
   double res = t->getResolution();
   for (OcTree::leaf_iterator it = t->begin_leafs(), end = t->end_leafs();
        it != end; ++it) {
-    float o = t->isNodeOccupied(*it) ? 1.f : 0.f;
-    if (o > 0.5f) occ++; else freen++;
+    float p = (float)it->getOccupancy();   // occupancy probability in [0, 1]
+    if (t->isNodeOccupied(*it)) occ++; else freen++;
     float rec[5] = { (float)it.getX(), (float)it.getY(), (float)it.getZ(),
-                     (float)it.getSize(), o };
+                     (float)it.getSize(), p };
     fwrite(rec, sizeof(float), 5, out);
   }
   fclose(out);

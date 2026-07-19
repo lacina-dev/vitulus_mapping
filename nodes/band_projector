@@ -103,6 +103,16 @@ class BandProjectorNode:
             rospy.get_param('~cluster_min_ztop_m', 0.30))
         self.cluster_traj_dist_m = float(
             rospy.get_param('~cluster_traj_dist_m', 0.6))
+        # --- classifier v3 (2026-07-19, forensic round-2) -------------------
+        # Cluster occupancy-probability gate. octomap stores log-odds per voxel:
+        # real structure saturates near the clamp under many rays, transients
+        # (walking operator, swaying grass, drive-by noise) stay near the 0.5
+        # threshold. An obstacle CLUSTER whose max in-band occupancy never
+        # reached min_occupancy was never ray-confirmed => dropped. Uses the
+        # occupied leaf probabilities from the ot_dump helper. 0 disables.
+        # (Measured on novaTestovaciMapa: 0.90 removes 222 more false cells at
+        # zero real-cluster loss; real clusters bottom out at cmax=0.927.)
+        self.min_occupancy = float(rospy.get_param('~min_occupancy', 0.90))
         # D3: the ot_dump helper reads octomap FREE leaves off the saved
         # garden.ot (octomap_server publishes only OCCUPIED centres on the wire).
         self.ot_dump_timeout_s = float(
@@ -178,6 +188,7 @@ class BandProjectorNode:
         d['cluster_min_size'] = self.cluster_min_size
         d['cluster_min_ztop_m'] = round(self.cluster_min_ztop_m, 2)
         d['cluster_traj_dist_m'] = round(self.cluster_traj_dist_m, 2)
+        d['min_occupancy'] = round(self.min_occupancy, 2)
         self.pub_status.publish(String(json.dumps(d)))
 
     # ---- classifier settings (live tuning) ----------------------------------
@@ -215,7 +226,8 @@ class BandProjectorNode:
                            'free_band_max': self.free_band_max,
                            'cluster_min_size': self.cluster_min_size,
                            'cluster_min_ztop_m': self.cluster_min_ztop_m,
-                           'cluster_traj_dist_m': self.cluster_traj_dist_m},
+                           'cluster_traj_dist_m': self.cluster_traj_dist_m,
+                           'min_occupancy': self.min_occupancy},
                           f, indent=1)
         except Exception as e:
             rospy.logwarn('band_projector: could not save band overrides: %s', e)
@@ -247,6 +259,7 @@ class BandProjectorNode:
                                     self.cluster_min_ztop_m))
             cl_tdist = float(req.get('cluster_traj_dist_m',
                                      self.cluster_traj_dist_m))
+            min_occ = float(req.get('min_occupancy', self.min_occupancy))
         except (TypeError, ValueError) as e:
             return None, 'non-numeric value: %s' % e
         if not (0.0 <= band_min < band_max <= 2.0):
@@ -276,6 +289,8 @@ class BandProjectorNode:
         if not (0.0 <= cl_tdist <= 20.0):
             return None, ('cluster_traj_dist_m out of range 0..20: %s'
                           % cl_tdist)
+        if not (0.0 <= min_occ <= 1.0):
+            return None, ('min_occupancy out of range 0..1: %s' % min_occ)
         self.band_min = band_min
         self.band_max = band_max
         self.min_evidence = min_evidence
@@ -290,6 +305,7 @@ class BandProjectorNode:
         self.cluster_min_size = cl_size
         self.cluster_min_ztop_m = cl_ztop
         self.cluster_traj_dist_m = cl_tdist
+        self.min_occupancy = min_occ
         applied = {'band_min': band_min, 'band_max': band_max,
                    'min_evidence': min_evidence,
                    'min_cluster_cells': min_cluster,
@@ -301,7 +317,8 @@ class BandProjectorNode:
                    'free_band_min': free_bmin, 'free_band_max': free_bmax,
                    'cluster_min_size': cl_size,
                    'cluster_min_ztop_m': cl_ztop,
-                   'cluster_traj_dist_m': cl_tdist}
+                   'cluster_traj_dist_m': cl_tdist,
+                   'min_occupancy': min_occ}
         if log:
             rospy.loginfo('band_projector: classifier settings -> %s',
                           json.dumps(applied))
@@ -423,14 +440,19 @@ class BandProjectorNode:
         return DemGrid.load_npz(self.dem_path)
 
     def load_free_leaves(self, occupied_count=0):
-        """D3 (classifier v2): dump the saved garden.ot with the ot_dump helper
-        and return its octomap FREE leaf centres as an (N, 3) float64 array in
-        the map frame — the raytraced free space that feeds band's FREE mask.
+        """D3 (classifier v2/v3): dump the saved garden.ot with the ot_dump
+        helper and return (free_xyz, occ_prob_xyz):
+          free_xyz     (N, 3) float64 octomap FREE leaf centres — the raytraced
+                       free space that feeds band's FREE mask (v2 D1).
+          occ_prob_xyz (M, 4) float64 [x, y, z, occupancy] of OCCUPIED leaves —
+                       the per-voxel occupancy probability that feeds band's v3
+                       cluster occupancy gate (min_occupancy).
 
-        Returns None (=> treat as zero free leaves) when: garden.ot is not on
+        Returns (None, None) (=> treat as zero leaves) when: garden.ot is not on
         disk, the ot_dump helper is missing/not built, it times out, or the file
         is empty. In every failure case the caller falls back to real-ground-only
-        FREE (or the legacy borrow rings if free_borrow_legacy is enabled).
+        FREE (or the legacy borrow rings if free_borrow_legacy is enabled) and
+        the occupancy gate becomes a no-op.
 
         occupied_count: live occupied-centre count, only used to logwarn loudly
         when free leaves look suspiciously sparse (a session built without
@@ -439,7 +461,7 @@ class BandProjectorNode:
         if not os.path.exists(ot_path):
             rospy.logwarn('band_projector: no garden.ot at %s — FREE from '
                           'real ground only (no octomap free mask)', ot_path)
-            return None
+            return None, None
         fd, tmp = tempfile.mkstemp(suffix='.bin', prefix='ot_free_')
         os.close(fd)
         try:
@@ -450,8 +472,10 @@ class BandProjectorNode:
             if raw.size == 0 or raw.size % 5:
                 rospy.logwarn('band_projector: ot_dump produced no/garbled '
                               'leaves — FREE from real ground only')
-                return None
+                return None, None
             leaves = raw.reshape(-1, 5)
+            # ot_dump col 4 is the leaf occupancy probability (getOccupancy);
+            # free leaves sit below the 0.5 occupancy threshold.
             is_free = leaves[:, 4] < 0.5
             n_free = int(is_free.sum())
             n_occ = int((~is_free).sum())
@@ -464,20 +488,23 @@ class BandProjectorNode:
             else:
                 rospy.loginfo('band_projector: ot_dump %d free / %d occupied '
                               'leaves from garden.ot', n_free, n_occ)
-            return leaves[is_free, :3].astype(np.float64)
+            free_xyz = leaves[is_free, :3].astype(np.float64)
+            # occupied leaf x,y,z,occupancy-probability for the v3 occ gate
+            occ_prob_xyz = leaves[~is_free][:, [0, 1, 2, 4]].astype(np.float64)
+            return free_xyz, occ_prob_xyz
         except FileNotFoundError:
             rospy.logwarn('band_projector: ot_dump helper not found (rosrun) — '
                           'build it (catkin_make --pkg vitulus_mapping); FREE '
                           'from real ground only')
-            return None
+            return None, None
         except subprocess.TimeoutExpired:
             rospy.logwarn('band_projector: ot_dump timed out (%.0fs) — FREE '
                           'from real ground only', self.ot_dump_timeout_s)
-            return None
+            return None, None
         except Exception as e:
             rospy.logwarn('band_projector: ot_dump failed (%s) — FREE from '
                           'real ground only', e)
-            return None
+            return None, None
         finally:
             try:
                 os.remove(tmp)
@@ -519,8 +546,11 @@ class BandProjectorNode:
             # v2 D1/D3: octomap FREE leaves off the saved garden.ot (raytraced
             # free space). None => real-ground-only FREE (legacy rings honoured
             # only if free_borrow_legacy is set). Skipped in legacy mode.
-            free_xyz = (None if self.free_borrow_legacy
-                        else self.load_free_leaves(occupied_count=len(pts)))
+            if self.free_borrow_legacy:
+                free_xyz, occ_prob_xyz = None, None
+            else:
+                free_xyz, occ_prob_xyz = self.load_free_leaves(
+                    occupied_count=len(pts))
             raster, info = project_band(work, pts, self.band_min,
                                         self.band_max, self.min_evidence,
                                         self.min_cluster_cells,
@@ -534,7 +564,9 @@ class BandProjectorNode:
                                         free_borrow_legacy=self.free_borrow_legacy,
                                         cluster_min_size=self.cluster_min_size,
                                         cluster_min_ztop_m=self.cluster_min_ztop_m,
-                                        cluster_traj_dist_m=self.cluster_traj_dist_m)
+                                        cluster_traj_dist_m=self.cluster_traj_dist_m,
+                                        occ_prob_xyz=occ_prob_xyz,
+                                        min_occupancy=self.min_occupancy)
             info.update({'fill_cells': filled, 'fill_dropped_slope': dropped,
                          'inpainted_cells': inpainted, 'points': len(pts),
                          'took_s': round(time.monotonic() - t0, 1)})

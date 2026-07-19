@@ -23,7 +23,8 @@ def project_band(dem, pts_xyz, band_min=0.10, band_max=0.60, min_evidence=6,
                  free_xyz=None, free_band_min=-0.30, free_band_max=0.60,
                  free_borrow_legacy=False,
                  cluster_min_size=15, cluster_min_ztop_m=0.30,
-                 cluster_traj_dist_m=0.6):
+                 cluster_traj_dist_m=0.6,
+                 occ_prob_xyz=None, min_occupancy=0.0):
     """dem: DemGrid (already filled/inpainted copy), pts_xyz: Nx3 occupied
     voxel centers in map frame. Returns (raster int8 [ix, iy], info dict).
 
@@ -94,7 +95,31 @@ def project_band(dem, pts_xyz, band_min=0.10, band_max=0.60, min_evidence=6,
     filter, a cluster is dropped iff ALL of: size < cluster_min_size AND its
     max column z-top above (own-else-borrowed) ground < cluster_min_ztop_m AND
     its min distance to a trajectory cell > cluster_traj_dist_m. On this dataset
-    that removes 262 false cells with 0 real-cluster losses."""
+    that removes 262 false cells with 0 real-cluster losses.
+
+    CLASSIFIER v3 (2026-07-19, forensic round-2). After v2 the FREE space was
+    accepted but the user reported REMAINING false obstacles. Round-2 forensics
+    (novaTestovaciMapa, 2833 v2 obstacle cells, 17 real clusters incl. the garage
+    623-cell cluster) tested three discriminators; only octomap per-voxel
+    OCCUPANCY PROBABILITY separated real from false. octomap stores log-odds per
+    leaf: real structure (walls, trunks, posts) is hit by many rays and saturates
+    toward the clamp (>=0.95), while transients (a walking operator, swaying
+    grass, drive-by noise) accumulate few hits and their occupancy sits near the
+    0.5 threshold. Per-CELL occupancy does NOT separate (real thin-lidar walls
+    contain low-prob cells too — measured overlap p5=0.61 both classes); the
+    per-CLUSTER MAXIMUM in-band occupancy is the clean discriminator: real
+    clusters bottom out at cmax=0.927, transient clusters top out below, so a
+    cluster whose BEST in-band voxel never reached min_occupancy was never
+    confirmed by repeated rays and is dropped. min_occupancy=0.90 removes 226
+    false cells at ZERO real-cluster loss here, INDEPENDENT of size (catches
+    larger transient smears the z-top/size gate spares). H1 operator-trail
+    (distance-to-trajectory, free-leaves-above-band) and H2 DEM-slope showed no
+    separation (slope was reversed — real obstacles sit on the steeper wall-base
+    gradient) and were rejected. Pass the occupied leaf centres+probability as
+    `occ_prob_xyz` (Nx4 x,y,z,occ, from the ot_dump helper). min_occupancy=0
+    disables the gate (backward compatible); a cluster with no occupancy coverage
+    at all (cmax==0, e.g. occ_prob_xyz snapshot mismatch) is KEPT, never dropped
+    — the gate is strictly evidence-additive."""
     nx, ny = dem.elev.shape
     evidence = np.zeros((nx, ny), np.int32)
     evidence_borrowed = np.zeros((nx, ny), np.int32)
@@ -259,6 +284,45 @@ def project_band(dem, pts_xyz, band_min=0.10, band_max=0.60, min_evidence=6,
                 ztop_gate_clusters = int(drop.sum())
                 ztop_gate_cells = int(drop_mask.sum())
                 obstacle = obstacle & ~drop_mask
+
+    # ---- v3: cluster occupancy-probability gate -----------------------------
+    # Drop a surviving obstacle cluster whose MAXIMUM in-band octomap occupancy
+    # probability is below min_occupancy — the whole cluster was raytraced only
+    # a few times (a walking operator, swaying grass, drive-by noise) and never
+    # confirmed to saturation like real structure. Per-cell occupancy would kill
+    # real thin walls (they contain low-prob cells too); the cluster max is the
+    # discriminator. cmax==0 (no occupancy coverage, e.g. snapshot mismatch) is
+    # KEPT — the gate only removes clusters it can positively see are transient.
+    occ_gate_clusters = 0
+    occ_gate_cells = 0
+    if (min_occupancy and min_occupancy > 0.0 and obstacle.any()
+            and occ_prob_xyz is not None and len(occ_prob_xyz)):
+        op = np.asarray(occ_prob_xyz, np.float64)
+        opx = np.floor((op[:, 0] - dem.ox) / dem.res).astype(np.int64)
+        opy = np.floor((op[:, 1] - dem.oy) / dem.res).astype(np.int64)
+        oki = (opx >= 0) & (opx < nx) & (opy >= 0) & (opy < ny)
+        opx, opy, opz, opp = opx[oki], opy[oki], op[oki, 2], op[oki, 3]
+        occg = cell_ground_within(ground_ref_radius_m)
+        gsel = occg[opx, opy]
+        odz = opz - gsel
+        oin = np.isfinite(gsel) & (odz >= band_min) & (odz <= band_max)
+        occprob = np.zeros((nx, ny), np.float32)
+        if oin.any():
+            np.maximum.at(occprob, (opx[oin], opy[oin]),
+                          opp[oin].astype(np.float32))
+        lab3, n3 = ndimage.label(obstacle, structure=np.ones((3, 3)))
+        if n3:
+            idx3 = np.arange(n3 + 1)
+            cmaxp = ndimage.maximum(occprob, lab3, idx3)
+            # cmaxp>0 guard: only drop clusters we can SEE are low-occupancy;
+            # a cluster with no occupancy coverage at all is kept (honest).
+            drop_o = (cmaxp < min_occupancy) & (cmaxp > 0.0)
+            drop_o[0] = False
+            if drop_o.any():
+                drop_om = drop_o[lab3]
+                occ_gate_clusters = int(drop_o.sum())
+                occ_gate_cells = int(drop_om.sum())
+                obstacle = obstacle & ~drop_om
     raster[obstacle] = OCC
 
     info = {
@@ -266,6 +330,8 @@ def project_band(dem, pts_xyz, band_min=0.10, band_max=0.60, min_evidence=6,
         'speckles_dropped': speckles,
         'ztop_gate_clusters_dropped': ztop_gate_clusters,
         'ztop_gate_cells_dropped': ztop_gate_cells,
+        'occ_gate_clusters_dropped': occ_gate_clusters,
+        'occ_gate_cells_dropped': occ_gate_cells,
         'cells_free': int((raster == FREE).sum()),
         'cells_free_realground': int(real_free_base.sum()),
         'cells_free_octomap': free_octomap,
@@ -284,6 +350,7 @@ def project_band(dem, pts_xyz, band_min=0.10, band_max=0.60, min_evidence=6,
         'cluster_min_size': cluster_min_size,
         'cluster_min_ztop_m': cluster_min_ztop_m,
         'cluster_traj_dist_m': cluster_traj_dist_m,
+        'min_occupancy': min_occupancy,
     }
     return raster, info
 
