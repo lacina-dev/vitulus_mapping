@@ -449,10 +449,14 @@ class DirectRasterNode:
         finite = np.isfinite(r)
         # hit: a real return within [range_min, cap]
         hit = finite & (r >= rmin) & (r <= cap)
-        # no-return free ray: a genuine max-range / beyond-cap beam (NOT a nan,
-        # which the filter uses for removed beams -> no information, skip).
+        # no-return free ray: max-range / beyond-cap beam OR NaN. Field fact
+        # (2026-07-19, measured): the rplidar driver encodes no-hit as inf, but
+        # /rplidar/scan_filtered converts those inf beams to NaN — so NaN here
+        # is overwhelmingly a genuine no-return, not filtered geometry. Per the
+        # user's explicit design, a no-hit beam carves FREE up to the cap when
+        # lidar_free_no_hit is on.
         beyond = finite & (r > cap)
-        noreturn = np.isinf(r) | (finite & (r >= rmax))
+        noreturn = np.isinf(r) | np.isnan(r) | (finite & (r >= rmax))
         free_ray = self.lidar_free_no_hit & (beyond | noreturn)
         sel = hit | free_ray
         if not sel.any():
