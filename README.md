@@ -56,7 +56,9 @@ topicy /mapping_manager/start|stop|remove_site|status).
 ```bash
 roslaunch vitulus_mapping mapping_v3.launch site:=zahrada
 # pokračování z uloženého archivu:
-roslaunch vitulus_mapping mapping_v3.launch site:=zahrada octomap:=$HOME/.vitulus/mapping_v3/zahrada/garden.ot
+roslaunch vitulus_mapping mapping_v3.launch site:=zahrada octomap_archive:=$HOME/.vitulus/mapping_v3/zahrada/garden.ot
+# direct-raster-only (bez octomapu / band_projectoru):
+roslaunch vitulus_mapping mapping_v3.launch site:=zahrada3 octomap:=false
 ```
 
 Pak normálně sekat/jezdit. Brána se otevírá sama jen při RTK FIXED; stav:
