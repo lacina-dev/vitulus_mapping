@@ -20,6 +20,8 @@ def project_band(dem, pts_xyz, band_min=0.10, band_max=0.60, min_evidence=6,
                  min_cluster_cells=3, ground_ref_radius_m=1.0,
                  borrowed_min_evidence=2, free_via_borrowed_ground=True,
                  free_ground_radius_m=None,
+                 slope_band_comp=False, slope_grad_cap=0.15,
+                 slope_comp_cap_m=0.20, slope_grad_smooth_m=0.40,
                  free_xyz=None, free_band_min=-0.30, free_band_max=0.60,
                  free_borrow_legacy=False,
                  cluster_min_size=15, cluster_min_ztop_m=0.30,
@@ -196,6 +198,73 @@ def project_band(dem, pts_xyz, band_min=0.10, band_max=0.60, min_evidence=6,
     if rg_dist is not None:
         near_ground_grid = dem.elev[rg_jx, rg_jy]
 
+    # ---- SLOPE-BAND COMPENSATION (treelawn 2026-07-19, SECONDARY, default OFF)
+    # NOTE ON DOMINANT MECHANISM: live forensics 2026-07-19 (novaTestovaciMapa,
+    # tree on a gentle uphill) showed the MAIN trailing-lawn phantom is NOT a
+    # band-classifier geometry error but an INSERTION-TIME temporal z bug: on the
+    # slope the RTK vertical solution flaps (measured outages 1.2-38 s, up to
+    # 3.27 m driven), z_corr freezes/lags within the 8 s moving grace, and clouds
+    # get inserted with a z that disagrees with the trajectory-DEM z stamped for
+    # the same cell -> fresh lawn lands 0.10-0.20 m 'above ground' just behind the
+    # robot. That is fixed in the z-pipeline (see gates.py z_stale_max_dist_m /
+    # max_z_corr_age_s), NOT here — band.py cannot tell a z-freeze phantom (cloud
+    # 0.15 m above DEM) from a real 0.15 m obstacle. The compensation below is a
+    # SECONDARY, purely-geometric correction for the classic flat-borrow slope
+    # error and is DEFAULT OFF: on this dataset it did not clear the trailing
+    # phantom and slightly perturbed gate outcomes, so it stays opt-in
+    # (slope_band_comp=True) pending clean (z-corrected) field data.
+    #
+    # Field manifestation (novaTestovaciMapa, tree on a gentle uphill): the flat
+    # nearest-ground borrow copies the driven ribbon's (lower, downhill)
+    # elevation to an UNDRIVEN cell whose true ground has RISEN. Grass / rising
+    # ground returns from the 2D lidar there sit only ~0.15-0.33 m absolute, but
+    # measured against the too-low flat borrow their dz lands in [band_min,
+    # band_max] -> a phantom obstacle ring uphill of the driven path (predicted
+    # weakness: 'angle from ground'). Caught live: thin nOcc 2-3 cells, ground
+    # borrow 0.10-0.17 vs voxel z 0.28-0.33 -> dz 0.12-0.18 (marginally in band);
+    # the real tree in the same neighbourhood has 8-11 voxels reaching z-top
+    # 0.8 m and is unaffected. FIX: extrapolate the borrowed ground along the
+    # LOCAL measured ground gradient (first-order plane) from the nearest
+    # real-ground cell to the query cell:  g = near_ground + grad·displacement.
+    # The gradient is estimated on the REAL-ground surface only (trajectory +
+    # low-percentile fill = honest ground; obstacle voxels are not in dem.elev),
+    # lightly smoothed (slope_grad_smooth_m), and both the per-metre slope
+    # (slope_grad_cap) and the total correction (slope_comp_cap_m) are clamped so
+    # it can never run away near structure. Marginal 0.10-0.20 m lawn cells move
+    # out of band; tall obstacles (voxels 0.3-0.8 m up) are untouched by a
+    # <=0.20 m ground shift. slope_band_comp=False restores the flat borrow.
+    near_ground_corr = near_ground_grid      # flat borrow when comp is off
+    if (slope_band_comp and near_ground_grid is not None
+            and real_ground.any()):
+        # Smooth ground surface from REAL cells ONLY, via normalized (Gaussian)
+        # convolution: num/den where num = blur(elev·real), den = blur(real).
+        # This interpolates the true measured ground slope and — unlike a
+        # Voronoi nearest-fill — has no artificial seams, so its gradient is the
+        # genuine ground gradient. We only ever SAMPLE that gradient at real
+        # cells (rg_jx, rg_jy), where den is high and the estimate is well posed.
+        sig = max(1.0, slope_grad_smooth_m / dem.res)
+        rgf = real_ground.astype(np.float32)
+        elev0 = np.where(real_ground, dem.elev, 0.0).astype(np.float32)
+        num = ndimage.gaussian_filter(elev0, sig, mode='nearest')
+        den = ndimage.gaussian_filter(rgf, sig, mode='nearest')
+        gsm = (num / np.maximum(den, 1e-6)).astype(np.float32)
+        # ∂z/∂x, ∂z/∂y in m per m (np.gradient spacing = cell size)
+        ggx, ggy = np.gradient(gsm, dem.res)
+        gmag = np.hypot(ggx, ggy)
+        scale = np.where(gmag > slope_grad_cap,
+                         slope_grad_cap / np.maximum(gmag, 1e-9), 1.0)
+        ggx = (ggx * scale).astype(np.float32)
+        ggy = (ggy * scale).astype(np.float32)
+        ii = np.arange(nx)[:, None]
+        jj = np.arange(ny)[None, :]
+        dxg = (ii - rg_jx).astype(np.float32) * dem.res   # target - source (m)
+        dyg = (jj - rg_jy).astype(np.float32) * dem.res
+        # gradient sampled AT the source real-ground cell, extrapolated over the
+        # displacement to the target cell; total shift clamped to ±slope_comp_cap_m
+        corr = ggx[rg_jx, rg_jy] * dxg + ggy[rg_jx, rg_jy] * dyg
+        corr = np.clip(corr, -slope_comp_cap_m, slope_comp_cap_m)
+        near_ground_corr = (near_ground_grid + corr).astype(np.float32)
+
     # Per-cell max occupied-voxel z (all in-bounds occupied leaves, band-agnostic
     # — the z-top gate needs the true column top, not just the in-band part).
     zmax_grid = np.full((nx, ny), -np.inf, np.float32)
@@ -218,7 +287,9 @@ def project_band(dem, pts_xyz, band_min=0.10, band_max=0.60, min_evidence=6,
         if ground_ref_radius_m and ground_ref_radius_m > 0.0 \
                 and rg_dist is not None and (~has_ground).any():
             near_dist = rg_dist[ix, iy]
-            near_ground = dem.elev[rg_jx[ix, iy], rg_jy[ix, iy]]
+            # slope-band compensated borrowed ground (treelawn fix): the
+            # gradient-extrapolated ground of the nearest real-ground cell.
+            near_ground = near_ground_corr[ix, iy]
             can_borrow = (~has_ground) & (near_dist <= ground_ref_radius_m) \
                 & ~np.isnan(near_ground)
             ground = np.where(can_borrow, near_ground, ground)
@@ -242,8 +313,8 @@ def project_band(dem, pts_xyz, band_min=0.10, band_max=0.60, min_evidence=6,
         g = np.where(real_ground, dem.elev, np.nan).astype(np.float32)
         if rg_dist is not None and radius_m and radius_m > 0.0:
             borrow = (~real_ground) & (rg_dist <= radius_m) \
-                & np.isfinite(near_ground_grid)
-            g[borrow] = near_ground_grid[borrow]
+                & np.isfinite(near_ground_corr)
+            g[borrow] = near_ground_corr[borrow]
         return g
 
     raster = np.full((nx, ny), UNKNOWN, np.int8)
@@ -502,6 +573,9 @@ def project_band(dem, pts_xyz, band_min=0.10, band_max=0.60, min_evidence=6,
         'cells_unknown': int((raster == UNKNOWN).sum()),
         'points_unreferenced': unref,
         'points_ground_borrowed': borrowed,
+        'slope_band_comp': bool(slope_band_comp),
+        'slope_grad_cap': slope_grad_cap,
+        'slope_comp_cap_m': slope_comp_cap_m,
         'cells_obstacle_lidar': int((evidence_borrowed
                                      >= max(1, borrowed_min_evidence)).sum()),
         'band': [band_min, band_max],

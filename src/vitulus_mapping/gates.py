@@ -105,6 +105,23 @@ class GateConfig:
     #     terrain with it smears the ground). Stationary re-observation is fine.
     z_stale_block_when_moving: bool = False
     max_z_corr_age_s: float = 8.0
+    # (3b) TRAILING-LAWN PHANTOM fix (treelawn 2026-07-19). On a slope the RTK
+    #     vertical solution flaps (measured outages 1.2-38 s / up to 3.27 m
+    #     driven); with z_corr_require_trust the accepted z updates go sparse, so
+    #     z_source reads 'frozen' (age > max_gps_odom_age_s) yet age stays under
+    #     the 8 s max_z_corr_age_s grace and the moving-block above REOPENS —
+    #     clouds keep inserting with a frozen/lagging z while the robot climbs.
+    #     The DEM (wheel-contact z) for the same cell was stamped at a different
+    #     z-freeze state, so fresh lawn lands 0.10-0.20 m 'above ground' trailing
+    #     the robot => a phantom obstacle ring along the just-driven uphill.
+    #     A TIME grace cannot bound this (error = grade * distance, not time), so
+    #     bound the DISTANCE a frozen z may be carried while moving: block once the
+    #     robot has driven more than z_stale_max_dist_m from where z was last
+    #     confidently updated. Slope-safe (no flat-world assumption — it caps the
+    #     geographic reach of a stale z, so residual error <= grade *
+    #     z_stale_max_dist_m; e.g. 5% * 0.5 m = 0.025 m, under band_min). Needs
+    #     z_stale_block_when_moving=True. 0.0 = off (legacy); 0.5 recommended.
+    z_stale_max_dist_m: float = 0.0
     # standstill dwell throttle (applied in the node): a near-stationary robot
     # re-inserting the same view hammers voxels and amplifies any z bias.
     standstill_speed_eps_mps: float = 0.05
@@ -130,6 +147,8 @@ class InsertionGate:
         self._gps_odom = None         # (t, x, y, z)       navsat odometry/gps
         self._z_corr = 0.0            # last RTK-grade gps.z - tf.z (frozen otherwise)
         self._z_corr_t = None         # time of last RTK-grade update
+        self._z_corr_xy = None        # pose (x, y) at last accepted z update
+                                      # (treelawn: bound frozen-z carry distance)
         self._cooldown_until = -1.0
         self._last_jump_m = 0.0
         self._map_odom = None         # (t, x, y, yaw) TF map->odom
@@ -284,6 +303,9 @@ class InsertionGate:
             else:
                 self._z_corr = target
         self._z_corr_t = t
+        # remember WHERE this z was confirmed, so evaluate() can block once the
+        # robot has carried the (soon-frozen) z too far over new terrain.
+        self._z_corr_xy = (self._pose[1], self._pose[2])
 
     # ---- helpers -----------------------------------------------------------
     def z_correction(self):
@@ -411,10 +433,22 @@ class InsertionGate:
             moving = self._speed_mps >= self.cfg.standstill_speed_eps_mps
             z_age = (float('inf') if self._z_corr_t is None
                      else wall_now - self._z_corr_t)
-            if moving and z_age > cfg.max_z_corr_age_s:
+            # treelawn (3b): also block when the frozen z has been CARRIED too
+            # far over new terrain (distance bound), even if still within the
+            # time grace — this is the slope hole the 8 s time grace leaves open.
+            z_far = False
+            z_carry_m = None
+            if (cfg.z_stale_max_dist_m > 0.0 and moving
+                    and self._z_corr_xy is not None and pose is not None):
+                z_carry_m = math.hypot(pose[1] - self._z_corr_xy[0],
+                                       pose[2] - self._z_corr_xy[1])
+                z_far = z_carry_m > cfg.z_stale_max_dist_m
+            if moving and (z_age > cfg.max_z_corr_age_s or z_far):
                 reasons.append('z_stale_moving')
                 info['z_corr_age_s'] = (None if self._z_corr_t is None
                                         else round(z_age, 2))
+                if z_carry_m is not None:
+                    info['z_carry_m'] = round(z_carry_m, 2)
 
         # rate-based pause: don't map while the map frame is actively being
         # corrected. Recompute the windowed rate against `now` so it decays to

@@ -103,6 +103,9 @@ class InsertionGateNode:
             z_stale_block_when_moving=bool(rospy.get_param(
                 '~z_stale_block_when_moving', False)),
             max_z_corr_age_s=float(rospy.get_param('~max_z_corr_age_s', 8.0)),
+            # treelawn 2026-07-19: bound how far a frozen z may be carried while
+            # moving (slope trailing-lawn phantom). 0.0 = off; 0.5 recommended.
+            z_stale_max_dist_m=float(rospy.get_param('~z_stale_max_dist_m', 0.0)),
             standstill_speed_eps_mps=float(rospy.get_param(
                 '~standstill_speed_eps_mps', 0.05)),
             standstill_after_s=float(rospy.get_param(

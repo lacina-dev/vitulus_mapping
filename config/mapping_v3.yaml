@@ -67,7 +67,15 @@ insertion_gate:
   z_corr_max_rate_mps: 0.25           # slew-limit z_corr (slope-safe; 0=off)
   z_stale_block_when_moving: true     # skip insertion when z stale/frozen AND
                                       # moving (stationary re-observe still OK)
-  max_z_corr_age_s: 8.0               # z considered stale for the block above
+  max_z_corr_age_s: 2.5               # z considered stale for the block above
+                                      # (8->2.5 after 19.7. slope forensics: the
+                                      # 8s grace let frozen-z insertions trail
+                                      # phantoms uphill)
+  z_stale_max_dist_m: 0.5             # max distance a frozen/lagging z may be
+                                      # carried while moving before insertion
+                                      # blocks (error = grade x distance, so a
+                                      # DISTANCE bound, not time; 5% x 0.5 m =
+                                      # 2.5 cm << band_min). 0 disables.
   standstill_throttle: true           # de-bias dwells (dock incl.)
   standstill_after_s: 8.0
   standstill_rate_hz: 0.5             # insert rate while parked (full rate moving)
