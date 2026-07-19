@@ -148,6 +148,9 @@ class BandProjectorNode:
         # garden.ot (octomap_server publishes only OCCUPIED centres on the wire).
         self.ot_dump_timeout_s = float(
             rospy.get_param('~ot_dump_timeout_s', 60.0))
+        self.free_refresh_s = float(rospy.get_param('~free_refresh_s', 30.0))
+        self._free_cache = None
+        self._free_cache_t = 0.0
         self.fill_percentile = float(rospy.get_param('~fill_percentile', 1.5))
         self.fill_min_pts = int(rospy.get_param('~fill_min_pts', 6))
         self.max_slope_deg = float(rospy.get_param('~max_slope_deg', 35.0))
@@ -562,8 +565,39 @@ class BandProjectorNode:
 
         occupied_count: live occupied-centre count, only used to logwarn loudly
         when free leaves look suspiciously sparse (a session built without
-        raytracing would otherwise yield a mostly-unknown map)."""
+        raytracing would otherwise yield a mostly-unknown map).
+
+        LIVE-SESSION FIX (2026-07-19): garden.ot is only written at Stop, so a
+        live session would read a STALE free mask forever and the raster would
+        never grow into newly driven areas. Now: (a) the parsed mask is CACHED
+        for ~free_refresh_s between regens (the 10s live loop stops paying the
+        dump cost every tick), (b) when the on-disk .ot is older than
+        ~free_refresh_s the live octomap is saved first via octomap_saver, so
+        the free mask tracks the session."""
+        now_mono = time.monotonic()
+        if (self._free_cache is not None
+                and now_mono - self._free_cache_t < self.free_refresh_s):
+            return self._free_cache
         ot_path = os.path.join(self.output_dir, 'garden.ot')
+        try:
+            ot_stale = (not os.path.exists(ot_path)) or \
+                (time.time() - os.path.getmtime(ot_path) > self.free_refresh_s)
+        except OSError:
+            ot_stale = True
+        if ot_stale:
+            ns = rospy.get_namespace().rstrip('/') or '/mapping'
+            try:
+                subprocess.run(['rosrun', 'octomap_server', 'octomap_saver',
+                                '-f', ot_path, '__ns:=' + ns],
+                               check=True, timeout=self.ot_dump_timeout_s,
+                               stdout=subprocess.DEVNULL,
+                               stderr=subprocess.STDOUT)
+                rospy.loginfo('band_projector: live octomap refreshed -> %s',
+                              ot_path)
+            except Exception as e:
+                rospy.logwarn_throttle(60.0, 'band_projector: live octomap '
+                                       'refresh failed (%s) — free mask may '
+                                       'be stale', e)
         if not os.path.exists(ot_path):
             rospy.logwarn('band_projector: no garden.ot at %s — FREE from '
                           'real ground only (no octomap free mask)', ot_path)
@@ -597,6 +631,8 @@ class BandProjectorNode:
             free_xyz = leaves[is_free, :3].astype(np.float64)
             # occupied leaf x,y,z,occupancy-probability for the v3 occ gate
             occ_prob_xyz = leaves[~is_free][:, [0, 1, 2, 4]].astype(np.float64)
+            self._free_cache = (free_xyz, occ_prob_xyz)
+            self._free_cache_t = now_mono
             return free_xyz, occ_prob_xyz
         except FileNotFoundError:
             rospy.logwarn('band_projector: ot_dump helper not found (rosrun) — '
