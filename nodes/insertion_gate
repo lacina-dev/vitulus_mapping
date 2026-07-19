@@ -160,6 +160,17 @@ class InsertionGateNode:
         self.last_corrections = 0
         # georef capture state (phase 1a)
         self.georef_stable_s = float(rospy.get_param('~georef_stable_s', 5.0))
+        # PROTOCOL 2026-07-19 (start-on-GPS early datum): the early datum.yaml is
+        # written after a SHORT MEDIAN WINDOW of trusted samples (not one
+        # instantaneous sample), so the map is world-anchored from minute one —
+        # robust even if the session dies right after. probation_proven + RTK
+        # must hold continuously for datum_early_window_s; the datum is the
+        # median (circular for yaw) over that window. The continuous refinement
+        # + robust median at stop (finalize_georef) stays the finalizer.
+        self.datum_early_window_s = float(rospy.get_param(
+            '~datum_early_window_s', 12.0))
+        self._datum_early_start_idx = 0   # index into _datum_samples where the
+                                          # current trust window began
         self._georef_good_since = None
         self._georef_done = False
         self._last_latlon = None
@@ -548,6 +559,18 @@ class InsertionGateNode:
                 pass
         return datum
 
+    def _robust_datum(self, samples):
+        """Median (circular for yaw) over [(e, n, alt, yaw, z), ...]. Returns
+        (e, n, alt, yaw). Shared by the early-window capture and the stop-time
+        finalizer so both use the same robust estimator."""
+        arr = np.array([(e, n, alt, yaw) for (e, n, alt, yaw, _z) in samples],
+                       dtype=float)
+        med = np.median(arr, axis=0)
+        yaws = arr[:, 3]
+        yaw = math.atan2(float(np.median(np.sin(yaws))),
+                         float(np.median(np.cos(yaws))))
+        return float(med[0]), float(med[1]), float(med[2]), yaw
+
     def try_capture_georef(self, dec):
         """Called at 1 Hz. Two jobs:
           (1) continuously accumulate utm->map samples whenever navi_transform
@@ -585,16 +608,34 @@ class InsertionGateNode:
                 self._datum_samples = \
                     self._datum_samples[-self._datum_samples_max:]
 
-        # (2) early one-shot datum.yaml (still needed mid-session)
+        # (2) early datum.yaml over a SHORT MEDIAN WINDOW (PROTOCOL 2026-07-19).
+        # Wait until probation_proven + RTK have held continuously for
+        # datum_early_window_s, then write the MEDIAN of the samples collected in
+        # that window (not one instantaneous sample). Still written once per
+        # session (so a georef exists mid-session); finalize_georef refines it
+        # over the whole drive at stop.
         if self._georef_done:
             return
         if self._georef_good_since is None:
             self._georef_good_since = now
+            # the sample just appended in (1) is the first of this trust window
+            with self._datum_lock:
+                self._datum_early_start_idx = max(0,
+                                                  len(self._datum_samples) - 1)
             return
-        if now - self._georef_good_since < self.georef_stable_s:
+        held = now - self._georef_good_since
+        if held < self.datum_early_window_s:
             return
 
-        datum = self._build_datum(e, n, alt, yaw)
+        # robust median over the early trust window (fall back to the live
+        # sample if too few accumulated, e.g. TF gaps thinned the window)
+        with self._datum_lock:
+            win = list(self._datum_samples[self._datum_early_start_idx:])
+        if len(win) >= 2:
+            e, n, alt, yaw = self._robust_datum(win)
+        nwin = max(1, len(win))
+
+        datum = self._build_datum(e, n, alt, yaw, nsamples=nwin)
         session_path = os.path.join(
             self.output_dir, time.strftime('datum_session_%Y%m%d_%H%M%S.yaml'))
         with open(session_path, 'w') as f:
@@ -604,10 +645,11 @@ class InsertionGateNode:
             with open(datum_path, 'w') as f:
                 yaml.safe_dump(datum, f, default_flow_style=False,
                                sort_keys=False)
-            rospy.logwarn('insertion_gate: site georeference CAPTURED (early) '
-                          '-> %s (utm %.2f, %.2f, alt %.2f, yaw %.2f deg); '
-                          'will refine at session stop',
-                          datum_path, e, n, alt, math.degrees(yaw))
+            rospy.logwarn('insertion_gate: datum captured early after %.0fs '
+                          '(%d samples) -> %s (E %.2f, N %.2f, alt %.2f, '
+                          'yaw %.2f deg); will refine at session stop',
+                          held, nwin, datum_path, e, n, alt,
+                          math.degrees(yaw))
         else:
             rospy.loginfo('insertion_gate: session georef logged -> %s',
                           session_path)
@@ -627,14 +669,8 @@ class InsertionGateNode:
                           '(early capture) unchanged')
             return
         self._georef_stop_written = True
-        arr = np.array([(e, n, alt, yaw) for (e, n, alt, yaw, _z) in samples],
-                       dtype=float)
         # circular median for yaw (values cluster near 0; wrap-safe)
-        med = np.median(arr, axis=0)
-        e, n, alt = med[0], med[1], med[2]
-        yaws = arr[:, 3]
-        yaw = math.atan2(float(np.median(np.sin(yaws))),
-                         float(np.median(np.cos(yaws))))
+        e, n, alt, yaw = self._robust_datum(samples)
         datum = self._build_datum(e, n, alt, yaw, nsamples=len(samples))
 
         datum_path = os.path.join(self.output_dir, 'datum.yaml')

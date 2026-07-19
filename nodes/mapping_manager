@@ -42,6 +42,7 @@ starting with an unused name.
 """
 
 import json
+import math
 import os
 import shutil
 import signal
@@ -52,10 +53,12 @@ import cv2
 import numpy as np
 import rosnode
 import rospy
+import tf2_ros
 import yaml
 from nav_msgs.msg import OccupancyGrid
 from sensor_msgs.msg import CompressedImage
 from std_msgs.msg import String
+from tf.transformations import euler_from_quaternion
 
 from vitulus_mapping import bundle, editmask, geo
 from vitulus_mapping.demgrid import DemGrid
@@ -75,6 +78,15 @@ class MappingManager:
         self.site = None
         self.started_at = None
         self.map_frame = rospy.get_param('~map_frame', 'map')
+        self.base_frame = rospy.get_param('~base_frame', 'base_link')
+        # PROTOCOL 2026-07-19 (stop-in-dock verification): cache navi_transform's
+        # loc_status so Stop can tell whether the session ended DOCKED (the
+        # dock<->map tie is then fresh for per-map dock seeding).
+        self._loc_status = None
+        self._loc_status_t = 0.0
+        # TF for reading the current map->base pose to record at a docked Stop.
+        self.tf_buf = tf2_ros.Buffer(rospy.Duration(10.0))
+        self.tf_listener = tf2_ros.TransformListener(self.tf_buf)
         self.serving = None    # {'site', 'raster', 'mtime'} of the last
                                 # successfully published site_map, or None
         self.previewing = None  # {'site', 'raster'} currently PREVIEWED on
@@ -137,6 +149,11 @@ class MappingManager:
         self.pub_raster_preview = rospy.Publisher(
             '/mapping_manager/raster_preview', OccupancyGrid, queue_size=1,
             latch=True)
+        # PROTOCOL 2026-07-19 (per-map tracker baseline): republish the persisted
+        # baseline (site_config.json track_baseline) for the SERVED raster on
+        # every serve so gloc_server seeds its rms baseline at map load.
+        self.pub_track_baseline = rospy.Publisher(
+            '/mapping_manager/track_baseline', String, queue_size=1, latch=True)
         rospy.Subscriber('/mapping_manager/start', String, self.cb_start,
                          queue_size=1)
         rospy.Subscriber('/mapping_manager/stop', String, self.cb_stop,
@@ -161,6 +178,12 @@ class MappingManager:
         # session ever captured a georef datum.
         rospy.Subscriber('/mapping/gate_status', String, self.cb_gate_status,
                          queue_size=1)
+        # PROTOCOL 2026-07-19: loc_status (docked flag at Stop) + gloc's
+        # stabilised per-map tracker baseline (persisted into site_config.json).
+        rospy.Subscriber('/nav_tf/loc_status', String, self.cb_loc_status,
+                         queue_size=1)
+        rospy.Subscriber('/gloc/baseline', String, self.cb_gloc_baseline,
+                         queue_size=1)
         rospy.Timer(rospy.Duration(1.0), self.tick_status)
         rospy.on_shutdown(self.shutdown)
         self.show_site('')            # newest saved map visible right away
@@ -184,6 +207,9 @@ class MappingManager:
             self._publish_edit_list(self.serving.get('site'))
         else:
             self.pub_edit_list.publish(String(json.dumps([])))
+            # PROTOCOL: latch an EMPTY baseline seed so gloc has an initial
+            # message (nothing served -> self-calibrate from scratch).
+            self.pub_track_baseline.publish(String(json.dumps({})))
         # per-raster mgmt: latch an empty raster_preview at boot so subscribers
         # (the UI 3D preview layer) always get an initial message.
         self._clear_preview()
@@ -202,6 +228,127 @@ class MappingManager:
         if 'datum_samples' in s or 'datum_captured' in s:
             self._last_gate_datum = {'samples': s.get('datum_samples', 0),
                                      'captured': bool(s.get('datum_captured'))}
+
+    def cb_loc_status(self, msg):
+        """PROTOCOL 2026-07-19: cache navi_transform's loc_status so Stop can
+        verify the session ended DOCKED (fresh dock<->map tie)."""
+        try:
+            self._loc_status = json.loads(msg.data)
+            self._loc_status_t = time.time()
+        except (ValueError, TypeError):
+            pass
+
+    def cb_gloc_baseline(self, msg):
+        """PROTOCOL 2026-07-19: persist gloc's stabilised per-map tracker rms
+        baseline into the SERVING site's site_config.json, then republish it on
+        /mapping_manager/track_baseline so gloc keeps a matching latched seed.
+        Ignored unless it matches the raster we are currently serving."""
+        try:
+            b = json.loads(msg.data) if msg.data.strip() else {}
+        except (ValueError, TypeError):
+            return
+        rms = b.get('rms_baseline')
+        if rms is None or not self.serving:
+            return
+        site = self.serving.get('site')
+        raster = self.serving.get('raster')
+        # only persist for the exact site/raster currently served (gloc tags
+        # both; tolerate a missing tag)
+        if (b.get('site') and b.get('site') != site) or \
+                (b.get('raster') and b.get('raster') != raster):
+            return
+        try:
+            tb = {'raster': raster, 'rms_baseline': round(float(rms), 4),
+                  'overlap_frac': b.get('overlap_frac'),
+                  'captured': time.strftime('%Y-%m-%d %H:%M:%S')}
+        except (TypeError, ValueError):
+            return
+        self._update_site_config(site, {'track_baseline': tb})
+        rospy.loginfo('mapping_manager: persisted tracker baseline rms %.3f for '
+                      '%s/%s (site_config track_baseline)', float(rms), site,
+                      raster)
+        self._publish_track_baseline(site, raster)
+
+    # ---- site_config.json (per-site key/value store) -------------------------
+    def _site_config_path(self, site):
+        return os.path.join(self.base_dir, site, 'site_config.json')
+
+    def _read_site_config(self, site):
+        try:
+            with open(self._site_config_path(site)) as f:
+                d = json.load(f)
+            return d if isinstance(d, dict) else {}
+        except (OSError, ValueError):
+            return {}
+
+    def _update_site_config(self, site, updates):
+        """Read-modify-write <site>/site_config.json (preserves 'resolution' and
+        any other keys). Returns True on success."""
+        cfg = self._read_site_config(site)
+        cfg.update(updates)
+        try:
+            os.makedirs(os.path.join(self.base_dir, site), exist_ok=True)
+            with open(self._site_config_path(site), 'w') as f:
+                json.dump(cfg, f, indent=1)
+            return True
+        except OSError as e:
+            rospy.logwarn('mapping_manager: site_config write failed for %s: %s',
+                          site, e)
+            return False
+
+    def _publish_track_baseline(self, site, raster):
+        """Latch the persisted tracker baseline for the SERVED raster on
+        /mapping_manager/track_baseline (gloc seeds from it at map load). If the
+        stored baseline is for a different raster (or none), publish EMPTY so
+        gloc self-calibrates from scratch instead of seeding a mismatched scale."""
+        tb = self._read_site_config(site).get('track_baseline') if site else None
+        if tb and tb.get('raster') == raster and tb.get('rms_baseline') is not None:
+            payload = {'rms_baseline': tb.get('rms_baseline'),
+                       'overlap_frac': tb.get('overlap_frac'),
+                       'site': site, 'raster': raster}
+        else:
+            payload = {}
+        self.pub_track_baseline.publish(String(json.dumps(payload)))
+
+    def _lookup_map_base(self):
+        """Current map->base_link pose as {x, y, yaw_deg}, or None if TF absent."""
+        try:
+            tr = self.tf_buf.lookup_transform(self.map_frame, self.base_frame,
+                                              rospy.Time(0), rospy.Duration(0.3))
+        except (tf2_ros.LookupException, tf2_ros.ConnectivityException,
+                tf2_ros.ExtrapolationException):
+            return None
+        t = tr.transform.translation
+        q = tr.transform.rotation
+        yaw = euler_from_quaternion([q.x, q.y, q.z, q.w])[2]
+        return {'x': round(t.x, 3), 'y': round(t.y, 3),
+                'yaw_deg': round(math.degrees(yaw), 2)}
+
+    def _verify_stop_in_dock(self, site):
+        """PROTOCOL 2026-07-19: at Stop, check navi_transform's loc_status docked
+        flag. DOCKED -> the dock<->map tie is fresh: record ended_docked + the
+        current map->base pose into site_config.json (diagnostics + future dock
+        seeding). NOT docked -> logwarn advising the protocol. Blocks nothing."""
+        loc = self._loc_status
+        fresh = loc is not None and (time.time() - self._loc_status_t) < 5.0
+        docked = bool(fresh and loc.get('docked'))
+        if docked:
+            pose = self._lookup_map_base()
+            upd = {'ended_docked': True,
+                   'ended_docked_at': time.strftime('%Y-%m-%d %H:%M:%S')}
+            if pose is not None:
+                upd['ended_docked_pose'] = pose
+            self._update_site_config(site, upd)
+            rospy.loginfo('mapping_manager: session "%s" ended DOCKED — '
+                          'dock<->map tie is fresh (map->base %s)', site,
+                          json.dumps(pose) if pose else 'unavailable')
+        else:
+            self._update_site_config(site, {'ended_docked': False})
+            why = ('loc_status stale/absent' if not fresh else 'not docked')
+            rospy.logwarn('mapping_manager: session "%s" did NOT end docked (%s) '
+                          '— for the best per-map localization, END the mapping '
+                          'session while DOCKED so the dock<->map tie is fresh. '
+                          'Map saved normally.', site, why)
 
     def _kill_orphan_pipeline(self):
         """M8: kill a /mapping pipeline left running by a dead previous manager
@@ -400,6 +547,13 @@ class MappingManager:
         else:
             self.datum_warning = None
         if stopped:
+            # PROTOCOL 2026-07-19: verify the session ended DOCKED (fresh
+            # dock<->map tie) and record it into site_config.json. Diagnostics
+            # only — never blocks the save/serve below.
+            try:
+                self._verify_stop_in_dock(stopped)
+            except Exception as e:
+                rospy.logwarn('mapping_manager: stop-in-dock check failed: %s', e)
             self.show_site(stopped)   # freshly saved data -> update previews
             # datumfix (2026-07-12): auto-serve the just-mapped site so its
             # freshly-saved raster is latched on /mapping_manager/site_map (and
@@ -823,6 +977,9 @@ class MappingManager:
         self.serving = None
         self.edits_applied = 0                # WP-D1: nothing served -> no edits
         self.pub_edit_list.publish(String(json.dumps([])))
+        # PROTOCOL: clear the baseline seed (empty grid -> gloc goes no_map; a
+        # stale seed must not carry into the next served raster).
+        self.pub_track_baseline.publish(String(json.dumps({})))
         # Drop the persisted last-served so a respawn during the fresh session does
         # not re-latch the old raster at boot (auto_serve_last would otherwise pick
         # it up again). It gets rewritten when a real raster is next served.
@@ -878,6 +1035,9 @@ class MappingManager:
         self.link_site_datum(site)
         # WP-D1: publish the edit list for the served site on every serve.
         self._publish_edit_list(site)
+        # PROTOCOL 2026-07-19: republish the persisted tracker baseline for this
+        # served raster so gloc seeds its rms baseline at map load.
+        self._publish_track_baseline(site, raster)
         rospy.loginfo('mapping_manager: site_map <- %s/%s (%dx%d @ %.3f m, '
                       '%d edits)', site, raster, nx, ny, resolution,
                       self.edits_applied)
