@@ -44,8 +44,8 @@ navsat má vlastní datum (offset ~6 m); proto brána stojí na čerstvosti póz
 ## Ovládání z web UI (doporučené)
 
 Tab **Map** → sekce „Mapping v3 — terrain & obstacles". Zadej jméno site
-(zahrady) → **Start** (nová mapa = nové jméno; existující site pokračuje
-včetně octomap archivu). Sekce ukazuje stav brány (OPEN/CLOSED + důvody,
+(zahrady) → **Start** (nová mapa = nové jméno; existující site pokračuje —
+při stopu se uloží nový direct rastr). Sekce ukazuje stav brány (OPEN/CLOSED + důvody,
 hAcc, Δheading, počty cloudů), DEM statistiky, náhledy elevace a rastru;
 tlačítka Raster/Snapshot/Compare a přepínač módu brány (RTK/Force/Off).
 Lifecycle řídí node `mapping_manager` (běží trvale z vitulus_ui.launch,
@@ -55,11 +55,13 @@ topicy /mapping_manager/start|stop|remove_site|status).
 
 ```bash
 roslaunch vitulus_mapping mapping_v3.launch site:=zahrada
-# pokračování z uloženého archivu:
-roslaunch vitulus_mapping mapping_v3.launch site:=zahrada octomap_archive:=$HOME/.vitulus/mapping_v3/zahrada/garden.ot
-# direct-raster-only (bez octomapu / band_projectoru):
-roslaunch vitulus_mapping mapping_v3.launch site:=zahrada3 octomap:=false
+# volitelně per-site rozlišení (jinak 0.05 m):
+roslaunch vitulus_mapping mapping_v3.launch site:=zahrada resolution:=0.10
 ```
+
+Pozn. (2026-07-19): octomap/band chain (octomap_server + band_projector) byl
+vyřazen — `direct_raster` (přímý 2D log-odds rastr z cloudů, imunní vůči pose-z
+driftu) JE mapper. Argumenty `octomap:=` / `octomap_archive:=` už neexistují.
 
 Pak normálně sekat/jezdit. Brána se otevírá sama jen při RTK FIXED; stav:
 
@@ -71,17 +73,16 @@ rostopic echo /mapping/gate_status     # JSON: pass, reasons, hAcc, heading_diff
 
 | Akce | Příkaz |
 |---|---|
-| Rastr překážek | `rostopic pub -1 /mapping/regenerate std_msgs/String "data: ''"` |
-| Plný snapshot (.ot + dem + rastr) | `rostopic pub -1 /mapping/save std_msgs/String "data: 'zahrada'"` |
-| A/B vs rtabmap grid | `rostopic pub -1 /mapping/compare std_msgs/String "data: ''"` |
+| Snapshot direct rastru | `rostopic pub -1 /mapping/save_direct std_msgs/String "data: '{\"name\": \"direct_manual\"}'"` |
 | Garážový průjezd bez RTK | `rostopic pub -1 /mapping/gate_mode std_msgs/String "data: 'force_on'"` (zpět: `'rtk'`) |
 | Uložit DEM hned | `rostopic pub -1 /mapping/save_dem std_msgs/String "data: ''"` |
 
 ## Výstupy (`~/.vitulus/mapping_v3/<site>/`)
 
 - `dem.npz` — kanonická trajektorická DEM (autosave 60 s, atomicky)
-- `garden.ot` — octomap 3D archiv (po `/mapping/save`)
+- `garden.ot` — (legacy) octomap 3D archiv starých site; už se nezapisuje
 - `rasters/<jméno>/` — pgm + yaml (map_server-kompatibilní, editovatelné) + meta.json
+  (direct_<ts> = direct raster; final_<ts> = legacy band raster starých site)
 - `logs/gate_*.csv` — rozhodnutí brány per scan
 - `compare_*.json` — A/B statistiky vs rtabmap
 

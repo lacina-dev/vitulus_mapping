@@ -2,15 +2,14 @@
 <package format="2">
   <name>vitulus_mapping</name>
   <version>0.1.0</version>
-  <description>Mapping v3 — mapping with known poses (gated insertion -> octomap 3D
-  evidence archive, trajectory DEM -> grid_map terrain, ground-relative obstacle
-  band raster). Runs alongside the existing stack; localization is untouched.</description>
+  <description>Mapping v3 — mapping with known poses (gated insertion, trajectory
+  DEM -> grid_map terrain, direct 2D log-odds raster mapper). Runs alongside the
+  existing stack; localization is untouched.</description>
   <maintainer email="robert@lacina.dev">user</maintainer>
   <license>MIT</license>
 
   <buildtool_depend>catkin</buildtool_depend>
 
-  <depend>octomap</depend>
   <depend>rospy</depend>
   <depend>std_msgs</depend>
   <depend>std_srvs</depend>
@@ -22,7 +21,6 @@
   <depend>ublox_msgs</depend>
   <depend>vitulus_msgs</depend>
 
-  <exec_depend>octomap_server</exec_depend>
   <exec_depend>laser_geometry</exec_depend>
 
 </package>

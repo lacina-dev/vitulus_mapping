@@ -2,9 +2,9 @@
 """mapping_manager — lifecycle manager for the Mapping v3 session (UI-facing).
 
 Runs permanently (started from the vitulus_ui launch); the mapping pipeline
-itself (insertion_gate + octomap_server + trajectory_dem + band_projector)
-is spawned/stopped on demand as a roslaunch subprocess, one site (garden)
-at a time.
+itself (insertion_gate + trajectory_dem + direct_raster) is spawned/stopped on
+demand as a roslaunch subprocess, one site (garden) at a time. The octomap/band
+raster chain was retired 2026-07-19 — direct_raster is the mapper.
 
 Interfaces (absolute, UI-friendly):
   in   /mapping_manager/start        std_msgs/String  site name ('' = 'default')
@@ -95,31 +95,22 @@ class MappingManager:
         self._raster_list_cache = {}
         self.session_resolution = None  # M13: resolution the active session
                                         # started with (None when stopped)
-        self.session_octomap = None     # M14 (nooctomap 2026-07-19): whether the
-                                        # active session runs the octomap/band
-                                        # chain (True) or is direct-raster-only
-                                        # (False). None when stopped. Drives the
-                                        # stop flow (skip band snapshot + garden.ot
-                                        # save when False) and the status JSON.
         self.edits_applied = 0     # WP-D1: number of human edits composited
                                    # onto the currently-served raster (status)
         # REPORT 2 (freeserve 2026-07-12): every stopped mapping session should be
-        # immediately servable. stop_proc used to autosave ONLY the octomap (.ot),
-        # never a raster, so a just-mapped site had has_ot=true / rasters=0 and
-        # serve_site rejected it (serving fell back to the previously-served site
-        # — the reported "cannot switch to novamapa"). With raster_on_stop, stop
-        # asks band_projector to snapshot a raster (final_<timestamp>) BEFORE the
-        # pipeline is killed, so the just-mapped site is servable + auto-served.
+        # immediately servable. Without this a just-mapped site had rasters=0 and
+        # serve_site rejected it (serving fell back to the previously-served
+        # site). With raster_on_stop, stop asks direct_raster to snapshot a
+        # raster (direct_<timestamp>) BEFORE the pipeline is killed, so the
+        # just-mapped site is servable + auto-served.
         self.raster_on_stop = bool(rospy.get_param('~raster_on_stop', True))
-        # how long to wait for band_projector's snapshot before killing the
-        # pipeline (regenerate loads DEM with a 2 s settle + rasters a hectare)
+        # how long to wait for direct_raster's snapshot before killing the
+        # pipeline
         self.raster_on_stop_timeout_s = float(
             rospy.get_param('~raster_on_stop_timeout_s', 25.0))
-        self.pub_mapping_save = rospy.Publisher('/mapping/save', String,
-                                                queue_size=1)
-        # Direct-raster path (2026-07-19): snapshot the direct 2D raster into the
-        # site in PARALLEL with band's, so the A/B raster is servable too. Non-
-        # fatal — band's final_<ts> stays the auto-served raster.
+        # Direct-raster snapshot request (2026-07-19): direct_raster writes a
+        # direct_<ts> raster into the site on Stop; it is the sole mapper now
+        # that the octomap/band chain (and its /mapping/save publisher) is gone.
         self.pub_mapping_save_direct = rospy.Publisher(
             '/mapping/save_direct', String, queue_size=1)
 
@@ -218,7 +209,7 @@ class MappingManager:
         (called from __init__). Uses rosnode.kill_nodes — we do not own the
         orphans' process group, so os.killpg is not an option."""
         session_nodes = ['/mapping/insertion_gate', '/mapping/trajectory_dem',
-                         '/mapping/band_projector', '/mapping/octomap_server']
+                         '/mapping/direct_raster']
         try:
             live = set(rosnode.get_node_names())
         except Exception as e:
@@ -245,28 +236,17 @@ class MappingManager:
                 rospy.loginfo('mapping_manager: %s already running', site)
                 return
             self.stop_proc()
-        # continue from a saved octomap archive when the site has one
-        ot = os.path.join(self.base_dir, site, 'garden.ot')
         # M13: per-site voxel/raster resolution (site_config.json), default 0.05.
         res = self._site_resolution(site)
-        # M14 (nooctomap 2026-07-19): per-site octomap on/off (site_config.json,
-        # key 'octomap', default true). False -> direct-raster-only session:
-        # launch skips octomap_server + band_projector, stop skips the band
-        # snapshot + garden.ot save, direct_<ts> is the served raster.
-        octo = self._site_octomap(site)
+        # DIRECT-RASTER-ONLY (2026-07-19): the launch has no octomap arg anymore;
+        # direct_raster is the sole mapper. site + resolution are the only args.
         cmd = ['roslaunch', 'vitulus_mapping', 'mapping_v3.launch',
-               'site:=' + site, 'resolution:=%g' % res,
-               'octomap:=' + ('true' if octo else 'false')]
-        # The .ot continuation archive is only consumed by octomap_server, so it
-        # is meaningless (and the node is absent) when the chain is off.
-        if octo and os.path.exists(ot):
-            cmd.append('octomap_archive:=' + ot)
+               'site:=' + site, 'resolution:=%g' % res]
         rospy.logwarn('mapping_manager: starting %s', ' '.join(cmd))
         self.proc = subprocess.Popen(cmd, start_new_session=True)
         self.site = site
         self.started_at = time.time()
         self.session_resolution = res      # M13: report in status JSON
-        self.session_octomap = octo        # M14: report in status JSON
         self.datum_warning = None          # M9: clear stale warning on new run
         self._last_gate_datum = None
         # servesync (2026-07-12): serving must be CONSISTENT with the active
@@ -320,25 +300,6 @@ class MappingManager:
                           '%.3f', site, e, default)
         return default
 
-    def _site_octomap(self, site):
-        """M14 (nooctomap 2026-07-19): per-site octomap on/off from
-        <site>/site_config.json (key 'octomap'), mirroring _site_resolution.
-        Default True keeps every legacy site (garden etc.) on the octomap/band
-        chain unchanged; a site with {"octomap": false} runs direct-raster-only.
-        A missing file or malformed value falls back to True (safe = old
-        behaviour)."""
-        default = bool(rospy.get_param('~default_octomap', True))
-        cfg = os.path.join(self.base_dir, site, 'site_config.json')
-        try:
-            with open(cfg) as f:
-                return bool(json.load(f).get('octomap', default))
-        except FileNotFoundError:
-            pass
-        except (ValueError, TypeError, OSError) as e:
-            rospy.logwarn('mapping_manager: bad site_config octomap for %s: %s '
-                          '— using %s', site, e, default)
-        return default
-
     def link_site_datum(self, site):
         """Point the canonical site-datum path at this site's datum.yaml so
         navi_transform picks it up (POSE_DATUM_PLAN 1b). The link may dangle
@@ -372,118 +333,47 @@ class MappingManager:
             return
         self.stop_proc()
 
-    def _snapshot_raster_on_stop(self, site, octomap=True):
-        """Ask band_projector for a full raster snapshot (final_<timestamp>)
+    def _snapshot_raster_on_stop(self, site):
+        """Ask direct_raster for a full raster snapshot (direct_<timestamp>)
         while the pipeline is still alive, and wait for the raster dir to
         appear. Returns the raster name on success, else None. This is what
         makes every stopped session immediately servable (REPORT 2).
 
-        M14 (nooctomap 2026-07-19): when octomap=False, band_projector is NOT
-        running (direct-raster-only session), so the band final_<ts> save+wait
-        is skipped entirely (no final_<ts>, no .ot). Only direct_<ts> is
-        requested and waited on; it becomes the newest raster the stop path
-        auto-serves."""
-        # Always request the direct snapshot: it is the sole raster when octomap
-        # is off, and the A/B raster when octomap is on.
+        DIRECT-RASTER-ONLY (2026-07-19): direct_raster is the sole mapper, so
+        direct_<ts> is the sole snapshot and the newest raster the stop path
+        auto-serves. The retired octomap/band final_<ts> save is gone."""
         direct_name = time.strftime('direct_%Y%m%d_%H%M%S')
         direct_pgm = os.path.join(self.base_dir, site, 'rasters', direct_name,
                                   direct_name + '.pgm')
+        rospy.loginfo('mapping_manager: raster_on_stop — snapshotting direct '
+                      '%s/%s', site, direct_name)
         self.pub_mapping_save_direct.publish(String(json.dumps(
             {'name': direct_name})))
-
-        if not octomap:
-            # Direct-raster-only: wait for direct_<ts> and return IT so the stop
-            # path serves the direct raster (it is also the newest by mtime).
-            rospy.loginfo('mapping_manager: raster_on_stop (octomap OFF) — '
-                          'snapshotting direct %s/%s', site, direct_name)
-            deadline = time.time() + self.raster_on_stop_timeout_s
-            while time.time() < deadline:
-                if os.path.exists(direct_pgm):
-                    rospy.loginfo('mapping_manager: raster_on_stop wrote direct '
-                                  '%s', direct_pgm)
-                    return direct_name
-                time.sleep(0.5)
-            rospy.logwarn('mapping_manager: raster_on_stop timed out (%ss) — no '
-                          'direct raster for %s (octomap off, no band fallback)',
-                          self.raster_on_stop_timeout_s, site)
-            return None
-
-        raster = time.strftime('final_%Y%m%d_%H%M%S')
-        rasters_dir = os.path.join(self.base_dir, site, 'rasters', raster)
-        pgm = os.path.join(rasters_dir, raster + '.pgm')
-        rospy.loginfo('mapping_manager: raster_on_stop — snapshotting %s/%s',
-                      site, raster)
-        # band_projector.cb_save -> full_save(name, write_ot=False): writes the
-        # raster only. M10: we skip its final_<ts>.ot (orphan cruft) because
-        # stop_proc saves garden.ot itself right after this. Pipeline still up.
-        self.pub_mapping_save.publish(String(json.dumps(
-            {'name': raster, 'write_ot': False})))
-        # PARALLEL: direct_<ts> (already requested above) into the SAME rasters/
-        # dir, so the direct 2D map is a servable A/B raster. This is fire-and-
-        # forget relative to the band flow: its success/failure never changes the
-        # return value (band's final_<ts> drives auto-serve).
         deadline = time.time() + self.raster_on_stop_timeout_s
-        got_band = None
-        got_direct = False
         while time.time() < deadline:
-            if got_band is None and os.path.exists(pgm):
-                rospy.loginfo('mapping_manager: raster_on_stop wrote %s', pgm)
-                got_band = raster
-            if not got_direct and os.path.exists(direct_pgm):
+            if os.path.exists(direct_pgm):
                 rospy.loginfo('mapping_manager: raster_on_stop wrote direct %s',
                               direct_pgm)
-                got_direct = True
-            if got_band is not None and got_direct:
-                return got_band
+                return direct_name
             time.sleep(0.5)
-        if got_band is not None:
-            if not got_direct:
-                rospy.logwarn('mapping_manager: direct raster snapshot not seen '
-                              'for %s (band raster saved; direct is optional A/B)',
-                              site)
-            return got_band
         rospy.logwarn('mapping_manager: raster_on_stop timed out (%ss) — no '
-                      'band raster for %s; falling back to octomap-only save',
-                      self.raster_on_stop_timeout_s, site)
+                      'direct raster for %s', self.raster_on_stop_timeout_s,
+                      site)
         return None
 
     def stop_proc(self):
-        # M14 (nooctomap): default True for legacy safety if a session's flag is
-        # somehow unknown (e.g. adopted orphan) — preserves the old stop flow.
-        octomap_on = self.session_octomap if self.session_octomap is not None \
-            else True
-        rospy.logwarn('mapping_manager: stopping %s (pid %s, octomap=%s)',
-                      self.site, self.proc.pid, octomap_on)
-        # REPORT 2: snapshot a raster BEFORE tearing the pipeline down, so the
-        # just-mapped session is immediately servable (and auto-served below).
-        # M10: the snapshot is raster-only (write_ot=False), so the octomap-only
-        # save below is now the sole writer of garden.ot (no orphan final_*.ot).
-        # M14: with octomap off, _snapshot_raster_on_stop skips the band save and
-        # only snapshots+waits the direct_<ts> raster.
+        rospy.logwarn('mapping_manager: stopping %s (pid %s)',
+                      self.site, self.proc.pid)
+        # REPORT 2: snapshot the direct raster BEFORE tearing the pipeline down,
+        # so the just-mapped session is immediately servable (and auto-served
+        # below). DIRECT-RASTER-ONLY (2026-07-19): direct_<ts> is the sole
+        # snapshot; trajectory_dem still saves its DEM on shutdown by itself.
+        # The retired octomap/band chain no longer writes garden.ot.
         if self.raster_on_stop:
             try:
-                self._snapshot_raster_on_stop(self.site, octomap_on)
+                self._snapshot_raster_on_stop(self.site)
             except Exception as e:
                 rospy.logwarn('mapping_manager: raster_on_stop failed: %s', e)
-        # save the in-RAM octomap before killing the pipeline, so the next
-        # start of this site continues instead of losing the 3D archive
-        # (trajectory_dem saves its DEM on shutdown by itself). M14: skip when
-        # octomap is off — octomap_server is not running, so octomap_saver would
-        # block on a nonexistent /mapping service for the full 60 s timeout.
-        if octomap_on:
-            try:
-                ot = os.path.join(self.base_dir, self.site, 'garden.ot')
-                subprocess.run(['rosrun', 'octomap_server', 'octomap_saver',
-                                '-f', ot, '__ns:=/mapping'],
-                               check=True, timeout=60,
-                               stdout=subprocess.DEVNULL,
-                               stderr=subprocess.STDOUT)
-                rospy.loginfo('mapping_manager: octomap saved to %s', ot)
-            except Exception as e:
-                rospy.logwarn('mapping_manager: octomap autosave failed: %s', e)
-        else:
-            rospy.loginfo('mapping_manager: octomap OFF this session — skipping '
-                          'garden.ot autosave (direct raster is the map)')
         try:
             # SIGINT to the whole roslaunch session for a clean node shutdown
             os.killpg(os.getpgid(self.proc.pid), signal.SIGINT)
@@ -498,7 +388,6 @@ class MappingManager:
         self.site = None
         self.started_at = None
         self.session_resolution = None     # M13
-        self.session_octomap = None        # M14
         # M9: warn if the session captured NO georef datum (no sustained RTK).
         # Observability only — no behavioural fallback.
         gd = self._last_gate_datum
@@ -973,7 +862,7 @@ class MappingManager:
         grid.info.origin.position.y = origin_xy[1]
         grid.info.origin.orientation.w = 1.0
         grid.data = data.T.ravel().tolist()   # row-major over y rows,
-                                               # matches band_projector
+                                               # matches the saved raster (pgmio)
         self.pub_site_map.publish(grid)
 
         self.serving = {'site': site, 'raster': raster,
@@ -1271,7 +1160,6 @@ class MappingManager:
             self.site = None
             self.started_at = None
             self.session_resolution = None    # M13
-            self.session_octomap = None       # M14
         sites = sorted(n for n in os.listdir(self.base_dir)
                        if os.path.isdir(os.path.join(self.base_dir, n)))
         status = {
@@ -1285,7 +1173,6 @@ class MappingManager:
             'previewing': self.previewing,            # per-raster mgmt
             'serve_error': self.serve_error,
             'resolution': self.session_resolution,   # M13
-            'octomap': self.session_octomap,          # M14 (nooctomap)
             'datum_warning': self.datum_warning,      # M9
             'edits_applied': self.edits_applied,      # WP-D1
         }

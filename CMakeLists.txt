@@ -6,35 +6,22 @@ find_package(catkin REQUIRED COMPONENTS
   std_msgs
 )
 
-# classifier v2 (2026-07-19): the ot_dump helper reads octomap FREE leaves off
-# the saved garden.ot so band_projector can build an honest FREE mask.
-find_package(octomap REQUIRED)
-
 catkin_python_setup()
 
 catkin_package(
   CATKIN_DEPENDS rospy std_msgs
-  DEPENDS OCTOMAP
 )
 
-include_directories(${OCTOMAP_INCLUDE_DIRS})
-
-# ot_dump: dump all octomap leaf centres (free + occupied) to a flat binary.
-# Lands at devel/lib/vitulus_mapping/ot_dump (rosrun vitulus_mapping ot_dump).
-add_executable(ot_dump src/tools/ot_dump.cpp)
-target_link_libraries(ot_dump ${OCTOMAP_LIBRARIES})
+# DIRECT-RASTER-ONLY (2026-07-19): the octomap/band chain (octomap_server +
+# band_projector + the ot_dump C++ helper) has been retired. octomap
+# find_package + the ot_dump target are gone; direct_raster is the mapper.
 
 catkin_install_python(PROGRAMS
   nodes/insertion_gate
   nodes/trajectory_dem
-  nodes/band_projector
   nodes/direct_raster
   nodes/mapping_manager
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
-)
-
-install(TARGETS ot_dump
-  RUNTIME DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
 
 install(DIRECTORY launch

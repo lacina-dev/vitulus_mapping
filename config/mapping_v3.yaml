@@ -1,33 +1,10 @@
 # Mapping v3 — loaded at ns /mapping, keys land as private params of the nodes.
 # Everything lives under /mapping/*; the existing stack is untouched.
 
-octomap_server:
-  frame_id: map
-  base_frame_id: base_link
-  # Resolution (dataprep 2026-07-12): KEPT at 0.05 m for continuity with the
-  # existing 'garden' site (its garden.ot / rasters are 0.05 m; changing this
-  # here would orphan them). RECOMMENDATION for a NEW large site: 0.10 m — a
-  # hectare at 0.05 m is heavy (RAM + publish cost) and 0.10 m is plenty for
-  # the ground-relative obstacle band. Prefer a per-launch arg override for a
-  # new site over editing this line, so 'garden' stays at 0.05.
-  resolution: 0.05
-  # Raytrace horizon. Must cover the LIDAR cap (8 m) now that /scan feeds the
-  # map (item 2); the D435 depth cap (2.8 m) is enforced upstream in the gate.
-  sensor_model/max_range: 8.0        # was 4.0 (D435-only); now covers lidar
-  sensor_model/hit: 0.7              # occupied evidence per hit
-  sensor_model/miss: 0.4             # free evidence per miss
-  sensor_model/min: 0.12             # clamp: min node occupancy prob
-  sensor_model/max: 0.97             # clamp: max node occupancy prob
-  # Vertical acceptance window for INSERTED points, in the map z frame. The
-  # gate re-parents clouds to an alias TF carrying real absolute z (navsat
-  # altitude), so map z ~ ground level; -1.0..+2.0 rejects gross z outliers
-  # (sky ghosts, sub-ground disparity errors) while keeping the sensing column.
-  pointcloud_min_z: -1.0
-  pointcloud_max_z: 2.0
-  filter_ground: false               # ground stays in the 3D evidence archive
-  filter_speckles: true              # drop isolated single-voxel speckles
-  latch: false                       # hectare maps: no latched full publishes
-  compress_map: true
+# Mapping v3 is DIRECT-RASTER-ONLY (2026-07-19): the octomap_server + band
+# projector chain has been retired. insertion_gate still runs — it owns the
+# georef datum, gate_status, and the z_corr the DEM ground z rides on — but it
+# no longer forwards clouds to octomap. direct_raster is the mapper.
 
 insertion_gate:
   mode: fused                        # fused (map from the fused pose, default)
@@ -163,9 +140,10 @@ trajectory_dem:
 # Direct 2D raster mapper (2026-07-19). USER-DESIGNED simplification that bypasses
 # octomap + the DEM-relative z classification entirely: it accumulates 2D log-odds
 # evidence DIRECTLY from the per-frame segmented clouds, discarding absolute z, so
-# global pose-z drift (the whole phantom class) cannot occur. Runs ALONGSIDE the
-# band/octomap pipeline (A/B). All keys below are live-settable via
-# /mapping/set_direct (String JSON) and persisted per-site to direct_overrides.json
+# global pose-z drift (the whole phantom class) cannot occur. This is now the SOLE
+# mapper (the octomap/band pipeline was retired 2026-07-19). All keys below are
+# live-settable via /mapping/set_direct (String JSON) and persisted per-site to
+# direct_overrides.json
 # (loaded on start, layered on top of these). resolution comes from the launch arg.
 direct_raster:
   direct_enabled: true               # false = node idles cleanly (no subs)
@@ -194,87 +172,3 @@ direct_raster:
   lidar_scan_topic: /rplidar/scan_filtered
   obstacle_cloud_topic: /obstacles_cloud
   ground_cloud_topic: /ground_cloud
-
-band_projector:
-  auto_regen_period_s: 10.0          # live raster for the UI (0 = off)
-  band_min: 0.10                     # obstacles 0.10-0.60 m above LOCAL ground
-  band_max: 0.60
-  min_evidence: 6                    # voxels in band per cell (production-tuned
-                                     # 2026-07-12: -73% ghosts, structures kept)
-  min_cluster_cells: 3               # drop smaller obstacle clusters (speckles)
-  # ISSUE A fix (lidarsync 2026-07-12): a 2D-lidar-only vertical obstacle in an
-  # UNDRIVEN column (garage wall/fence/trunk at the dock) has no ground voxel in
-  # its own column, so it was dropped as 'unreferenced' and never reached the
-  # obstacle raster ("lidar adds no obstacles"). Reference such columns against
-  # the nearest REAL (traj/fill, never inpaint) ground within this radius; the
-  # robot drives on continuous ground right next to the wall. Measured at the
-  # dock: 154 -> ~800 obstacle cells, garage walls recovered. 0 = strict
-  # same-column-only (old behaviour).
-  ground_ref_radius_m: 1.0
-  # ISSUE A part 2 (lidarsync 2026-07-12): the 2D lidar paints ONE thin scan
-  # plane, so a solid wall yields only ~1-2 occupied voxels per 5 cm cell — far
-  # below the depth-tuned min_evidence=6 (dense depth stacks many voxels/cell).
-  # Cells whose in-band evidence came from a borrowed-ground (lidar-only) column
-  # use this lower floor; depth cells keep min_evidence. The cluster filter
-  # still culls sparse lidar speckle (a wall is a big contiguous cluster), so
-  # this recovers garage walls/fences without admitting noise.
-  borrowed_min_evidence: 2
-  # REPORT 1 fix (freeserve 2026-07-12): after the DEM tightening (fill_percentile
-  # 1.5 + coherence guard + fill_min_pts 6) the real-ground columns shrank to
-  # ~the driven trajectory, so FREE (painted only on real-ground cells) collapsed
-  # to a thin ribbon even though the robot drove a real area. Extend the same
-  # ground-borrow used for obstacles to FREE: a cell within free_ground_radius_m
-  # of a real-ground cell (traj/percentile-fill, never inpaint) and with NO
-  # obstacle evidence is marked FREE (driveable surroundings). Honesty preserved
-  # by the EDT: FREE never spreads beyond this radius of a genuine measurement.
-  # NOTE on octomap free-voxels (REPORT 1 part b): octomap_server does NOT cheaply
-  # expose free voxels here — the node publishes occupied centres
-  # (octomap_point_cloud_centers) + a 2D projected_map; a full free-voxel stream
-  # would need octomap_server's ~occupied/free markers or a raytrace we do not
-  # subscribe to. The lidar-raycast-free proxy (free along scan rays at scan
-  # height) is doable only in insertion_gate from the raw cloud and is materially
-  # more complex. Decision: ship the ground-borrow (a) first and measure; only
-  # add a free-voxel source if borrow coverage proves insufficient.
-  free_via_borrowed_ground: true
-  free_ground_radius_m: 1.0          # 0 or false => strict real-ground-only FREE
-  # CLASSIFIER v2 (2026-07-19, forensic redesign). On novaTestovaciMapa the old
-  # free_via_borrowed_ground painted 67.6% of FREE as occlusion-blind 1.0 m rings
-  # (22.4% with no raytraced backing) and counted invented INPAINT ground as FREE.
-  # D1: default FREE = REAL ground (traj/fill, NOT inpaint) UNION an octomap
-  # FREE-band mask (the raytraced free space, read off garden.ot by the ot_dump
-  # helper). A cell is free-band if an octomap free leaf sits in its column with
-  # z-ground in [free_band_min, free_band_max]; no ground reference in range =>
-  # NOT free. free_borrow_legacy=true restores the old ring behaviour (rollback).
-  free_borrow_legacy: false
-  free_band_min: -0.30               # octomap free voxel z-ground acceptance band
-  free_band_max: 0.60
-  ot_dump_timeout_s: 60.0            # subprocess budget for the ot_dump helper
-  # D2: cluster z-top gate. A surviving obstacle cluster is dropped iff ALL of:
-  # size < cluster_min_size AND max column z-top above (own-else-borrowed) ground
-  # < cluster_min_ztop_m AND min distance to a driven trajectory cell >
-  # cluster_traj_dist_m. Separates false lawn/vegetation patches (small, low, far)
-  # from real thin 2D-lidar walls (large, tall, or hugging the driven path).
-  # Measured on novaTestovaciMapa: -262 false cells, 0 real-cluster losses.
-  cluster_min_size: 15
-  cluster_min_ztop_m: 0.30
-  cluster_traj_dist_m: 0.6
-  # v3 (2026-07-19): cluster occupancy-probability gate. octomap stores log-odds
-  # per voxel — real structure (walls, trunks, posts) is hit by many rays and
-  # saturates toward the clamp, transients (a walking operator, swaying grass,
-  # drive-by noise) get few hits and stay near the 0.5 threshold. An obstacle
-  # CLUSTER whose MAX in-band occupancy never reached min_occupancy was never
-  # ray-confirmed and is dropped (per-cell occupancy would kill real thin walls;
-  # the cluster max is the discriminator). Uses the occupied leaf probabilities
-  # the ot_dump helper reads off garden.ot. 0 disables. Measured on
-  # novaTestovaciMapa: 0.90 removes 222 more false cells at ZERO real-cluster
-  # loss (real clusters bottom out at cmax=0.927; a cluster with no occupancy
-  # coverage is kept, never dropped).
-  min_occupancy: 0.90
-  fill_percentile: 1.5               # low envelope of octree column z; lower =
-                                     # more resistant to tall grass reading as
-                                     # ground (audit 2026-07-12, was 5.0)
-  fill_min_pts: 6                    # need more voxels before trusting a fill
-  max_slope_deg: 35.0
-  inpaint_max_dist_m: 0.15           # inpaint invents ground; keep it a thin
-                                     # crack-filler, not a gap-inventor (audit
-                                     # 2026-07-12, was 0.5 -> ~29k invented cells)

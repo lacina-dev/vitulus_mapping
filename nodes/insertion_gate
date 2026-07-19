@@ -140,7 +140,10 @@ class InsertionGateNode:
         self.tf_listener = tf2_ros.TransformListener(self.tf_buf)
         self.tf_bcast = tf2_ros.TransformBroadcaster()
 
-        self.pub_cloud = rospy.Publisher('cloud_in', PointCloud2, queue_size=2)
+        # cloud_in publisher retired 2026-07-19: octomap_server was the only
+        # consumer of the gated cloud, and the octomap/band chain is gone. The
+        # gate still evaluates every cloud for the per-source counters and the
+        # decision log, and still owns z_corr / gate_status for the DEM.
         self.pub_gate = rospy.Publisher('gate', Bool, queue_size=1)
         self.pub_status = rospy.Publisher('gate_status', String,
                                           queue_size=1, latch=True)
@@ -214,9 +217,9 @@ class InsertionGateNode:
 
         rospy.Timer(rospy.Duration(0.2), self.tick_gate)
         rospy.Timer(rospy.Duration(1.0), self.tick_status)
-        rospy.loginfo('insertion_gate up: mode=%s clouds=%s -> %s',
-                      cfg.mode, self.cloud_topics,
-                      rospy.resolve_name('cloud_in'))
+        rospy.loginfo('insertion_gate up: mode=%s clouds=%s (gated for '
+                      'counters/z_corr; octomap forwarding retired)',
+                      cfg.mode, self.cloud_topics)
 
     def _new_counter(self):
         """M3: split per-topic cloud outcomes. 'in' counts arrivals BEFORE the
@@ -729,45 +732,11 @@ class InsertionGateNode:
             c['gate_closed'] += 1        # M3
             return
 
-        # Item 3: per-source range cap before forwarding (lidar already cut at
-        # projection; depth clouds capped here).
-        msg = self._cap_cloud_range(msg, self._range_cap_for(topic))
-
-        alias = msg.header.frame_id + '_mapping'
-        with self.alias_lock:
-            need_tf = self.last_alias_stamp.get(alias) != msg.header.stamp.to_nsec()
-            if need_tf:
-                self.last_alias_stamp[alias] = msg.header.stamp.to_nsec()
-        if need_tf:
-            try:
-                tr = self.tf_buf.lookup_transform(
-                    self.map_frame, msg.header.frame_id,
-                    msg.header.stamp, rospy.Duration(0.2))
-            except (tf2_ros.LookupException, tf2_ros.ConnectivityException,
-                    tf2_ros.ExtrapolationException) as e:
-                rospy.logwarn_throttle(10.0, 'insertion_gate: TF for cloud '
-                                       'failed: %s', e)
-                return
-            out = TransformStamped()
-            out.header.stamp = msg.header.stamp
-            out.header.frame_id = self.map_frame
-            out.child_frame_id = alias
-            out.transform = tr.transform
-            out.transform.translation.z += self.gate.z_correction()
-            self.tf_bcast.sendTransform(out)
-
-        gated = PointCloud2()
-        gated.header.stamp = msg.header.stamp
-        gated.header.frame_id = alias
-        gated.height = msg.height
-        gated.width = msg.width
-        gated.fields = msg.fields
-        gated.is_bigendian = msg.is_bigendian
-        gated.point_step = msg.point_step
-        gated.row_step = msg.row_step
-        gated.data = msg.data
-        gated.is_dense = msg.is_dense
-        self.pub_cloud.publish(gated)
+        # nooctomap 2026-07-19: a PASSED cloud used to be range-capped, re-parented
+        # to a z-corrected '<frame>_mapping' alias TF, and republished on cloud_in
+        # for octomap_server to raytrace. The octomap/band chain is retired, so
+        # that forwarding is gone. cb_cloud stays for the per-source gate-decision
+        # counters + CSV log (gate_status); z_corr/gate_status come from tick_*.
         self.last_pub[topic] = now
         c['passed'] += 1                 # M3
         c['out'] += 1
