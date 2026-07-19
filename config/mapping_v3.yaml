@@ -44,7 +44,39 @@ insertion_gate:
   lidar_enabled: true
   # z-correction (item 6): 'local' = position-tied current RTK ground offset
   # (follows real slope, frozen on outage); 'global' = one smoothed site scalar.
+  # NOTE: z_corr_mode only matters in z_mode=rtk (legacy). In z_mode=dr the
+  # insertion z comes from the DR integrator + datum bias b (see below).
   z_corr_mode: local
+  # --- DR-z: pitch-integrated dead-reckoned altitude (2026-07-19 evening) ------
+  # WHY: RTK altitude on this terrain is chronically untrustworthy IN MOTION
+  # (morning +0.5 m excursion at vAcc 11-20 mm; afternoon frozen/lagging z
+  # trailing phantoms). Gating a wrong reference cannot fix it and on 2026-07-19
+  # the z_stale gates blocked 7031/13983 insertions while 573 phantom cells
+  # STILL appeared. The robot is ground truth: wheels touch the terrain, the
+  # BNO085 knows the grade. So the insertion z is now:
+  #     z = z_dr + b ,  z_dr(t) = integral of v_forward * sin(grade) dt
+  # where v_forward is the JUMP-FREE wheel-odom forward velocity
+  # (/mobile_base_controller/odom, base_link frame) and sin(grade) is the
+  # forward-axis vertical component from TF map->base_link (the fused BNO085
+  # attitude). b is a SLOW (~120 s) EMA of (rtk_alt - z_dr), updated ONLY under
+  # full trust (probation_proven + rtk_fixed + fresh vAcc) and FROZEN otherwise
+  # (harmless: z_dr keeps the local shape). RTK's ONLY remaining job is the slow
+  # global datum bias; its in-motion excursions/lag never propagate into the map.
+  # KEY WIN: mapping stays CONTINUOUS through GPS outages (no more blocking half
+  # the session). z_dr+b is the SINGLE SOURCE OF TRUTH for both the octomap
+  # insertion z and the DEM ground z (via the /mapping/z_corr topic), so they
+  # stay consistent with no downstream change.
+  # Risk: an IMU pitch bias -> slow z drift, bounded by the b anchor. A 0.5 deg
+  # pitch bias = 0.9 cm per driven metre, re-zeroed by b every ~120 s.
+  z_mode: dr                          # dr (default) | rtk (legacy byte-identical)
+  dr_pitch_clamp_deg: 30.0            # sanity clamp on |grade| per step
+  dr_v_eps_mps: 0.02                  # ignore integration below this |v| (noise)
+  dr_dt_max_s: 0.5                    # skip integration across dt spikes/gaps
+  dr_v_max_mps: 2.0                   # reject velocity spikes (e.g. motor-enable)
+  b_tau_s: 120.0                      # slow RTK datum-bias EMA time constant
+  b_init_window_s: 10.0              # median window to seed b at session start
+  dr_max_divergence_m: 1.0           # backstop: block if |rtk_alt-(z_dr+b)|
+  dr_divergence_persist_s: 5.0        #  persists above it while moving+trusted
   # per-source range caps (item 3), runtime-settable via /mapping/set_ranges
   # {lidar_max_m?, depth_max_m?} (0.5..20 m), persisted per-site.
   lidar_max_range_m: 8.0             # lidar cut at projection (range_cutoff)
@@ -62,6 +94,11 @@ insertion_gate:
   # the z_stale_moving counter). depth_max_range_m stays 2.8 m (already the
   # research-recommended conservative D435 value; it excludes the worst stereo
   # noise >3.5 m -- do NOT lower further, it would cost coverage).
+  # NOTE (2026-07-19 evening): the z_corr_require_trust / z_corr_max_rate_mps /
+  # z_stale_* gates below act on the LEGACY z_corr path and only bite in
+  # z_mode=rtk. In z_mode=dr (default) the DR integrator never goes stale, so
+  # these are inert and the DR-divergence backstop (dr_max_divergence_m) is the
+  # sole z safety net. Left intact so z_mode=rtk fallback is byte-identical.
   z_corr_require_trust: true          # accept RTK altitude into z_corr ONLY when
                                       # the arbiter is trusted (probation_proven)
   z_corr_max_rate_mps: 0.25           # slew-limit z_corr (slope-safe; 0=off)

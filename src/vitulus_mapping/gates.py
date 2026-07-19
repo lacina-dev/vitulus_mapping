@@ -127,6 +127,29 @@ class GateConfig:
     standstill_speed_eps_mps: float = 0.05
     standstill_after_s: float = 8.0
     standstill_rate_hz: float = 0.5
+    # --- DR-z: pitch-integrated dead-reckoned altitude (2026-07-19 evening) ----
+    # ROOT PROBLEM this replaces: the insertion z was TF-z + z_corr where
+    # z_corr = (rtk_alt - tf_z). RTK altitude on this terrain is untrustworthy
+    # IN MOTION (morning +0.5 m excursion at vAcc 11-20 mm; afternoon frozen/
+    # lagging z trailing phantoms). Gating a wrong reference cannot fix it AND it
+    # blocked 7031/13983 insertions on 2026-07-19 while 573 phantom cells still
+    # appeared. The robot itself is ground truth: wheels touch the terrain, the
+    # BNO085 knows the grade. DR-z = integral of v_forward*sin(grade) dt is
+    # smooth, continuous, jump-free and self-consistent with the DEM the robot
+    # writes; RTK's only remaining job is a SLOW global datum bias b.
+    #   insertion z = z_dr + b ; b = slow EMA of (rtk_alt - z_dr).
+    z_mode: str = 'dr'                # 'dr' (default) | 'rtk' (legacy, byte-
+                                      # identical to today's z_corr behaviour)
+    dr_pitch_clamp_deg: float = 30.0  # sanity clamp on |grade| per step
+    dr_v_eps_mps: float = 0.02        # ignore integration below this |v|
+    dr_dt_max_s: float = 0.5          # skip integration across dt spikes/gaps
+    dr_v_max_mps: float = 2.0         # reject velocity spikes (motor-enable)
+    b_tau_s: float = 120.0            # slow RTK datum-bias EMA time constant
+    b_init_window_s: float = 10.0     # median window to seed b at session start
+    dr_max_divergence_m: float = 1.0  # backstop: block insertion if
+                                      # |rtk_alt-(z_dr+b)| persists above this
+                                      # while moving+trusted (DR drift / bad b)
+    dr_divergence_persist_s: float = 5.0
 
 
 @dataclass
@@ -167,6 +190,16 @@ class InsertionGate:
         # concurrent cloud subscriber threads via the stamped path) both touch
         # _corr_hist/_corr_rate_mps. Guard them; only the tick path prunes.
         self._corr_lock = threading.Lock()
+        # --- DR-z state ------------------------------------------------------
+        self._z_dr = 0.0              # pitch-integrated dead-reckoned altitude
+        self._dr_last_t = None        # last feed_dr timestamp (integrator dt)
+        self._sin_grade = 0.0         # map-frame z-component of base_link +x
+                                      # (= sin of forward grade; fed at TF rate)
+        self._b = 0.0                 # slow RTK datum bias (z_dr -> abs alt)
+        self._b_t = None              # last b update time
+        self._b_init = False          # b seeded from the first trusted window?
+        self._b_init_samples = []     # (t, residual) buffer for the seed median
+        self._div_since = None        # DR-divergence backstop persistence timer
 
     @property
     def mode(self):
@@ -217,6 +250,41 @@ class InsertionGate:
 
     def speed_mps(self):
         return self._speed_mps
+
+    # ---- DR-z feeders ------------------------------------------------------
+    def feed_attitude(self, t, sin_grade):
+        """Latest forward-axis grade = map-frame z-component of base_link's +x
+        axis (= sin of the pitch/grade the robot is climbing). Fed from TF
+        map->base_link (which carries the fused BNO085 attitude) at the tick
+        rate; the integrator (feed_dr) uses the most recent value. Clamped to
+        the pitch sanity limit so a bad attitude spike cannot run the z away."""
+        lim = math.sin(math.radians(self.cfg.dr_pitch_clamp_deg))
+        self._sin_grade = max(-lim, min(lim, float(sin_grade)))
+
+    def feed_dr(self, t, v_forward):
+        """Integrate the dead-reckoned altitude: z_dr += v_forward*sin(grade)*dt.
+        v_forward is the JUMP-FREE body-forward wheel-odometry velocity (m/s,
+        signed); sin(grade) is the last fed attitude. Both are immune to RTK/
+        map corrections, so z_dr is smooth and continuous through GPS outages.
+        Guards: dt spikes/gaps (dr_dt_max_s), velocity spikes (dr_v_max_mps,
+        e.g. a motor-enable transient), and standstill (dr_v_eps_mps)."""
+        prev = self._dr_last_t
+        self._dr_last_t = t
+        if prev is None:
+            return
+        dt = t - prev
+        if dt <= 0.0 or dt > self.cfg.dr_dt_max_s:
+            return                       # clock jump / long gap -> skip step
+        v = float(v_forward)
+        if abs(v) > self.cfg.dr_v_max_mps:
+            return                       # velocity spike -> reject
+        if abs(v) < self.cfg.dr_v_eps_mps:
+            return                       # standstill -> no integration
+        self._z_dr += v * self._sin_grade * dt
+
+    def dr_state(self):
+        """(z_dr, b, b_initialized) for logging / UI."""
+        return self._z_dr, self._b, self._b_init
 
     def standstill_s(self, now):
         """Seconds below standstill_speed_eps (0.0 if moving/unknown)."""
@@ -307,10 +375,45 @@ class InsertionGate:
         # robot has carried the (soon-frozen) z too far over new terrain.
         self._z_corr_xy = (self._pose[1], self._pose[2])
 
+        # --- DR-z datum bias b (slow anchor) ---------------------------------
+        # Reached ONLY under the same trust conditions as z_corr above (rtk
+        # fixed + fresh + vAcc ok + probation_proven). z here is the navsat
+        # ABSOLUTE altitude of base_link; z_dr is our DR absolute altitude.
+        # b = slow EMA of the residual (z - z_dr) so z_dr+b tracks the true
+        # datum without inheriting RTK's in-motion excursions. Frozen when
+        # untrusted (the early-return above) -- harmless: z_dr keeps the shape.
+        residual = z - self._z_dr
+        if not self._b_init:
+            self._b_init_samples.append((t, residual))
+            self._b = residual           # provisional, usable immediately
+            span = (self._b_init_samples[-1][0] - self._b_init_samples[0][0])
+            if span >= self.cfg.b_init_window_s:
+                vals = sorted(r for _tt, r in self._b_init_samples)
+                self._b = vals[len(vals) // 2]     # robust seed (median)
+                self._b_init = True
+                self._b_init_samples = []
+        else:
+            dt = max(1e-3, t - (self._b_t if self._b_t is not None else t))
+            gain = min(1.0, dt / max(self.cfg.b_tau_s, 1e-3))
+            self._b += gain * (residual - self._b)
+        self._b_t = t
+
     # ---- helpers -----------------------------------------------------------
     def z_correction(self):
-        """What to ADD to a TF-derived z to get navsat altitude. Holds the
-        last known offset through GPS outages; 0.0 until first GPS."""
+        """What to ADD to the TF-derived z to get the ground ABSOLUTE altitude
+        the clouds/DEM are inserted with. SINGLE SOURCE OF TRUTH for both the
+        alias-TF z bump (insertion_gate) and the DEM ground z (trajectory_dem),
+        so octomap and DEM stay z-consistent.
+
+        z_mode='dr' (default): return (z_dr + b) - tf_z, so the inserted
+        absolute z = tf_z + z_correction = z_dr + b -- the smooth DR shape
+        anchored by the slow RTK datum bias, immune to RTK jumps/outages.
+        z_mode='rtk' (legacy): the last RTK-grade (gps.z - tf.z), held frozen
+        through GPS outages -- byte-identical to the pre-2026-07-19-evening
+        behaviour."""
+        if self.cfg.z_mode == 'dr':
+            tf_z = self._pose[3] if self._pose is not None else 0.0
+            return (self._z_dr + self._b) - tf_z
         return self._z_corr
 
     # ---- decision ----------------------------------------------------------
@@ -362,7 +465,14 @@ class InsertionGate:
             if vacc > cfg.max_vacc_mm:
                 rtk_reasons.append('vacc')
 
-        if self._z_corr_t is None:
+        if cfg.z_mode == 'dr':
+            # DR-z is integrated every wheel-odom tick -> never stale/frozen;
+            # this is the key win (continuous mapping through GPS outages).
+            info['z_source'] = 'dr'
+            info['z_dr_m'] = round(self._z_dr, 3)
+            info['b_m'] = round(self._b, 3)
+            info['b_init'] = self._b_init
+        elif self._z_corr_t is None:
             info['z_source'] = 'none'
             rtk_reasons.append('no_rtk_altitude')
         elif wall_now - self._z_corr_t <= cfg.max_gps_odom_age_s:   # M11
@@ -370,7 +480,7 @@ class InsertionGate:
         else:
             info['z_source'] = 'frozen'
             rtk_reasons.append('altitude_frozen')
-        info['z_corr_m'] = round(self._z_corr, 3)
+        info['z_corr_m'] = round(self.z_correction(), 3)
 
         if self._pose_src is None:
             info['pose_src'] = '?'
@@ -429,7 +539,7 @@ class InsertionGate:
         # tail of the excursion). Stationary re-observation of the same spot is
         # allowed (speed below eps). Slope-safe: it gates on z FRESHNESS, never
         # on z being non-zero. Opt-in (default off).
-        if self.cfg.z_stale_block_when_moving:
+        if self.cfg.z_stale_block_when_moving and cfg.z_mode != 'dr':
             moving = self._speed_mps >= self.cfg.standstill_speed_eps_mps
             z_age = (float('inf') if self._z_corr_t is None
                      else wall_now - self._z_corr_t)
@@ -449,6 +559,32 @@ class InsertionGate:
                                         else round(z_age, 2))
                 if z_carry_m is not None:
                     info['z_carry_m'] = round(z_carry_m, 2)
+
+        # DR-z BACKSTOP (replaces the z-stale gates in dr mode): the DR integrator
+        # never goes stale, so instead watch for it DRIFTING away from a fresh,
+        # trusted RTK altitude. A persistent large |rtk_alt - (z_dr+b)| while
+        # moving means DR has accumulated error (or b is wrong) -> block until it
+        # re-converges. Generous default (1.0 m over 5 s) so it never bites in
+        # normal operation; it is a safety net, not a routine gate.
+        if (cfg.z_mode == 'dr' and cfg.dr_max_divergence_m > 0.0
+                and self._gps_odom is not None and self._loc_ok is not False):
+            g_t, _gx, _gy, g_z = self._gps_odom
+            g_fresh = (wall_now - g_t) <= cfg.max_gps_odom_age_s
+            moving = self._speed_mps >= self.cfg.standstill_speed_eps_mps
+            if g_fresh and moving:
+                div = abs(g_z - (self._z_dr + self._b))
+                info['dr_div_m'] = round(div, 3)
+                if div > cfg.dr_max_divergence_m:
+                    if self._div_since is None:
+                        self._div_since = now
+                    elif now - self._div_since >= cfg.dr_divergence_persist_s:
+                        reasons.append('dr_divergence')
+                else:
+                    self._div_since = None
+            else:
+                self._div_since = None
+        else:
+            self._div_since = None
 
         # rate-based pause: don't map while the map frame is actively being
         # corrected. Recompute the windowed rate against `now` so it decays to

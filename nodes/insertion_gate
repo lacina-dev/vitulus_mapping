@@ -112,6 +112,20 @@ class InsertionGateNode:
                 '~standstill_after_s', 8.0)),
             standstill_rate_hz=float(rospy.get_param(
                 '~standstill_rate_hz', 0.5)),
+            # DR-z (2026-07-19 evening): pitch-integrated dead-reckoned altitude
+            # + slow RTK datum bias b, replacing RTK-jump-driven insertion z.
+            z_mode=rospy.get_param('~z_mode', 'dr'),
+            dr_pitch_clamp_deg=float(rospy.get_param(
+                '~dr_pitch_clamp_deg', 30.0)),
+            dr_v_eps_mps=float(rospy.get_param('~dr_v_eps_mps', 0.02)),
+            dr_dt_max_s=float(rospy.get_param('~dr_dt_max_s', 0.5)),
+            dr_v_max_mps=float(rospy.get_param('~dr_v_max_mps', 2.0)),
+            b_tau_s=float(rospy.get_param('~b_tau_s', 120.0)),
+            b_init_window_s=float(rospy.get_param('~b_init_window_s', 10.0)),
+            dr_max_divergence_m=float(rospy.get_param(
+                '~dr_max_divergence_m', 1.0)),
+            dr_divergence_persist_s=float(rospy.get_param(
+                '~dr_divergence_persist_s', 5.0)),
         )
         # standstill dwell throttle enable (node-level; uses gate speed)
         self.standstill_throttle = bool(rospy.get_param(
@@ -173,6 +187,11 @@ class InsertionGateNode:
                          queue_size=2)
         rospy.Subscriber('/odometry/gps', Odometry, self.cb_gps_odom,
                          queue_size=2)
+        # DR-z: jump-free body-forward wheel velocity feeds the z_dr integrator.
+        # twist.twist.linear.x is in child_frame=base_link (verified live), i.e.
+        # the true forward speed the wheels measure -- immune to map/RTK jumps.
+        rospy.Subscriber('/mobile_base_controller/odom', Odometry,
+                         self.cb_wheel_odom, queue_size=5)
         rospy.Subscriber('/nav_tf/odom_status', Navi_transform,
                          self.cb_pose_src, queue_size=1)
         rospy.Subscriber('/nav_tf/loc_status', String, self.cb_loc_status,
@@ -223,6 +242,11 @@ class InsertionGateNode:
     def cb_gps_odom(self, msg):
         p = msg.pose.pose.position
         self.gate.feed_gps_odom(msg.header.stamp.to_sec(), p.x, p.y, p.z)
+
+    def cb_wheel_odom(self, msg):
+        """DR-z: integrate z_dr from the jump-free forward wheel velocity."""
+        self.gate.feed_dr(msg.header.stamp.to_sec(),
+                          msg.twist.twist.linear.x)
 
     def cb_pose_src(self, msg):
         self.gate.feed_pose_src(rospy.Time.now().to_sec(), msg.status)
@@ -396,6 +420,13 @@ class InsertionGateNode:
         q = tr.transform.rotation
         yaw = euler_from_quaternion([q.x, q.y, q.z, q.w])[2]
         self.gate.feed_pose(tr.header.stamp.to_sec(), t.x, t.y, t.z, yaw)
+        # DR-z grade: the map-frame z-component of base_link's +x (forward) axis
+        # = R[2,0] = 2*(qx*qz - qw*qy). This IS sin(forward grade), yaw-
+        # independent and convention-free (positive => forward axis points up =>
+        # driving forward raises z). TF map->base_link carries the fused BNO085
+        # attitude (verified: TF pitch == /bno085/imu_base_link pitch).
+        sin_grade = 2.0 * (q.x * q.z - q.w * q.y)
+        self.gate.feed_attitude(tr.header.stamp.to_sec(), sin_grade)
         try:
             mo = self.tf_buf.lookup_transform(self.map_frame, 'odom',
                                               rospy.Time(0),
@@ -429,6 +460,15 @@ class InsertionGateNode:
                 'insertion_gate: %s %s',
                 'OPEN' if dec.passed else 'CLOSED', dec.reasons)
             self.last_passed = dec.passed
+        # DR-z: warn once when the slow datum bias b is seeded from the first
+        # trusted window (so a session's z anchor is visible in the log).
+        if self.gate.cfg.z_mode == 'dr':
+            z_dr, b, b_init = self.gate.dr_state()
+            if b_init and not getattr(self, '_b_warned', False):
+                rospy.logwarn('insertion_gate: DR-z datum bias b seeded = '
+                              '%.3f m (z_dr=%.3f) -> insertion z = z_dr + b',
+                              b, z_dr)
+                self._b_warned = True
         self._last_decision = dec
 
     def tick_status(self, _evt):
@@ -437,6 +477,7 @@ class InsertionGateNode:
             return
         status = {'pass': dec.passed, 'reasons': dec.reasons,
                   'z_corr_m': round(self.gate.z_correction(), 3),
+                  'z_mode': self.gate.cfg.z_mode,
                   'z_corr_mode': self.gate.cfg.z_corr_mode,
                   'lidar_max_m': round(self.gate.cfg.lidar_max_range_m, 2),
                   'depth_max_m': round(self.gate.cfg.depth_max_range_m, 2),
