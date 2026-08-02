@@ -145,9 +145,6 @@ class DirectRasterNode:
                                        queue_size=1, latch=True)
         self.pub_status = rospy.Publisher('direct_status', String,
                                           queue_size=1, latch=True)
-        # AUDIT A14: snapshot ack/nack for mapping_manager's stop wait
-        self.pub_save_ack = rospy.Publisher('save_direct_ack', String,
-                                            queue_size=1)
 
         rospy.Subscriber('set_direct', String, self.cb_set_direct, queue_size=2)
         rospy.Subscriber('save_direct', String, self.cb_save_direct,
@@ -161,12 +158,9 @@ class DirectRasterNode:
 
         rospy.Subscriber('/nav_tf/odom_status', Navi_transform,
                          self.cb_pose_src, queue_size=1)
-        # AUDIT A15 (2026-08-01): subscribe unconditionally and gate per-callback
-        # (same pattern as the camera sources). The old start-time-only subscribe
-        # made a live `set_direct {use_lidar:true}` toggle persist + report in
-        # status while actually doing NOTHING until the next session restart.
-        rospy.Subscriber(self.lidar_scan_topic, LaserScan, self.cb_scan,
-                         queue_size=1, buff_size=2 ** 20)
+        if self.use_lidar:
+            rospy.Subscriber(self.lidar_scan_topic, LaserScan, self.cb_scan,
+                             queue_size=1, buff_size=2 ** 20)
         rospy.Subscriber(self.obstacle_cloud_topic, PointCloud2,
                          self.cb_cloud, callback_args='cam_obstacle',
                          queue_size=1, buff_size=2 ** 22)
@@ -544,12 +538,6 @@ class DirectRasterNode:
             if raster.size == 0 or stats['observed_cells'] == 0:
                 rospy.logwarn('direct_raster: save_direct skipped — no evidence '
                               'accumulated yet (nothing to snapshot)')
-                # AUDIT A14 (2026-08-01): NACK so mapping_manager aborts its
-                # snapshot wait instead of burning the full timeout on an
-                # empty session.
-                self.pub_save_ack.publish(String(json.dumps(
-                    {'saved': False, 'name': name or '',
-                     'reason': 'no evidence'})))
                 return
             out_name = name or time.strftime('direct_%Y%m%d_%H%M%S')
             base = os.path.join(self.output_dir, 'rasters', out_name, out_name)
@@ -561,15 +549,8 @@ class DirectRasterNode:
                 json.dump(meta, f, indent=1)
             rospy.loginfo('direct_raster: saved raster %s (%s)', base,
                           json.dumps(stats))
-            self.pub_save_ack.publish(String(json.dumps(
-                {'saved': True, 'name': out_name})))
         except Exception as e:
             rospy.logerr('direct_raster: save_direct failed: %s', e)
-            try:
-                self.pub_save_ack.publish(String(json.dumps(
-                    {'saved': False, 'name': name or '', 'reason': str(e)})))
-            except Exception:
-                pass
 
 
 if __name__ == '__main__':

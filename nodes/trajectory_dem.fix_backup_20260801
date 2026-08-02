@@ -123,11 +123,7 @@ class TrajectoryDemNode:
         if 'z_corr_m' in s and (rospy.Time.now().to_sec()
                                 - self._z_corr_topic_t) > 1.0:
             self.z_corr = float(s['z_corr_m'])
-        # AUDIT A13 (2026-08-01): 'dr' counts as a HEALTHY altitude source — in
-        # the default z_mode=dr the source is 'dr' the whole session and the
-        # old rtk-only test kept the UI on a false "no RTK altitude" warning
-        # all drive long. Unhealthy = 'frozen' / 'none'.
-        self.z_live = s.get('z_source') in ('rtk', 'dr')
+        self.z_live = s.get('z_source') == 'rtk'
 
     def cb_save(self, msg):
         path = msg.data.strip() or self.dem_path

@@ -178,11 +178,6 @@ class MappingManager:
                          self.cb_remove_edit, queue_size=4)
         # M9: watch the pipeline's gate_status so Stop can tell whether the
         # session ever captured a georef datum.
-        # AUDIT A14: direct_raster snapshot ack/nack — lets the stop wait abort
-        # immediately on an empty-session reject instead of the full timeout.
-        self._save_ack = None
-        rospy.Subscriber('/mapping/save_direct_ack', String, self.cb_save_ack,
-                         queue_size=2)
         rospy.Subscriber('/mapping/gate_status', String, self.cb_gate_status,
                          queue_size=1)
         # PROTOCOL 2026-07-19: loc_status (docked flag at Stop) + gloc's
@@ -361,10 +356,6 @@ class MappingManager:
             # Stash the pose; stop_proc publishes it AFTER the serve settles.
             self._pending_dock_wp = pose
         else:
-            # AUDIT A1 (2026-08-01): clear any stale stash — a docked stop whose
-            # raster never saved left the pose here, and the NEXT (non-docked)
-            # stop would publish the OLD dock position under a new datum.
-            self._pending_dock_wp = None
             self._update_site_config(site, {'ended_docked': False})
             why = ('loc_status stale/absent' if not fresh else 'not docked')
             rospy.logwarn('mapping_manager: session "%s" did NOT end docked (%s) '
@@ -496,13 +487,6 @@ class MappingManager:
         except OSError as e:
             rospy.logwarn('mapping_manager: datum link failed: %s', e)
 
-    def cb_save_ack(self, msg):
-        """AUDIT A14: remember direct_raster's snapshot ack/nack."""
-        try:
-            self._save_ack = json.loads(msg.data)
-        except ValueError:
-            pass
-
     def cb_stop(self, _msg):
         if not self.running():
             rospy.loginfo('mapping_manager: nothing to stop')
@@ -523,7 +507,6 @@ class MappingManager:
                                   direct_name + '.pgm')
         rospy.loginfo('mapping_manager: raster_on_stop — snapshotting direct '
                       '%s/%s', site, direct_name)
-        self._save_ack = None
         self.pub_mapping_save_direct.publish(String(json.dumps(
             {'name': direct_name})))
         deadline = time.time() + self.raster_on_stop_timeout_s
@@ -532,14 +515,6 @@ class MappingManager:
                 rospy.loginfo('mapping_manager: raster_on_stop wrote direct %s',
                               direct_pgm)
                 return direct_name
-            # AUDIT A14: a NACK for our snapshot means nothing will ever be
-            # written — abort the wait now instead of burning the timeout.
-            ack = self._save_ack
-            if ack and ack.get('name') == direct_name and not ack.get('saved'):
-                rospy.logwarn('mapping_manager: raster_on_stop REJECTED by '
-                              'direct_raster (%s) — no raster for %s',
-                              ack.get('reason', '?'), site)
-                return None
             time.sleep(0.5)
         rospy.logwarn('mapping_manager: raster_on_stop timed out (%ss) — no '
                       'direct raster for %s', self.raster_on_stop_timeout_s,
@@ -623,10 +598,6 @@ class MappingManager:
                                           'auto-save failed: %s', e)
                     rospy.Timer(rospy.Duration(2.0), _pub_dock_wp, oneshot=True)
             else:
-                # AUDIT A1 (2026-08-01): no raster -> the stash must die here
-                # too, or a DOCKED raster-less stop would leak its pose into the
-                # next session's save (old dock position under a new datum).
-                self._pending_dock_wp = None
                 # servesync (2026-07-12): the stopped session saved NO raster
                 # (e.g. aborted fresh site). Serving was cleared at start (empty
                 # grid), so restore it to the newest site that has a raster
@@ -830,8 +801,9 @@ class MappingManager:
                         os.path.join(self.base_dir, site, 'garden.ot'))
                     if has_ot:
                         self._serve_reject(
-                            'site "%s" has no raster — one is written '
-                            'automatically on Stop' % site)
+                            'site "%s" has no raster — press Snapshot while '
+                            'mapping, or it is written automatically on Stop'
+                            % site)
                     else:
                         self._serve_reject('site "%s" has no raster (and no '
                                            '3D map)' % site)
