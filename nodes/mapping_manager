@@ -47,6 +47,7 @@ import os
 import shutil
 import signal
 import subprocess
+import threading
 import time
 
 import cv2
@@ -77,6 +78,12 @@ class MappingManager:
         self.proc = None
         self.site = None
         self.started_at = None
+        # AUDIT P2-2 (2026-08-08): lifecycle mutex — cb_start/cb_stop/stop_proc
+        # and the tick_status reaper run on different rospy threads and all
+        # mutate proc/site/started_at; an unserialised double-stop or
+        # start-during-stop could kill a dead pgid or leave site/proc torn.
+        # RLock: cb_start legitimately calls stop_proc while holding it.
+        self._lifecycle_lock = threading.RLock()
         self.map_frame = rospy.get_param('~map_frame', 'map')
         self.base_frame = rospy.get_param('~base_frame', 'base_link')
         # PROTOCOL 2026-07-19 (stop-in-dock verification): cache navi_transform's
@@ -396,6 +403,11 @@ class MappingManager:
             rospy.logwarn('mapping_manager: orphan kill failed: %s', e)
 
     def cb_start(self, msg):
+        # AUDIT P2-2: serialized with cb_stop/stop_proc/reaper
+        with self._lifecycle_lock:
+            return self._cb_start_locked(msg)
+
+    def _cb_start_locked(self, msg):
         site = msg.data.strip() or 'default'
         if not site.replace('_', '').replace('-', '').isalnum():
             rospy.logwarn('mapping_manager: invalid site name %r', site)
@@ -504,10 +516,13 @@ class MappingManager:
             pass
 
     def cb_stop(self, _msg):
-        if not self.running():
-            rospy.loginfo('mapping_manager: nothing to stop')
-            return
-        self.stop_proc()
+        # AUDIT P2-2: serialized — a double-click Stop used to race two
+        # stop_proc calls (second killpg on a reaped pid / torn site state).
+        with self._lifecycle_lock:
+            if not self.running():
+                rospy.loginfo('mapping_manager: nothing to stop')
+                return
+            self.stop_proc()
 
     def _snapshot_raster_on_stop(self, site):
         """Ask direct_raster for a full raster snapshot (direct_<timestamp>)
@@ -547,6 +562,15 @@ class MappingManager:
         return None
 
     def stop_proc(self):
+        # AUDIT P2-2: serialized with cb_start/cb_stop/reaper (RLock — the
+        # cb_start continuation path calls this while already holding it).
+        with self._lifecycle_lock:
+            return self._stop_proc_locked()
+
+    def _stop_proc_locked(self):
+        if self.proc is None:
+            rospy.loginfo('mapping_manager: stop_proc — already stopped')
+            return
         rospy.logwarn('mapping_manager: stopping %s (pid %s)',
                       self.site, self.proc.pid)
         # REPORT 2: snapshot the direct raster BEFORE tearing the pipeline down,
@@ -1394,13 +1418,16 @@ class MappingManager:
         return info
 
     def tick_status(self, _evt):
-        if self.proc is not None and self.proc.poll() is not None:
-            rospy.logwarn('mapping_manager: launch exited (code %s)',
-                          self.proc.returncode)
-            self.proc = None
-            self.site = None
-            self.started_at = None
-            self.session_resolution = None    # M13
+        # AUDIT P2-2: the dead-launch reaper mutates the same lifecycle state
+        # as cb_start/cb_stop — take the mutex for the check-and-clear.
+        with self._lifecycle_lock:
+            if self.proc is not None and self.proc.poll() is not None:
+                rospy.logwarn('mapping_manager: launch exited (code %s)',
+                              self.proc.returncode)
+                self.proc = None
+                self.site = None
+                self.started_at = None
+                self.session_resolution = None    # M13
         sites = sorted(n for n in os.listdir(self.base_dir)
                        if os.path.isdir(os.path.join(self.base_dir, n)))
         status = {

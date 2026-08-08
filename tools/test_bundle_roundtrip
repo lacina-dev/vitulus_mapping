@@ -15,6 +15,7 @@ NO ROS required.  Checks:
 
 Exit code 0 on pass, non-zero on failure.
 """
+import glob
 import math
 import os
 import random
@@ -170,7 +171,14 @@ def test_reality():
     import yaml
     sys.path.insert(0, "/home/vitulus/catkin_ws/src/vitulus/vitulus_navi/src")
     pkl = "/home/vitulus/.vitulus/saves/maps_data/GARDEN_2026***env*OUTDOOR.pkl"
-    site_datum_yaml = "/home/vitulus/.vitulus/mapping_v3/novamapa/datum.yaml"
+    # 2026-08-08: site was hardcoded ('novamapa' — since removed, test crashed
+    # with FileNotFoundError). Use the newest site dir that has a datum.yaml.
+    root = "/home/vitulus/.vitulus/mapping_v3"
+    cands = sorted(
+        (d for d in glob.glob(os.path.join(root, "*", "datum.yaml"))),
+        key=os.path.getmtime, reverse=True)
+    site_datum_yaml = cands[0] if cands else os.path.join(
+        root, "MISSING", "datum.yaml")
     try:
         from navi_man import mapdata  # noqa: F401  (needed to unpickle)
         with open(pkl, "rb") as f:
@@ -197,6 +205,10 @@ def test_reality():
           % (e_p, n_p, rt))
     check(rt < 1e-3, "real docked point self-roundtrip < 1e-3 m")
 
+    if not os.path.exists(site_datum_yaml):
+        print("      (skipped: no site datum.yaml under %s)" % root)
+        return
+    print("      site datum: %s" % site_datum_yaml)
     with open(site_datum_yaml) as f:
         sd = yaml.safe_load(f)
     sdatum = geo.from_datum_yaml(sd)

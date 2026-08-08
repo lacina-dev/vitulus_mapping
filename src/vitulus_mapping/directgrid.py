@@ -134,6 +134,19 @@ class DirectGrid:
         ux, uy = flat // ny, flat % ny
         self.lo[ux, uy] = np.maximum(self.lo[ux, uy] - self.miss_dec,
                                      self.lo_clamp)
+        # AUDIT P2-1 (2026-08-08): expire the historical hit counter while the
+        # cell is confidently FREE — `hits` used to only ever grow, so
+        # min_hits=3 meant 3 obstacle frames per cell LIFETIME: a long-erased
+        # transient could re-promote to occupied from a single later noise hit
+        # (its old confirmations never expired). One decrement per free frame,
+        # only once log-odds is at/below free_thresh, floor 0. Genuine static
+        # obstacles are unaffected (their endpoint cells are excluded from
+        # same-scan freeing and carry high hit counts).
+        decay = (self.lo[ux, uy] <= self.free_thresh) & (self.hits[ux, uy] > 0)
+        if decay.any():
+            dx_, dy_ = ux[decay], uy[decay]
+            self.hits[dx_, dy_] = (self.hits[dx_, dy_].astype(np.int32)
+                                   - 1).astype(np.uint16)
         self.obs[ux, uy] = True
         self.n_free_frames += 1
 

@@ -70,6 +70,41 @@ def test_transient_erodes():
     check(cell_val(g, x, y) == 0, 'and eventually becomes free')
 
 
+def test_hits_decay_under_free():
+    """AUDIT P2-1 (2026-08-08): while a cell is confidently free, free frames
+    expire the historical hit counter — a long-erased transient must need the
+    FULL min_hits again, not re-promote from a single later noise hit."""
+    print('test_hits_decay_under_free')
+    g = DirectGrid(resolution=0.05, hit_inc=1.0, miss_dec=0.5,
+                   lo_clamp=-2.0, hi_clamp=4.0,
+                   occ_thresh=0.85, free_thresh=-0.4, min_hits=3)
+    x, y = 0.5, 0.5
+    for _ in range(3):
+        g.add_obstacle_points([x], [y])
+    check(cell_val(g, x, y) == 100, 'transient shows occupied (3 hits)')
+    for _ in range(14):                      # erode deep into free + decay hits
+        g.add_free_points([x], [y])
+    check(cell_val(g, x, y) == 0, 'transient erodes to free')
+    check(int(g.hits[g.world_to_idx(x, y)]) == 0,
+          'hit history expired while confidently free')
+    for _ in range(2):                       # noise: 2 fresh hits, lo recrosses
+        g.add_obstacle_points([x], [y])
+    check(cell_val(g, x, y) != 100,
+          '2 fresh hits alone do NOT re-promote (min_hits enforced anew)')
+    g.add_obstacle_points([x], [y])
+    check(cell_val(g, x, y) == 100,
+          'a genuinely returning obstacle re-promotes after full min_hits')
+    # static-obstacle safety: a frequently-hit cell keeps its history
+    g2 = DirectGrid(resolution=0.05, hit_inc=1.0, miss_dec=0.5,
+                    occ_thresh=0.85, free_thresh=-0.4, min_hits=3)
+    for _ in range(20):
+        g2.add_obstacle_points([1.0], [1.0])
+    g2.add_free_points([1.0], [1.0])         # single spurious free frame
+    check(int(g2.hits[g2.world_to_idx(1.0, 1.0)]) == 20,
+          'occupied cell (lo above free_thresh) does not decay hits')
+    check(cell_val(g2, 1.0, 1.0) == 100, 'static obstacle stays occupied')
+
+
 def test_lidar_free_ray():
     print('test_lidar_free_ray')
     g = DirectGrid(resolution=0.05, hit_inc=0.5, miss_dec=0.4,
@@ -138,6 +173,7 @@ def test_render_crop():
 
 def main():
     for t in (test_obstacle_needs_min_hits, test_transient_erodes,
+              test_hits_decay_under_free,
               test_lidar_free_ray, test_lidar_no_return_free,
               test_autogrow_and_origin, test_render_crop):
         t()
