@@ -60,6 +60,103 @@ def _clamp(v, lo, hi):
     return max(lo, min(hi, v))
 
 
+def _cluster_filter_xy(x, y, radius, min_pts):
+    """Keep-mask for points whose connected blob (grid cells of size `radius`,
+    8-neighborhood) holds >= min_pts points. Approximates radius clustering
+    without scipy; clouds here are voxel-thinned (<= a few thousand points)."""
+    n = x.size
+    if min_pts <= 1 or n == 0:
+        return np.ones(n, dtype=bool)
+    cell = max(float(radius), 1e-3)
+    ix = np.floor(x / cell).astype(np.int64)
+    iy = np.floor(y / cell).astype(np.int64)
+    cells = {}
+    for i in range(n):
+        cells.setdefault((ix[i], iy[i]), []).append(i)
+    keep = np.zeros(n, dtype=bool)
+    seen = set()
+    for start in cells:
+        if start in seen:
+            continue
+        seen.add(start)
+        stack = [start]
+        comp = []
+        while stack:
+            cx, cy = stack.pop()
+            comp.append((cx, cy))
+            for dx in (-1, 0, 1):
+                for dy in (-1, 0, 1):
+                    nb = (cx + dx, cy + dy)
+                    if nb in cells and nb not in seen:
+                        seen.add(nb)
+                        stack.append(nb)
+        if sum(len(cells[c]) for c in comp) >= min_pts:
+            for c in comp:
+                keep[cells[c]] = True
+    return keep
+
+
+# Environment presets (2026-08-09): named PARTIAL settings dicts applied via
+# /mapping/direct_preset. Only the "environment character" keys — source
+# enables and ranges are the user's own live choice and are never touched by
+# a preset. Custom presets (saved from the UI) persist globally in
+# direct_presets.json and shadow a builtin of the same name.
+# PRESET REWORK (2026-08-09 field test zahradaDneska): the first-cut presets
+# were erosion-broken — 'Lawn tall' had miss_dec 0.5 > hit_inc 0.4 with
+# occ_thresh 1.0/min_hits 5, and with the lidar carving free 360° at 6 Hz only
+# 96 occupied cells survived a 10-min drive. Rules now: miss_dec <= hit_inc,
+# reachable thresholds, and the sceptical knobs are lidar_free_dec +
+# occ_erode_factor + min_hits rather than a free/hit imbalance.
+BUILTIN_PRESETS = {
+    'Lawn short': {
+        'cam_obstacle_min_h': 0.12, 'cam_obstacle_max_h': 0.6,
+        'cam_min_cluster_pts': 1, 'cam_cluster_radius_m': 0.15,
+        'lidar_min_intensity': 0.0,
+        'hit_inc': 0.6, 'miss_dec': 0.4, 'occ_thresh': 0.85,
+        'free_thresh': -0.4, 'min_hits': 2,
+        'lidar_free_dec': 0.15, 'occ_erode_factor': 0.5,
+    },
+    'Lawn tall': {
+        # tall grass: lift the obstacle floor above the blade tips, demand
+        # more frames + bigger blobs, drop weak lidar returns (grass);
+        # scepticism comes from min_hits/cluster — NOT from miss>hit
+        'cam_obstacle_min_h': 0.25, 'cam_obstacle_max_h': 0.8,
+        'cam_min_cluster_pts': 4, 'cam_cluster_radius_m': 0.2,
+        'lidar_min_intensity': 6.0,
+        'hit_inc': 0.5, 'miss_dec': 0.3, 'occ_thresh': 0.8,
+        'free_thresh': -0.4, 'min_hits': 4,
+        'lidar_free_dec': 0.08, 'occ_erode_factor': 0.3,
+    },
+    'Paved yard': {
+        # hard surfaces, walls/fences matter: converge fast, take tall stuff;
+        # lidar is trustworthy here so its free rays may erode a bit more
+        'cam_obstacle_min_h': 0.10, 'cam_obstacle_max_h': 1.5,
+        'cam_min_cluster_pts': 1, 'cam_cluster_radius_m': 0.15,
+        'lidar_min_intensity': 0.0,
+        'hit_inc': 0.7, 'miss_dec': 0.4, 'occ_thresh': 0.85,
+        'free_thresh': -0.4, 'min_hits': 2,
+        'lidar_free_dec': 0.2, 'occ_erode_factor': 0.5,
+    },
+    'Bushes / edge': {
+        # soft moving vegetation: slow accumulation, sticky once confirmed
+        'cam_obstacle_min_h': 0.20, 'cam_obstacle_max_h': 1.8,
+        'cam_min_cluster_pts': 5, 'cam_cluster_radius_m': 0.2,
+        'lidar_min_intensity': 4.0,
+        'hit_inc': 0.4, 'miss_dec': 0.3, 'occ_thresh': 0.9,
+        'free_thresh': -0.4, 'min_hits': 5,
+        'lidar_free_dec': 0.08, 'occ_erode_factor': 0.3,
+    },
+    'Default (yaml)': {
+        'cam_obstacle_min_h': 0.15, 'cam_obstacle_max_h': 0.5,
+        'cam_min_cluster_pts': 1, 'cam_cluster_radius_m': 0.15,
+        'lidar_min_intensity': 0.0,
+        'hit_inc': 0.5, 'miss_dec': 0.4, 'occ_thresh': 0.85,
+        'free_thresh': -0.4, 'min_hits': 3,
+        'lidar_free_dec': 0.12, 'occ_erode_factor': 0.5,
+    },
+}
+
+
 class DirectRasterNode:
     def __init__(self):
         self.map_frame = rospy.get_param('~map_frame', 'map')
@@ -84,11 +181,39 @@ class DirectRasterNode:
         # log-odds tunables (also live-settable)
         self.hit_inc = float(rospy.get_param('~hit_inc', 0.5))
         self.miss_dec = float(rospy.get_param('~miss_dec', 0.4))
+        # ANTI-EROSION (2026-08-09, see directgrid.py): weak decrement for
+        # lidar-ray free evidence + erosion hysteresis on confirmed-occupied
+        # cells. Both live-settable.
+        self.lidar_free_dec = float(rospy.get_param('~lidar_free_dec', 0.12))
+        self.occ_erode_factor = float(
+            rospy.get_param('~occ_erode_factor', 0.5))
         self.lo_clamp = float(rospy.get_param('~lo_clamp', -2.0))
         self.hi_clamp = float(rospy.get_param('~hi_clamp', 3.5))
         self.occ_thresh = float(rospy.get_param('~occ_thresh', 0.85))
         self.free_thresh = float(rospy.get_param('~free_thresh', -0.4))
         self.min_hits = int(rospy.get_param('~min_hits', 3))
+
+        # camera-obstacle LIVE re-filter (2026-08-09). The wide obstacles chain
+        # (obstacles_detection_wide, window 0.05..2.0 m) hands over MORE than
+        # the old narrow instance did; the final height window / blob size is
+        # decided HERE, live-settable per environment. Heights are z in
+        # base_link — the SAME frame obstacles_detection projects into
+        # (frame_id base_link), so the semantics match the old
+        # Grid/Min|MaxObstacleHeight exactly; the defaults reproduce the old
+        # narrow 0.15..0.5 behaviour.
+        self.cam_obstacle_min_h = float(
+            rospy.get_param('~cam_obstacle_min_h', 0.15))
+        self.cam_obstacle_max_h = float(
+            rospy.get_param('~cam_obstacle_max_h', 0.5))
+        self.cam_min_cluster_pts = int(
+            rospy.get_param('~cam_min_cluster_pts', 1))
+        self.cam_cluster_radius_m = float(
+            rospy.get_param('~cam_cluster_radius_m', 0.15))
+        # weak-return gate on TOP of the scan_filter intensity NaN filter:
+        # a finite return with intensity < this is neither hit nor free ray
+        # (unknown). 0 = off.
+        self.lidar_min_intensity = float(
+            rospy.get_param('~lidar_min_intensity', 0.0))
 
         self.lidar_scan_topic = rospy.get_param(
             '~lidar_scan_topic', '/rplidar/scan_filtered')
@@ -97,17 +222,19 @@ class DirectRasterNode:
         self.ground_cloud_topic = rospy.get_param(
             '~ground_cloud_topic', '/ground_cloud')
 
-        self.grid = DirectGrid(
-            resolution=self.res, hit_inc=self.hit_inc, miss_dec=self.miss_dec,
-            lo_clamp=self.lo_clamp, hi_clamp=self.hi_clamp,
-            occ_thresh=self.occ_thresh, free_thresh=self.free_thresh,
-            min_hits=self.min_hits)
+        self.grid = self._make_grid()
         self.grid_lock = threading.Lock()
 
         # per-site persistence of the live control (mirrors band_overrides.json)
         self.overrides_path = os.path.join(self.output_dir,
                                            'direct_overrides.json')
         self._load_overrides()
+
+        # GLOBAL (cross-site) custom environment presets — sites share one
+        # environment vocabulary, unlike the per-site overrides above.
+        self.presets_path = os.path.expanduser(rospy.get_param(
+            '~presets_path', '~/.vitulus/mapping_v3/direct_presets.json'))
+        self.custom_presets = self._load_presets()
 
         # XY-only gate: fused mode blocks on pose freshness / jumps / map-corr
         # rate, never on z. Pull the tuned XY thresholds from the sibling
@@ -150,6 +277,10 @@ class DirectRasterNode:
                                             queue_size=1)
 
         rospy.Subscriber('set_direct', String, self.cb_set_direct, queue_size=2)
+        rospy.Subscriber('direct_preset', String, self.cb_direct_preset,
+                         queue_size=2)
+        rospy.Subscriber('reset_direct', String, self.cb_reset_direct,
+                         queue_size=1)
         rospy.Subscriber('save_direct', String, self.cb_save_direct,
                          queue_size=1)
 
@@ -195,6 +326,15 @@ class DirectRasterNode:
     def _new_counter(self):
         return {'in': 0, 'throttled': 0, 'gate_closed': 0, 'passed': 0}
 
+    def _make_grid(self):
+        """Fresh DirectGrid from the CURRENT node settings (init + reset)."""
+        return DirectGrid(
+            resolution=self.res, hit_inc=self.hit_inc, miss_dec=self.miss_dec,
+            lo_clamp=self.lo_clamp, hi_clamp=self.hi_clamp,
+            occ_thresh=self.occ_thresh, free_thresh=self.free_thresh,
+            min_hits=self.min_hits, lidar_free_dec=self.lidar_free_dec,
+            occ_erode_factor=self.occ_erode_factor)
+
     # ---- live control + persistence ----------------------------------------
     def _load_overrides(self):
         try:
@@ -218,6 +358,88 @@ class DirectRasterNode:
         except Exception as e:
             rospy.logwarn('direct_raster: could not save overrides: %s', e)
 
+    # ---- environment presets (global, cross-site) ---------------------------
+    # keys a preset may carry: environment character only — never the source
+    # enables/ranges, those stay the user's live choice
+    PRESET_KEYS = ('cam_obstacle_min_h', 'cam_obstacle_max_h',
+                   'cam_min_cluster_pts', 'cam_cluster_radius_m',
+                   'lidar_min_intensity', 'hit_inc', 'miss_dec',
+                   'lidar_free_dec', 'occ_erode_factor',
+                   'occ_thresh', 'free_thresh', 'min_hits',
+                   'lo_clamp', 'hi_clamp')
+
+    def _load_presets(self):
+        try:
+            if os.path.exists(self.presets_path):
+                with open(self.presets_path) as f:
+                    p = json.load(f)
+                if isinstance(p, dict):
+                    return p
+        except Exception as e:
+            rospy.logwarn('direct_raster: could not load presets: %s', e)
+        return {}
+
+    def _save_presets(self):
+        try:
+            os.makedirs(os.path.dirname(self.presets_path), exist_ok=True)
+            with open(self.presets_path, 'w') as f:
+                json.dump(self.custom_presets, f, indent=1)
+        except Exception as e:
+            rospy.logwarn('direct_raster: could not save presets: %s', e)
+
+    def _presets_dict(self):
+        out = []
+        for name, vals in BUILTIN_PRESETS.items():
+            if name not in self.custom_presets:
+                out.append({'name': name, 'builtin': True, 'values': vals})
+        for name, vals in self.custom_presets.items():
+            out.append({'name': name, 'builtin': False, 'values': vals})
+        return out
+
+    def cb_direct_preset(self, msg):
+        """{'action': 'apply'|'save'|'delete', 'name': str}. A custom preset
+        shadows a builtin of the same name; save snapshots the CURRENT
+        settings' preset keys under the given name."""
+        try:
+            req = json.loads(msg.data)
+            action = req['action']
+            name = str(req.get('name', '')).strip()
+        except (ValueError, KeyError, TypeError) as e:
+            rospy.logwarn('direct_raster: direct_preset bad payload: %s', e)
+            return
+        if action == 'apply':
+            vals = self.custom_presets.get(name) or BUILTIN_PRESETS.get(name)
+            if not vals:
+                rospy.logwarn("direct_raster: unknown preset '%s'", name)
+                return
+            applied, err = self._apply_settings(vals)
+            if err:
+                rospy.logwarn("direct_raster: preset '%s' rejected: %s",
+                              name, err)
+            else:
+                rospy.loginfo("direct_raster: preset '%s' applied", name)
+                self._publish_status()
+        elif action == 'save':
+            if not name:
+                rospy.logwarn('direct_raster: preset save without a name')
+                return
+            cur = self._settings_dict()
+            self.custom_presets[name] = {k: cur[k] for k in self.PRESET_KEYS}
+            self._save_presets()
+            rospy.loginfo("direct_raster: preset '%s' saved", name)
+            self._publish_status()
+        elif action == 'delete':
+            if name in self.custom_presets:
+                del self.custom_presets[name]
+                self._save_presets()
+                rospy.loginfo("direct_raster: preset '%s' deleted", name)
+                self._publish_status()
+            else:
+                rospy.logwarn("direct_raster: preset '%s' is not a custom "
+                              'preset (builtins cannot be deleted)', name)
+        else:
+            rospy.logwarn("direct_raster: unknown preset action '%s'", action)
+
     def _settings_dict(self):
         return {
             'use_lidar': self.use_lidar,
@@ -229,11 +451,18 @@ class DirectRasterNode:
             'free_max_range_m': self.free_max_range_m,
             'hit_inc': self.hit_inc,
             'miss_dec': self.miss_dec,
+            'lidar_free_dec': self.lidar_free_dec,
+            'occ_erode_factor': self.occ_erode_factor,
             'lo_clamp': self.lo_clamp,
             'hi_clamp': self.hi_clamp,
             'occ_thresh': self.occ_thresh,
             'free_thresh': self.free_thresh,
             'min_hits': self.min_hits,
+            'cam_obstacle_min_h': self.cam_obstacle_min_h,
+            'cam_obstacle_max_h': self.cam_obstacle_max_h,
+            'cam_min_cluster_pts': self.cam_min_cluster_pts,
+            'cam_cluster_radius_m': self.cam_cluster_radius_m,
+            'lidar_min_intensity': self.lidar_min_intensity,
         }
 
     def _apply_settings(self, req, persist=True, log=True):
@@ -252,11 +481,25 @@ class DirectRasterNode:
             free_max = float(req.get('free_max_range_m', s['free_max_range_m']))
             hit_inc = float(req.get('hit_inc', s['hit_inc']))
             miss_dec = float(req.get('miss_dec', s['miss_dec']))
+            lidar_free_dec = float(req.get('lidar_free_dec',
+                                           s['lidar_free_dec']))
+            occ_erode = float(req.get('occ_erode_factor',
+                                      s['occ_erode_factor']))
             lo_clamp = float(req.get('lo_clamp', s['lo_clamp']))
             hi_clamp = float(req.get('hi_clamp', s['hi_clamp']))
             occ_thresh = float(req.get('occ_thresh', s['occ_thresh']))
             free_thresh = float(req.get('free_thresh', s['free_thresh']))
             min_hits = int(req.get('min_hits', s['min_hits']))
+            cam_hmin = float(req.get('cam_obstacle_min_h',
+                                     s['cam_obstacle_min_h']))
+            cam_hmax = float(req.get('cam_obstacle_max_h',
+                                     s['cam_obstacle_max_h']))
+            cam_clu_pts = int(req.get('cam_min_cluster_pts',
+                                      s['cam_min_cluster_pts']))
+            cam_clu_r = float(req.get('cam_cluster_radius_m',
+                                      s['cam_cluster_radius_m']))
+            lidar_min_int = float(req.get('lidar_min_intensity',
+                                          s['lidar_min_intensity']))
         except (TypeError, ValueError) as e:
             return None, 'non-numeric value: %s' % e
         for name, v in (('lidar_max_range_m', lidar_max),
@@ -268,6 +511,12 @@ class DirectRasterNode:
             return None, 'hit_inc out of range 0.05..5: %s' % hit_inc
         if not (0.05 <= miss_dec <= 5.0):
             return None, 'miss_dec out of range 0.05..5: %s' % miss_dec
+        if not (0.0 <= lidar_free_dec <= 5.0):
+            return None, ('lidar_free_dec out of range 0..5: %s'
+                          % lidar_free_dec)
+        if not (0.0 <= occ_erode <= 1.0):
+            return None, ('occ_erode_factor out of range 0..1: %s'
+                          % occ_erode)
         if not (lo_clamp < 0.0 <= hi_clamp):
             return None, ('need lo_clamp<0<=hi_clamp, got [%s, %s]'
                           % (lo_clamp, hi_clamp))
@@ -276,6 +525,18 @@ class DirectRasterNode:
                           % (free_thresh, occ_thresh))
         if not (1 <= min_hits <= 50):
             return None, 'min_hits out of range 1..50: %s' % min_hits
+        if not (0.0 <= cam_hmin < cam_hmax <= 2.5):
+            return None, ('need 0<=cam_obstacle_min_h<max_h<=2.5, got [%s, %s]'
+                          % (cam_hmin, cam_hmax))
+        if not (1 <= cam_clu_pts <= 200):
+            return None, ('cam_min_cluster_pts out of range 1..200: %s'
+                          % cam_clu_pts)
+        if not (0.02 <= cam_clu_r <= 1.0):
+            return None, ('cam_cluster_radius_m out of range 0.02..1: %s'
+                          % cam_clu_r)
+        if not (0.0 <= lidar_min_int <= 1000.0):
+            return None, ('lidar_min_intensity out of range 0..1000: %s'
+                          % lidar_min_int)
 
         # source enables/ranges apply immediately at the node level
         self.use_lidar = use_lidar
@@ -287,22 +548,45 @@ class DirectRasterNode:
         self.free_max_range_m = free_max
         self.hit_inc = hit_inc
         self.miss_dec = miss_dec
+        self.lidar_free_dec = lidar_free_dec
+        self.occ_erode_factor = occ_erode
         self.lo_clamp = lo_clamp
         self.hi_clamp = hi_clamp
         self.occ_thresh = occ_thresh
         self.free_thresh = free_thresh
         self.min_hits = min_hits
+        self.cam_obstacle_min_h = cam_hmin
+        self.cam_obstacle_max_h = cam_hmax
+        self.cam_min_cluster_pts = cam_clu_pts
+        self.cam_cluster_radius_m = cam_clu_r
+        self.lidar_min_intensity = lidar_min_int
         with self.grid_lock:
             self.grid.set_params(hit_inc=hit_inc, miss_dec=miss_dec,
                                  lo_clamp=lo_clamp, hi_clamp=hi_clamp,
                                  occ_thresh=occ_thresh, free_thresh=free_thresh,
-                                 min_hits=min_hits)
+                                 min_hits=min_hits,
+                                 lidar_free_dec=lidar_free_dec,
+                                 occ_erode_factor=occ_erode)
         applied = self._settings_dict()
         if log:
             rospy.loginfo('direct_raster: settings -> %s', json.dumps(applied))
         if persist:
             self._save_overrides()
         return applied, None
+
+    def cb_reset_direct(self, _msg):
+        """UI session controls (2026-08-09): wipe the in-progress raster (grid
+        + per-source counters) while the session keeps running. Settings, gate
+        state, per-site overrides and the trajectory DEM are untouched — this
+        is 'start the obstacle raster over', e.g. after a live-tuning change
+        or a botched first pass. An empty grid publish is safe: the session
+        starts with exactly this (0,0) grid state."""
+        with self.grid_lock:
+            self.grid = self._make_grid()
+        for k in self._counters:
+            self._counters[k] = self._new_counter()
+        rospy.logwarn('direct_raster: raster RESET (grid wiped) by request')
+        self.tick_publish(None)
 
     def cb_set_direct(self, msg):
         try:
@@ -381,15 +665,17 @@ class DirectRasterNode:
         return dec.passed
 
     # ---- TF helpers --------------------------------------------------------
-    def _lookup_sensor_tf(self, frame, stamp):
-        """4x4 map<-sensor matrix at the cloud stamp, or None."""
+    def _lookup_sensor_tf(self, frame, stamp, target=None):
+        """4x4 target<-sensor matrix at the cloud stamp (target defaults to
+        the map frame), or None."""
+        target = target or self.map_frame
         try:
-            tr = self.tf_buf.lookup_transform(self.map_frame, frame, stamp,
+            tr = self.tf_buf.lookup_transform(target, frame, stamp,
                                               rospy.Duration(0.2))
         except (tf2_ros.LookupException, tf2_ros.ConnectivityException,
                 tf2_ros.ExtrapolationException) as e:
             rospy.logwarn_throttle(10.0, 'direct_raster: TF %s->%s failed: %s',
-                                   self.map_frame, frame, e)
+                                   target, frame, e)
             return None
         q = tr.transform.rotation
         t = tr.transform.translation
@@ -437,10 +723,36 @@ class DirectRasterNode:
         if xyz.shape[0] == 0:
             c['passed'] += 1
             return
+        if key == 'cam_obstacle':
+            # LIVE height window (2026-08-09): the wide obstacles chain hands
+            # over 0.05..2.0 m candidates; the decision window is applied HERE
+            # in base_link z — the same frame obstacles_detection segments in
+            # (frame_id base_link), so the semantics match the retired narrow
+            # Grid/Min|MaxObstacleHeight exactly, but are runtime-tunable.
+            mb = self._lookup_sensor_tf(msg.header.frame_id, msg.header.stamp,
+                                        target=self.base_frame)
+            if mb is None:
+                return
+            zb = xyz @ mb[2, 0:3] + mb[2, 3]
+            xyz = xyz[(zb >= self.cam_obstacle_min_h)
+                      & (zb <= self.cam_obstacle_max_h)]
+            if xyz.shape[0] == 0:
+                c['passed'] += 1
+                return
         # transform to map frame, keep XY (ground-project)
         pts = np.column_stack([xyz, np.ones(xyz.shape[0])])
         pm = pts @ m.T                              # Nx4
         xm, ym = pm[:, 0], pm[:, 1]
+        if key == 'cam_obstacle' and self.cam_min_cluster_pts > 1:
+            # LIVE blob filter: drop obstacle blobs smaller than
+            # cam_min_cluster_pts points (grid-hash connected components of
+            # cell size cam_cluster_radius_m) — speckle/grass-tip suppressor.
+            keep = _cluster_filter_xy(xm, ym, self.cam_cluster_radius_m,
+                                      self.cam_min_cluster_pts)
+            xm, ym = xm[keep], ym[keep]
+            if xm.size == 0:
+                c['passed'] += 1
+                return
         with self.grid_lock:
             if key == 'cam_obstacle':
                 self.grid.add_obstacle_points(xm, ym)
@@ -473,8 +785,16 @@ class DirectRasterNode:
         rmin = float(msg.range_min)
         rmax = float(msg.range_max)
         finite = np.isfinite(r)
+        inten = (np.asarray(msg.intensities, dtype=np.float64)
+                 if len(msg.intensities) == n else None)
         # hit: a real return within [range_min, cap]
         hit = finite & (r >= rmin) & (r <= cap)
+        if self.lidar_min_intensity > 0.0 and inten is not None:
+            # LIVE weak-return gate (2026-08-09), on TOP of scan_filter's
+            # static lower_threshold: a finite return weaker than this is
+            # neither hit nor free ray -> UNKNOWN (it DID hit something —
+            # tall grass etc. — carving free through it would be a lie).
+            hit &= inten >= self.lidar_min_intensity
         # no-return free ray: max-range / beyond-cap beam OR NaN — but ONLY a
         # NaN that was a genuine no-return. AUDIT P0-1 (2026-08-08): the
         # intensity filter (scan_filter.yaml, lower_threshold 4) NaNs BOTH
@@ -488,8 +808,7 @@ class DirectRasterNode:
         # Fallback: no/short intensities array -> old behavior (NaN = no-return).
         beyond = finite & (r > cap)
         nan_mask = np.isnan(r)
-        if len(msg.intensities) == n:
-            inten = np.asarray(msg.intensities, dtype=np.float64)
+        if inten is not None:
             nan_noreturn = nan_mask & (inten <= 0.0)
         else:
             nan_noreturn = nan_mask
@@ -547,6 +866,7 @@ class DirectRasterNode:
             'reasons': dec.reasons if dec is not None else [],
             'counters': self._counters,
             'settings': self._settings_dict(),
+            'presets': self._presets_dict(),
             'grid': st,
         }
         self.pub_status.publish(String(json.dumps(status)))

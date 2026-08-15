@@ -45,10 +45,27 @@ _GROW_CELLS = 128          # grow in blocks to amortize reallocation (as DemGrid
 class DirectGrid:
     def __init__(self, resolution=0.05, hit_inc=0.5, miss_dec=0.4,
                  lo_clamp=-2.0, hi_clamp=3.5, occ_thresh=0.85,
-                 free_thresh=-0.4, min_hits=3):
+                 free_thresh=-0.4, min_hits=3,
+                 lidar_free_dec=0.12, occ_erode_factor=0.5):
+        # ANTI-EROSION (2026-08-09 field test zahradaDneska, 96 occ cells
+        # survived a 10-min drive): free evidence is no longer one-size-fits-all.
+        #  * lidar_free_dec — the decrement used for ALL lidar-ray free evidence
+        #    (both the ray to a hit and the full no-return/beyond-cap ray).
+        #    Deliberately much weaker than miss_dec: a lidar beam only vouches
+        #    for "empty at the ~0.35 m scan plane" and says NOTHING about the
+        #    0.15-0.35 m band where the camera maps low obstacles; with a short
+        #    range cap nearly every beam is a "beyond" free ray, which made the
+        #    lidar a 360° 6 Hz eraser that out-muscled the camera's narrow-FOV
+        #    hits (miss 0.5 vs hit 0.4 = nothing could ever accumulate).
+        #  * occ_erode_factor — hysteresis: cells CURRENTLY rendered occupied
+        #    (lo >= occ_thresh AND hits >= min_hits) erode at this fraction of
+        #    the applicable decrement. A confirmed obstacle should take many
+        #    contradicting frames to clear, not a couple of drive-by rays.
         self.res = float(resolution)
         self.hit_inc = float(hit_inc)
         self.miss_dec = float(miss_dec)
+        self.lidar_free_dec = float(lidar_free_dec)
+        self.occ_erode_factor = float(occ_erode_factor)
         self.lo_clamp = float(lo_clamp)
         self.hi_clamp = float(hi_clamp)
         self.occ_thresh = float(occ_thresh)
@@ -121,10 +138,13 @@ class DirectGrid:
         self.obs[ux, uy] = True
         self.n_obstacle_frames += 1
 
-    def _apply_free(self, ix, iy, exclude_flat=None):
-        """Apply free/miss evidence (-miss_dec) to the given cells, once per
-        distinct cell. `exclude_flat` (flat indices) are skipped — used so a
-        lidar ray never frees its own hit cell within the same scan."""
+    def _apply_free(self, ix, iy, exclude_flat=None, dec=None):
+        """Apply free/miss evidence to the given cells, once per distinct
+        cell. `dec` is the decrement (defaults to miss_dec; lidar rays pass
+        their weaker lidar_free_dec). `exclude_flat` (flat indices) are
+        skipped — used so a lidar ray never frees its own hit cell within the
+        same scan. Cells currently rendered OCCUPIED erode at
+        occ_erode_factor of the decrement (hysteresis)."""
         ny = self.lo.shape[1]
         flat = np.unique(ix * ny + iy)
         if exclude_flat is not None and exclude_flat.size:
@@ -132,8 +152,13 @@ class DirectGrid:
         if flat.size == 0:
             return
         ux, uy = flat // ny, flat % ny
-        self.lo[ux, uy] = np.maximum(self.lo[ux, uy] - self.miss_dec,
-                                     self.lo_clamp)
+        step = np.full(ux.size, self.miss_dec if dec is None else float(dec),
+                       np.float32)
+        occ_now = (self.lo[ux, uy] >= self.occ_thresh) \
+            & (self.hits[ux, uy] >= self.min_hits)
+        if occ_now.any():
+            step[occ_now] *= self.occ_erode_factor
+        self.lo[ux, uy] = np.maximum(self.lo[ux, uy] - step, self.lo_clamp)
         # AUDIT P2-1 (2026-08-08): expire the historical hit counter while the
         # cell is confidently FREE — `hits` used to only ever grow, so
         # min_hits=3 meant 3 obstacle frames per cell LIFETIME: a long-erased
@@ -226,7 +251,9 @@ class DirectGrid:
                 fx = (sx + ux[None, :] * steps[:, None])[valid]
                 fy = (sy + uy[None, :] * steps[:, None])[valid]
                 fix, fiy = self._cells(fx, fy)
-                self._apply_free(fix, fiy, exclude_flat=occ_flat)
+                # lidar rays use the WEAK free decrement (see __init__)
+                self._apply_free(fix, fiy, exclude_flat=occ_flat,
+                                 dec=self.lidar_free_dec)
 
         if occ_flat.size:
             ux2, uy2 = occ_flat // ny, occ_flat % ny
@@ -288,13 +315,17 @@ class DirectGrid:
 
     def set_params(self, hit_inc=None, miss_dec=None, lo_clamp=None,
                    hi_clamp=None, occ_thresh=None, free_thresh=None,
-                   min_hits=None):
+                   min_hits=None, lidar_free_dec=None, occ_erode_factor=None):
         """Live-update the log-odds tunables. Threshold/min_hits changes take
         effect on the next render(); increments affect future integration."""
         if hit_inc is not None:
             self.hit_inc = float(hit_inc)
         if miss_dec is not None:
             self.miss_dec = float(miss_dec)
+        if lidar_free_dec is not None:
+            self.lidar_free_dec = float(lidar_free_dec)
+        if occ_erode_factor is not None:
+            self.occ_erode_factor = float(occ_erode_factor)
         if lo_clamp is not None:
             self.lo_clamp = float(lo_clamp)
         if hi_clamp is not None:

@@ -188,6 +188,8 @@ class MappingManager:
         # AUDIT A14: direct_raster snapshot ack/nack — lets the stop wait abort
         # immediately on an empty-session reject instead of the full timeout.
         self._save_ack = None
+        rospy.Subscriber('/mapping/reset_direct', String, self.cb_reset_direct,
+                         queue_size=1)
         rospy.Subscriber('/mapping/save_direct_ack', String, self.cb_save_ack,
                          queue_size=2)
         rospy.Subscriber('/mapping/gate_status', String, self.cb_gate_status,
@@ -508,6 +510,25 @@ class MappingManager:
         except OSError as e:
             rospy.logwarn('mapping_manager: datum link failed: %s', e)
 
+    def cb_reset_direct(self, _msg):
+        """UI 'Reset map' fix (2026-08-10): make a reset LOOK like a reset.
+        direct_raster wipes the in-progress raster on this same topic, but on a
+        CONTINUATION session the site's previous raster is auto-served (red
+        Saved layer) — so after a reset the user still sees a full map and
+        reads it as 'reset did not work'. When the running session's site is
+        also the served one, clear serving to the fresh-site state (empty
+        site_map; datum link stays on the active site — same as the fresh
+        cb_start branch). Stop & save re-serves the new raster and Discard
+        auto-restores the newest existing one, so serving always recovers."""
+        with self._lifecycle_lock:
+            if not self.running():
+                return
+            if self.serving and self.serving.get('site') == self.site:
+                rospy.loginfo('mapping_manager: reset_direct — clearing served '
+                              '%s while it is being remapped', self.site)
+                self._publish_empty_site_map()
+                self.link_site_datum(self.site)
+
     def cb_save_ack(self, msg):
         """AUDIT A14: remember direct_raster's snapshot ack/nack."""
         try:
@@ -515,14 +536,18 @@ class MappingManager:
         except ValueError:
             pass
 
-    def cb_stop(self, _msg):
+    def cb_stop(self, msg):
         # AUDIT P2-2: serialized — a double-click Stop used to race two
         # stop_proc calls (second killpg on a reaped pid / torn site state).
+        # UI session controls (2026-08-09): payload 'discard' = end the session
+        # WITHOUT the raster snapshot (botched run) — serving stays on whatever
+        # was served before; any other payload = normal save-and-stop.
+        discard = (msg.data or '').strip().lower() == 'discard'
         with self._lifecycle_lock:
             if not self.running():
                 rospy.loginfo('mapping_manager: nothing to stop')
                 return
-            self.stop_proc()
+            self.stop_proc(save=not discard)
 
     def _snapshot_raster_on_stop(self, site):
         """Ask direct_raster for a full raster snapshot (direct_<timestamp>)
@@ -561,13 +586,13 @@ class MappingManager:
                       site)
         return None
 
-    def stop_proc(self):
+    def stop_proc(self, save=True):
         # AUDIT P2-2: serialized with cb_start/cb_stop/reaper (RLock — the
         # cb_start continuation path calls this while already holding it).
         with self._lifecycle_lock:
-            return self._stop_proc_locked()
+            return self._stop_proc_locked(save=save)
 
-    def _stop_proc_locked(self):
+    def _stop_proc_locked(self, save=True):
         if self.proc is None:
             rospy.loginfo('mapping_manager: stop_proc — already stopped')
             return
@@ -578,11 +603,19 @@ class MappingManager:
         # below). DIRECT-RASTER-ONLY (2026-07-19): direct_<ts> is the sole
         # snapshot; trajectory_dem still saves its DEM on shutdown by itself.
         # The retired octomap/band chain no longer writes garden.ot.
-        if self.raster_on_stop:
+        if self.raster_on_stop and save:
             try:
                 self._snapshot_raster_on_stop(self.site)
             except Exception as e:
                 rospy.logwarn('mapping_manager: raster_on_stop failed: %s', e)
+        elif not save:
+            # discard: no snapshot AND no dock-waypoint save from this session —
+            # the auto-serve below then simply re-serves the newest raster that
+            # already existed (continuation) or restores the previous site
+            # (fresh), i.e. serving never adopts anything from the discarded run.
+            rospy.logwarn('mapping_manager: DISCARD stop — skipping raster '
+                          'snapshot for %s', self.site)
+            self._pending_dock_wp = None
         try:
             # SIGINT to the whole roslaunch session for a clean node shutdown
             os.killpg(os.getpgid(self.proc.pid), signal.SIGINT)

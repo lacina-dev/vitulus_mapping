@@ -163,12 +163,33 @@ direct_raster:
   # log-odds model. An obstacle cell shows only after min_hits DISTINCT frames
   # AND log-odds >= occ_thresh; free/miss erodes transients back to unknown/free.
   hit_inc: 0.5                       # +log-odds per obstacle frame
-  miss_dec: 0.4                      # -log-odds per free/miss frame (erosion)
+  miss_dec: 0.4                      # -log-odds per CAMERA-ground free frame
+  # ANTI-EROSION (2026-08-09 field test: 96 occ cells after 10 min — lidar
+  # free rays out-muscled the camera hits). Lidar-ray free evidence (ray to a
+  # hit AND no-return/beyond-cap rays) uses its own WEAK decrement — a beam
+  # only vouches for "empty at the scan plane", nothing below it. Confirmed
+  # occupied cells (>=min_hits & >=occ_thresh) erode at occ_erode_factor of
+  # any decrement (hysteresis: one confirmed object won't vanish from a few
+  # drive-by rays). Both live-settable via set_direct + UI sliders.
+  lidar_free_dec: 0.12               # -log-odds per lidar free-ray frame
+  occ_erode_factor: 0.5              # erosion multiplier on confirmed-occ cells
   lo_clamp: -2.0
   hi_clamp: 3.5
   occ_thresh: 0.85                   # render OCCUPIED at/above this (2 hits)
   free_thresh: -0.4                  # render FREE at/below this (1 miss)
   min_hits: 3                        # frames of obstacle evidence before it shows
+  # camera-obstacle LIVE re-filter (2026-08-09): the WIDE obstacles chain
+  # (obstacles_detection_wide in the RTABMAP_OBSTACLES container, window
+  # 0.05..2.0 m, depth 4.0 m) hands over MORE candidates than the retired
+  # narrow topics did; the final decision window/blob size is applied in
+  # direct_raster in base_link z and is live-settable (set_direct + UI
+  # sliders + environment presets). Defaults reproduce the old narrow
+  # 0.15..0.5 m behaviour exactly.
+  cam_obstacle_min_h: 0.15           # obstacle floor above base_link z (m)
+  cam_obstacle_max_h: 0.5            # obstacle ceiling (m)
+  cam_min_cluster_pts: 1             # min points per blob (1 = off)
+  cam_cluster_radius_m: 0.15         # blob connect radius (m)
+  lidar_min_intensity: 0.0           # weak lidar return gate (0 = off)
   lidar_scan_topic: /rplidar/scan_filtered
-  obstacle_cloud_topic: /obstacles_cloud
-  ground_cloud_topic: /ground_cloud
+  obstacle_cloud_topic: /mapping/obstacles_cloud_wide
+  ground_cloud_topic: /mapping/ground_cloud_wide
