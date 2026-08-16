@@ -864,8 +864,12 @@ class MappingManager:
 
     def cb_serve_site(self, msg):
         """'' -> newest raster of newest site with any raster; '<site>' ->
-        newest raster of that site; '<site>/<raster>' -> that exact raster."""
+        newest raster of that site; '<site>/<raster>' -> that exact raster;
+        'none' -> DEACTIVATE (factory-fresh: no map served, survives boot)."""
         payload = msg.data.strip()
+        if payload.lower() == 'none':
+            self._deactivate_serving()
+            return
         try:
             if not payload:
                 site = self._newest_site_with_raster()
@@ -1078,10 +1082,49 @@ class MappingManager:
         except Exception:
             return None, None
 
+    def _deactivate_serving(self):
+        """FACTORY-FRESH mode (2026-08-16, user request): explicitly serve NO
+        map — empty site_map, serving cleared, site-datum symlink removed, and
+        a persisted {"none": true} marker so the state SURVIVES REBOOTS
+        (auto_serve_last honours it instead of falling back to the newest
+        raster). Simulates a just-installed robot for first-run testing:
+        localization runs on GPS/odometry only until a map is activated again
+        or a new one is recorded (any serve overwrites the marker)."""
+        self._publish_empty_site_map()
+        try:
+            with open(self._last_served_path(), 'w') as f:
+                json.dump({'none': True}, f)
+        except OSError as e:
+            rospy.logwarn('mapping_manager: could not persist deactivate: %s',
+                          e)
+        link = os.path.expanduser(rospy.get_param(
+            '~site_datum_link', '~/.vitulus/saves/site_datum.yaml'))
+        try:
+            if os.path.islink(link) or os.path.exists(link):
+                os.remove(link)
+                rospy.loginfo('mapping_manager: site datum link removed '
+                              '(factory-fresh)')
+        except OSError as e:
+            rospy.logwarn('mapping_manager: datum link remove failed: %s', e)
+        rospy.logwarn('mapping_manager: serving DEACTIVATED — no active map '
+                      '(factory-fresh test state)')
+        self.tick_status(None)
+
     def auto_serve_last(self):
         """At boot, re-serve the last-served site (if it still has a raster) so
         /mapping_manager/site_map is latched immediately. Falls back to the newest
-        site with any raster. No-op (logged) when nothing has a raster yet."""
+        site with any raster. No-op (logged) when nothing has a raster yet.
+        FACTORY-FRESH: a persisted {"none": true} marker (explicit Deactivate)
+        keeps the boot map-less instead of falling back."""
+        try:
+            with open(self._last_served_path()) as f:
+                if json.load(f).get('none'):
+                    rospy.logwarn('mapping_manager: boot in DEACTIVATED '
+                                  '(factory-fresh) state — no map served')
+                    self._publish_empty_site_map()
+                    return
+        except (OSError, ValueError, AttributeError):
+            pass
         site, raster = self.load_last_served()
         # Validate the persisted raster still exists; otherwise refresh to newest.
         if site is not None:
