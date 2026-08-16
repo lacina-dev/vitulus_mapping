@@ -872,6 +872,21 @@ class MappingManager:
             return
         try:
             if not payload:
+                # FACTORY-FRESH guard (2026-08-16): an EMPTY payload is the
+                # AUTOMATIC "newest" request (navi_man's boot serve-retry).
+                # While the user explicitly deactivated serving, automation
+                # must not re-serve behind their back — only an explicit
+                # '<site>[/<raster>]' request (or a recording flow) overrides
+                # the marker.
+                try:
+                    with open(self._last_served_path()) as f:
+                        if json.load(f).get('none'):
+                            rospy.logwarn('mapping_manager: automatic serve '
+                                          'request ignored — serving is '
+                                          'DEACTIVATED (factory-fresh)')
+                            return
+                except (OSError, ValueError, AttributeError):
+                    pass
                 site = self._newest_site_with_raster()
                 if site is None:
                     self._serve_reject('no site has a raster yet — Snapshot '
