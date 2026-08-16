@@ -967,6 +967,31 @@ class MappingManager:
             self._serve_reject('preview: load failed for %s: %s'
                                % (payload, e))
             return
+        # GEOREF RE-FRAME (2026-08-16 field feedback): a raster lives in its
+        # OWN session frame, but the 3D view lives in the SERVED map's frame.
+        # Previewing a different site's raster used to overlay it shifted by
+        # the inter-datum offset ("mapa nesedí — když jsem ji dělal, seděla").
+        # Re-anchor the preview origin through UTM using both site datums.
+        yaw_d = 0.0
+        cur = self.serving.get('site') if self.serving else None
+        if cur and cur != site:
+            src_d = self._load_datum(site)
+            dst_d = self._load_datum(cur)
+            if src_d is not None and dst_d is not None:
+                e, n = geo.map_to_utm(origin_xy[0], origin_xy[1], src_d)
+                origin_xy = geo.utm_to_map(e, n, dst_d)
+                yaw_d = geo.utm_yaw_to_map(
+                    geo.map_yaw_to_utm(0.0, src_d), dst_d)
+                rospy.loginfo('mapping_manager: preview %s re-framed into %s '
+                              "frame (origin -> %.2f, %.2f | yaw %.2f deg)",
+                              payload, cur, origin_xy[0], origin_xy[1],
+                              math.degrees(yaw_d))
+            else:
+                rospy.logwarn('mapping_manager: preview %s NOT re-framed — '
+                              'missing datum (src ok=%s, dst ok=%s); the '
+                              'overlay may sit offset by the inter-datum '
+                              'delta', payload, src_d is not None,
+                              dst_d is not None)
         nx, ny = data.shape
         grid = OccupancyGrid()
         grid.header.stamp = rospy.Time.now()
@@ -976,7 +1001,11 @@ class MappingManager:
         grid.info.height = ny
         grid.info.origin.position.x = origin_xy[0]
         grid.info.origin.position.y = origin_xy[1]
-        grid.info.origin.orientation.w = 1.0
+        _q = geo.yaw_to_quat(yaw_d)
+        grid.info.origin.orientation.x = _q[0]
+        grid.info.origin.orientation.y = _q[1]
+        grid.info.origin.orientation.z = _q[2]
+        grid.info.origin.orientation.w = _q[3]
         grid.data = data.T.ravel().tolist()   # row-major over y, matches serve
         self.pub_raster_preview.publish(grid)
         self.previewing = {'site': site, 'raster': raster}
