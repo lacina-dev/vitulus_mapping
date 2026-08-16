@@ -953,11 +953,11 @@ class MappingManager:
         grid = OccupancyGrid()
         grid.header.stamp = rospy.Time.now()
         grid.header.frame_id = self.map_frame
-        grid.info.resolution = 0.0
-        grid.info.width = 0
-        grid.info.height = 0
+        grid.info.resolution = 0.05
+        grid.info.width = 1
+        grid.info.height = 1
         grid.info.origin.orientation.w = 1.0
-        grid.data = []
+        grid.data = [-1]      # 2026-08-16: 1x1 unknown, not 0x0 (see above)
         self.pub_raster_preview.publish(grid)
         if self.previewing is not None:
             self.previewing = None
@@ -1169,14 +1169,19 @@ class MappingManager:
         -> tracker goes no_map/idle (correct while a fresh site is being mapped);
         navi_man's callback_site_map detects the empty/tiny grid and falls back to
         its truthful bootstrap map instead of the stale raster."""
+        # 2026-08-16: 1x1 UNKNOWN instead of 0x0 — a zero-size grid builds a
+        # zero-scale THREE mesh in the UI (endless 'determinant is 0' console
+        # spam); a single unknown cell renders as nothing and clears the same.
+        # Downstream empty-detection uses occupied-cell counts / <20 cells, so
+        # 1 unknown cell keeps the same semantics as 0x0.
         grid = OccupancyGrid()
         grid.header.stamp = rospy.Time.now()
         grid.header.frame_id = self.map_frame
-        grid.info.resolution = 0.0
-        grid.info.width = 0
-        grid.info.height = 0
+        grid.info.resolution = 0.05
+        grid.info.width = 1
+        grid.info.height = 1
         grid.info.origin.orientation.w = 1.0
-        grid.data = []
+        grid.data = [-1]
         self.pub_site_map.publish(grid)
         self.serving = None
         self.edits_applied = 0                # WP-D1: nothing served -> no edits

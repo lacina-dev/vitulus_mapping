@@ -840,6 +840,11 @@ class DirectRasterNode:
         self._publish_status()
 
     def _publish_grid(self, raster, ox, oy, res):
+        # 2026-08-16: never publish a 0x0 grid (zero-scale mesh in the UI ->
+        # THREE 'determinant is 0' spam); an empty raster goes out as one
+        # UNKNOWN cell, which renders as nothing.
+        if raster.size == 0:
+            raster = np.full((1, 1), -1, np.int8)
         nx, ny = raster.shape
         msg = OccupancyGrid()
         stamp = rospy.Time.now()
