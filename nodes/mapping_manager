@@ -15,7 +15,9 @@ Interfaces (absolute, UI-friendly):
   out  /mapping_manager/status       std_msgs/String  latched JSON 1 Hz:
        {running, site, uptime_s, pid, serving, previewing, sites:
         [{name, dem_kb, dem_m2?, rasters, has_ot, mtime, raster_list:
-          [{name, mtime, cells_free, cells_obstacle}] up to 12 newest}]}
+          [{name, mtime, cells_free, cells_obstacle, enabled}] up to 12
+          newest sessions, combined: {name, mtime, sources, excluded,
+          cells_free, cells_obstacle, built}|null}]}
   out  /mapping_manager/terrain_png  sensor_msgs/CompressedImage (latched)
   out  /mapping_manager/raster_png   sensor_msgs/CompressedImage (latched)
   out  /mapping_manager/preview_info std_msgs/String  latched JSON
@@ -33,6 +35,16 @@ Interfaces (absolute, UI-friendly):
                                      raster preview (empty 0x0 grid clears)
   in   /mapping_manager/remove_raster  std_msgs/String  'site/raster' (refuses
                                      the served raster; clears preview first)
+  in   /mapping_manager/layer_enable   std_msgs/String  'site/raster:on|off' ->
+                                     include/exclude one session from the
+                                     site's COMBINED map (rebuilds it)
+  in   /mapping_manager/rebuild_combined std_msgs/String  site ('' = served)
+
+COMBINED MAP (2026-09-13, composite.py): every site keeps ONE derived raster
+'combined' = all its session rasters merged through UTM, newer observed
+cells win. It is rebuilt at Save & finish / layer delete / layer toggle and
+is what '<site>' (and '' / boot) serves by default; the session rasters are
+layers and stay servable one by one ('<site>/<raster>').
 
 The previews make saved maps visible in the UI at ANY time (the live
 /mapping/* preview topics exist only while the pipeline runs).
@@ -61,7 +73,7 @@ from sensor_msgs.msg import CompressedImage
 from std_msgs.msg import String
 from tf.transformations import euler_from_quaternion
 
-from vitulus_mapping import bundle, editmask, geo
+from vitulus_mapping import bundle, composite, editmask, geo
 from vitulus_mapping.demgrid import DemGrid
 from vitulus_mapping.pgmio import load_occupancy_pgm
 from vitulus_mapping.preview import dem_to_png
@@ -178,6 +190,10 @@ class MappingManager:
                          self.cb_preview_raster, queue_size=1)
         rospy.Subscriber('/mapping_manager/remove_raster', String,
                          self.cb_remove_raster, queue_size=1)
+        rospy.Subscriber('/mapping_manager/layer_enable', String,
+                         self.cb_layer_enable, queue_size=4)
+        rospy.Subscriber('/mapping_manager/rebuild_combined', String,
+                         self.cb_rebuild_combined, queue_size=2)
         # WP-D1: human map-edit API (save/remove; edit_list is latched output).
         rospy.Subscriber('/mapping_manager/save_edit', String,
                          self.cb_save_edit, queue_size=4)
@@ -215,6 +231,9 @@ class MappingManager:
         # costmap/MBF chain fails to come up. Auto-serve the last-served site (from
         # the persisted .last_served state) so site_map is latched immediately at
         # boot, without waiting for anyone to send serve_site.
+        # COMBINED (2026-09-13): make sure every site has an up-to-date
+        # combined raster before the boot serve picks it.
+        self._backfill_combined_all()
         self.auto_serve_last()
         # WP-D1: ensure edit_list is latched even if nothing is served at boot
         # (auto_serve_last -> _publish_site_map already publishes it when a site
@@ -444,10 +463,10 @@ class MappingManager:
         #      cb_grid rejects <20 occupied cells -> tracker goes no_map/idle
         #      (correct during fresh mapping); navi_man's site_map callback treats
         #      the empty grid as no-raster and falls back to its bootstrap map.
-        raster = self._newest_raster_in(site)
+        raster = self._preferred_raster(site)
         if raster is not None:
             rospy.loginfo('mapping_manager: start %s (continuation) — '
-                          'auto-serving newest raster %s', site, raster)
+                          'auto-serving %s', site, raster)
             self._publish_site_map(site, raster)   # relinks datum to X
         else:
             rospy.loginfo('mapping_manager: start %s (fresh, no raster) — '
@@ -603,9 +622,10 @@ class MappingManager:
         # below). DIRECT-RASTER-ONLY (2026-07-19): direct_<ts> is the sole
         # snapshot; trajectory_dem still saves its DEM on shutdown by itself.
         # The retired octomap/band chain no longer writes garden.ot.
+        snapshot = None
         if self.raster_on_stop and save:
             try:
-                self._snapshot_raster_on_stop(self.site)
+                snapshot = self._snapshot_raster_on_stop(self.site)
             except Exception as e:
                 rospy.logwarn('mapping_manager: raster_on_stop failed: %s', e)
         elif not save:
@@ -649,6 +669,18 @@ class MappingManager:
                 self._verify_stop_in_dock(stopped)
             except Exception as e:
                 rospy.logwarn('mapping_manager: stop-in-dock check failed: %s', e)
+            # COMBINED (2026-09-13): the pipeline is down, so insertion_gate
+            # has finalized datum.yaml -> pin it to the just-saved version and
+            # rebuild the site's combined map (newer observed cells win).
+            if snapshot is not None:
+                try:
+                    composite.record_version_datum(
+                        os.path.join(self.base_dir, stopped), snapshot)
+                except Exception as e:
+                    rospy.logwarn('mapping_manager: version datum for %s/%s '
+                                  'not recorded: %s', stopped, snapshot, e)
+            if snapshot is not None or self._newest_raster_in(stopped):
+                self._rebuild_combined(stopped, reserve=False)
             self.show_site(stopped)   # freshly saved data -> update previews
             # datumfix (2026-07-12): auto-serve the just-mapped site so its
             # freshly-saved raster is latched on /mapping_manager/site_map (and
@@ -656,7 +688,7 @@ class MappingManager:
             # Without this, serving stayed null until someone sent serve_site,
             # leaving the localization/costmap chain on the bootstrap map.
             if self._newest_raster_in(stopped) is not None:
-                raster = self._newest_raster_in(stopped)
+                raster = self._preferred_raster(stopped)
                 rospy.loginfo('mapping_manager: auto-serving %s/%s after stop',
                               stopped, raster)
                 self._publish_site_map(stopped, raster)
@@ -692,7 +724,7 @@ class MappingManager:
                 # re-syncs the datum symlink to the served site (invariant).
                 site = self._newest_site_with_raster()
                 if site is not None:
-                    raster = self._newest_raster_in(site)
+                    raster = self._preferred_raster(site)
                     rospy.loginfo('mapping_manager: stopped %s saved no raster '
                                   '— restoring serving to %s/%s',
                                   stopped, site, raster)
@@ -836,12 +868,15 @@ class MappingManager:
 
     # ---- site_map server (WP1, LOCALIZATION_V2_PLAN.md) ----------------------
     def _newest_raster_in(self, site):
-        """Newest (by .pgm mtime) raster dir under <site>/rasters, or None."""
+        """Newest (by .pgm mtime) SESSION raster dir under <site>/rasters, or
+        None. The derived 'combined' raster is never a session."""
         rasters = os.path.join(self.base_dir, site, 'rasters')
         if not os.path.isdir(rasters):
             return None
         best_name, best_mtime = None, -1.0
         for name in os.listdir(rasters):
+            if composite.is_combined(name):
+                continue
             pgm = os.path.join(rasters, name, name + '.pgm')
             if not os.path.exists(pgm):
                 continue
@@ -849,6 +884,126 @@ class MappingManager:
             if mtime > best_mtime:
                 best_name, best_mtime = name, mtime
         return best_name
+
+    def _preferred_raster(self, site):
+        """What '<site>' serves by default: the COMBINED map when the site has
+        one, else its newest session raster (None when the site has none)."""
+        if composite.combined_info(os.path.join(self.base_dir, site)):
+            return composite.COMBINED_NAME
+        return self._newest_raster_in(site)
+
+    def _rebuild_combined(self, site, reserve=True):
+        """Rebuild <site>/rasters/combined from the enabled session rasters.
+        Never raises. When the combined map of this site is being SERVED and
+        `reserve`, republish it so gloc/costmaps pick up the new content."""
+        site_dir = os.path.join(self.base_dir, site)
+        try:
+            stats = composite.build_combined(
+                site_dir, resolution=self._site_resolution(site),
+                log=lambda m: rospy.loginfo('mapping_manager: %s', m))
+        except Exception as e:
+            rospy.logwarn('mapping_manager: combined rebuild FAILED for %s: %s',
+                          site, e)
+            return None
+        self._raster_list_cache.pop(site, None)
+        if stats is None:
+            # no session raster left -> drop a stale combined dir; if that
+            # was the served raster, fall back to whatever remains.
+            cdir = os.path.join(site_dir, 'rasters', composite.COMBINED_NAME)
+            if os.path.isdir(cdir):
+                shutil.rmtree(cdir, ignore_errors=True)
+                rospy.logwarn('mapping_manager: %s has no session raster — '
+                              'combined map removed', site)
+            if self.serving and self.serving.get('site') == site \
+                    and self.serving.get('raster') == composite.COMBINED_NAME:
+                fb = self._newest_site_with_raster()
+                if fb is not None:
+                    self._publish_site_map(fb, self._preferred_raster(fb))
+                else:
+                    self._publish_empty_site_map()
+            return None
+        # the tracker baseline was measured against the previous content
+        tb = self._read_site_config(site).get('track_baseline')
+        if tb and tb.get('raster') == composite.COMBINED_NAME:
+            self._update_site_config(site, {'track_baseline': None})
+        rospy.loginfo('mapping_manager: combined %s rebuilt: %d sessions, '
+                      '%dx%d @ %.3f m, %d occ / %d free, excluded %s', site,
+                      len(stats['sources']), stats['shape'][0],
+                      stats['shape'][1], stats['res'], stats['occ_cells'],
+                      stats['free_cells'], stats['excluded'] or '-')
+        if reserve and self.serving and self.serving.get('site') == site \
+                and self.serving.get('raster') == composite.COMBINED_NAME:
+            self._publish_site_map(site, composite.COMBINED_NAME)
+        return stats
+
+    def _backfill_combined_all(self):
+        """Boot: build/refresh the combined raster of every site whose
+        sessions changed since it was last built (first run: every site)."""
+        try:
+            sites = sorted(n for n in os.listdir(self.base_dir)
+                           if os.path.isdir(os.path.join(self.base_dir, n)))
+        except OSError:
+            return
+        self._combined_born = set()   # sites whose combined map is NEW this boot
+        for site in sites:
+            try:
+                site_dir = os.path.join(self.base_dir, site)
+                had = composite.combined_info(site_dir) is not None
+                if composite.is_stale(site_dir):
+                    if self._rebuild_combined(site, reserve=False) and not had:
+                        self._combined_born.add(site)
+            except Exception as e:
+                rospy.logwarn('mapping_manager: combined check failed for %s: '
+                              '%s', site, e)
+
+    def cb_layer_enable(self, msg):
+        """'site/raster:on|off' -> include/exclude a session raster from the
+        site's combined map and rebuild it (re-served when it is active)."""
+        payload = msg.data.strip()
+        ref, _, flag = payload.rpartition(':')
+        flag = flag.lower()
+        if not ref or flag not in ('on', 'off'):
+            self._serve_reject('layer_enable: expected "site/raster:on|off"')
+            return
+        try:
+            site, raster, base = self._validate_raster_ref(ref)
+        except ValueError as e:
+            self._serve_reject('layer_enable: %s' % e)
+            return
+        if composite.is_combined(raster) or not os.path.exists(base + '.pgm'):
+            self._serve_reject('layer_enable: no such session raster %s' % ref)
+            return
+        site_dir = os.path.join(self.base_dir, site)
+        if flag == 'off':
+            ex = set(composite.load_config(site_dir)['exclude'])
+            left = [v for v in composite.session_versions(site_dir)
+                    if v not in ex and v != raster]
+            if not left:
+                self._serve_reject('at least one session must stay included '
+                                   'in the combined map of %s' % site)
+                return
+        try:
+            composite.set_layer_enabled(os.path.join(self.base_dir, site),
+                                        raster, flag == 'on')
+        except OSError as e:
+            self._serve_reject('layer_enable: %s' % e)
+            return
+        rospy.logwarn('mapping_manager: layer %s -> %s', ref, flag)
+        self._rebuild_combined(site)
+        self.show_site(site)
+        self.tick_status(None)
+
+    def cb_rebuild_combined(self, msg):
+        site = msg.data.strip()
+        if not site:
+            site = self.serving.get('site') if self.serving else None
+        if not site or not site.replace('_', '').replace('-', '').isalnum() \
+                or not os.path.isdir(os.path.join(self.base_dir, site)):
+            self._serve_reject('rebuild_combined: unknown site %r' % site)
+            return
+        self._rebuild_combined(site)
+        self.show_site(site)
+        self.tick_status(None)
 
     def _newest_site_with_raster(self):
         """Newest site (by directory mtime) that has at least one raster."""
@@ -892,12 +1047,12 @@ class MappingManager:
                     self._serve_reject('no site has a raster yet — Snapshot '
                                        'or Stop a mapping session first')
                     return
-                raster = self._newest_raster_in(site)
+                raster = self._preferred_raster(site)
             elif '/' in payload:
                 site, raster = payload.split('/', 1)
             else:
                 site = payload
-                raster = self._newest_raster_in(site)
+                raster = self._preferred_raster(site)
                 if raster is None:
                     # REPORT 2(b): the common failure — site mapped (.ot) but
                     # never snapshotted, so it has no raster. Tell the UI WHY
@@ -923,6 +1078,7 @@ class MappingManager:
         reason is published in the status JSON (serve_error) and shown by
         mapping.js; it is cleared on the next successful serve."""
         self.serve_error = reason
+        self._serve_error_t = time.time()   # auto-clears in tick_status
         rospy.logwarn('mapping_manager: serve_site rejected: %s', reason)
         self.tick_status(None)   # push the reason to the UI immediately
 
@@ -1047,6 +1203,10 @@ class MappingManager:
         if not os.path.isdir(rdir):
             self._serve_reject('remove_raster: no such raster %s' % payload)
             return
+        if composite.is_combined(raster):
+            self._serve_reject('the combined map is derived — exclude or '
+                               'delete its layers instead')
+            return
         # never delete the raster gloc/costmaps are localizing against
         if self.serving and self.serving.get('site') == site \
                 and self.serving.get('raster') == raster:
@@ -1072,6 +1232,9 @@ class MappingManager:
             return
         self._raster_list_cache.pop(site, None)   # drop stale cached list
         rospy.logwarn('mapping_manager: removed raster %s/%s', site, raster)
+        # COMBINED: the deleted session leaves the combined map (re-served
+        # when active; dropped with fallback when no session is left).
+        self._rebuild_combined(site)
         self.show_site(site)     # refresh disk previews (raster png may change)
         self.tick_status(None)   # push updated raster_list/status to the UI
 
@@ -1141,16 +1304,26 @@ class MappingManager:
         except (OSError, ValueError, AttributeError):
             pass
         site, raster = self.load_last_served()
-        # Validate the persisted raster still exists; otherwise refresh to newest.
+        # Validate the persisted raster still exists; otherwise refresh to the
+        # site's preferred (combined) raster.
         if site is not None:
             if raster is None or not os.path.exists(
                     os.path.join(self.base_dir, site, 'rasters', raster,
                                  raster + '.pgm')):
-                raster = self._newest_raster_in(site)
+                raster = self._preferred_raster(site)
+            elif raster == self._newest_raster_in(site) \
+                    and site in getattr(self, '_combined_born', set()):
+                # COMBINED migration (ONE-SHOT: only the boot that first built
+                # this site's combined map): the persisted choice was the
+                # automatic 'newest session' -> the combined map now plays
+                # that role. Later boots honour whatever was activated.
+                rospy.loginfo('mapping_manager: boot serve %s/%s -> combined',
+                              site, raster)
+                raster = composite.COMBINED_NAME
         if site is None or raster is None:
             site = self._newest_site_with_raster()
             if site is not None:
-                raster = self._newest_raster_in(site)
+                raster = self._preferred_raster(site)
         if site is None or raster is None:
             rospy.loginfo('mapping_manager: auto_serve_last: no site has a '
                           'raster yet — site_map not served at boot')
@@ -1484,27 +1657,35 @@ class MappingManager:
         if not os.path.isdir(rasters):
             return []
         entries = []
+        excluded = set(composite.load_config(
+            os.path.join(self.base_dir, site))['exclude'])
         for name in os.listdir(rasters):
+            if composite.is_combined(name):
+                continue
             pgm = os.path.join(rasters, name, name + '.pgm')
             if not os.path.exists(pgm):
                 continue
             entries.append((name, os.path.getmtime(pgm)))
         entries.sort(key=lambda e: e[1], reverse=True)
         entries = entries[:limit]
-        sig = tuple(entries)
+        sig = (tuple(entries), tuple(sorted(excluded)))
         cached = self._raster_list_cache.get(site)
         if cached is not None and cached[0] == sig:
             return cached[1]
         out = []
         for name, mtime in entries:
             rec = {'name': name, 'mtime': int(mtime),
-                   'cells_free': None, 'cells_obstacle': None}
+                   'cells_free': None, 'cells_obstacle': None,
+                   'enabled': name not in excluded}
             meta = os.path.join(rasters, name, name + '_meta.json')
             try:
                 with open(meta) as f:
                     m = json.load(f)
-                rec['cells_free'] = m.get('cells_free')
-                rec['cells_obstacle'] = m.get('cells_obstacle')
+                # direct_raster writes free_cells/occ_cells (the older keys
+                # never existed -> the UI always showed '—')
+                rec['cells_free'] = m.get('cells_free', m.get('free_cells'))
+                rec['cells_obstacle'] = m.get('cells_obstacle',
+                                              m.get('occ_cells'))
             except (OSError, ValueError):
                 pass
             out.append(rec)
@@ -1536,10 +1717,13 @@ class MappingManager:
                     pass
         rasters = os.path.join(d, 'rasters')
         if os.path.isdir(rasters):
-            info['rasters'] = len(os.listdir(rasters))
+            info['rasters'] = len([n for n in os.listdir(rasters)
+                                   if not composite.is_combined(n)])
         info['has_ot'] = any(f.endswith('.ot') for f in os.listdir(d))
         # per-raster mgmt: up to 12 newest rasters w/ cell counts (cached).
         info['raster_list'] = self._raster_list(name)
+        # COMBINED: derived all-sessions map (None until first build)
+        info['combined'] = composite.combined_info(d)
         return info
 
     def tick_status(self, _evt):
@@ -1553,6 +1737,11 @@ class MappingManager:
                 self.site = None
                 self.started_at = None
                 self.session_resolution = None    # M13
+        # UI hygiene (2026-09-13): a rejection reason is transient — drop it
+        # after 20 s instead of showing a stale red line until the next serve.
+        if self.serve_error and time.time() - getattr(
+                self, '_serve_error_t', 0.0) > 20.0:
+            self.serve_error = None
         sites = sorted(n for n in os.listdir(self.base_dir)
                        if os.path.isdir(os.path.join(self.base_dir, n)))
         status = {
