@@ -97,8 +97,13 @@ mapping_manager (permanent, started from vitulus_ui.launch)
 
 ## Build & run
 
+All Vitulus packages live side by side in `<workspace>/src/vitulus/` (on the
+robot: `~/catkin_ws/src/vitulus/`); see `INSTALL.md` in the
+[vitulus](https://github.com/lacina-dev/vitulus) repo for the whole stack.
+
 ```bash
-cd ~/catkin_ws/src && git clone https://github.com/lacina-dev/vitulus_mapping.git
+mkdir -p ~/catkin_ws/src/vitulus && cd ~/catkin_ws/src/vitulus
+git clone https://github.com/lacina-dev/vitulus_mapping.git
 cd ~/catkin_ws && catkin_make && source devel/setup.bash
 ```
 

@@ -21,7 +21,7 @@ writes.  Refuses to overwrite existing bundle files unless --force.
 
 RUN with ROS env sourced (needs vitulus_msgs to unpickle programs):
   source /opt/ros/noetic/setup.bash
-  source ~/catkin_ws/devel/setup.bash
+  source <workspace>/devel/setup.bash
   rosrun vitulus_mapping migrate_to_bundle --site novamapa \
       --navi-map 'GARDEN_2026***env*OUTDOOR'
 """
@@ -32,9 +32,22 @@ import pickle
 import sys
 
 # --- make our libs + the pickle classes importable ------------------------
-_MAP_SRC = "/home/vitulus/catkin_ws/src/vitulus/vitulus_mapping/src"
-_NAVI_SRC = "/home/vitulus/catkin_ws/src/vitulus/vitulus_navi/src"
-_PLANNER_SRC = "/home/vitulus/catkin_ws/src/vitulus/vitulus_planner/src"
+# Paths follow this file (<pkg>/tools/...), never a fixed workspace name.
+_PKG_DIR = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+
+
+def _pkg_src(pkg):
+    """<pkg>/src via rospkg; fall back to the sibling checkout next to us."""
+    try:
+        import rospkg
+        return os.path.join(rospkg.RosPack().get_path(pkg), "src")
+    except Exception:
+        return os.path.join(os.path.dirname(_PKG_DIR), pkg, "src")
+
+
+_MAP_SRC = os.path.join(_PKG_DIR, "src")
+_NAVI_SRC = _pkg_src("vitulus_navi")
+_PLANNER_SRC = _pkg_src("vitulus_planner")
 for p in (_MAP_SRC, _NAVI_SRC, _PLANNER_SRC):
     if p not in sys.path:
         sys.path.insert(0, p)

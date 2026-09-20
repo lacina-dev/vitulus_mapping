@@ -22,7 +22,9 @@ import random
 import sys
 import tempfile
 
-SRC = "/home/vitulus/catkin_ws/src/vitulus/vitulus_mapping/src"
+# Paths follow this file (<pkg>/tools/...), never a fixed workspace name.
+PKG_DIR = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+SRC = os.path.join(PKG_DIR, "src")
 sys.path.insert(0, SRC)
 
 from vitulus_mapping import geo, bundle  # noqa: E402
@@ -169,11 +171,18 @@ def test_reality():
     print("[4] REALITY: 'docked' waypoint pickle-datum vs site datum.yaml")
     import pickle
     import yaml
-    sys.path.insert(0, "/home/vitulus/catkin_ws/src/vitulus/vitulus_navi/src")
-    pkl = "/home/vitulus/.vitulus/saves/maps_data/GARDEN_2026***env*OUTDOOR.pkl"
+    try:
+        import rospkg
+        navi_src = os.path.join(rospkg.RosPack().get_path("vitulus_navi"), "src")
+    except Exception:
+        # no ROS env: sibling checkout next to this package
+        navi_src = os.path.join(os.path.dirname(PKG_DIR), "vitulus_navi", "src")
+    sys.path.insert(0, navi_src)
+    pkl = os.path.expanduser(
+        "~/.vitulus/saves/maps_data/GARDEN_2026***env*OUTDOOR.pkl")
     # 2026-08-08: site was hardcoded ('novamapa' — since removed, test crashed
     # with FileNotFoundError). Use the newest site dir that has a datum.yaml.
-    root = "/home/vitulus/.vitulus/mapping_v3"
+    root = os.path.expanduser("~/.vitulus/mapping_v3")
     cands = sorted(
         (d for d in glob.glob(os.path.join(root, "*", "datum.yaml"))),
         key=os.path.getmtime, reverse=True)
