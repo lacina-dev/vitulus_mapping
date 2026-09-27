@@ -53,6 +53,8 @@ from vitulus_msgs.msg import Navi_transform
 from vitulus_mapping.directgrid import DirectGrid
 from vitulus_mapping.gates import GateConfig, InsertionGate
 from vitulus_mapping.pgmio import save_occupancy_pgm
+from vitulus_mapping.presets import (BUILTIN_PRESETS, DEFAULT_PATH, PRESET_KEYS,
+                                     load_custom, presets_list, save_custom)
 from vitulus_mapping.roscloud import pointcloud2_to_xyz
 
 
@@ -94,67 +96,6 @@ def _cluster_filter_xy(x, y, radius, min_pts):
             for c in comp:
                 keep[cells[c]] = True
     return keep
-
-
-# Environment presets (2026-08-09): named PARTIAL settings dicts applied via
-# /mapping/direct_preset. Only the "environment character" keys — source
-# enables and ranges are the user's own live choice and are never touched by
-# a preset. Custom presets (saved from the UI) persist globally in
-# direct_presets.json and shadow a builtin of the same name.
-# PRESET REWORK (2026-08-09 field test zahradaDneska): the first-cut presets
-# were erosion-broken — 'Lawn tall' had miss_dec 0.5 > hit_inc 0.4 with
-# occ_thresh 1.0/min_hits 5, and with the lidar carving free 360° at 6 Hz only
-# 96 occupied cells survived a 10-min drive. Rules now: miss_dec <= hit_inc,
-# reachable thresholds, and the sceptical knobs are lidar_free_dec +
-# occ_erode_factor + min_hits rather than a free/hit imbalance.
-BUILTIN_PRESETS = {
-    'Lawn short': {
-        'cam_obstacle_min_h': 0.12, 'cam_obstacle_max_h': 0.6,
-        'cam_min_cluster_pts': 1, 'cam_cluster_radius_m': 0.15,
-        'lidar_min_intensity': 0.0,
-        'hit_inc': 0.6, 'miss_dec': 0.4, 'occ_thresh': 0.85,
-        'free_thresh': -0.4, 'min_hits': 2,
-        'lidar_free_dec': 0.15, 'occ_erode_factor': 0.5,
-    },
-    'Lawn tall': {
-        # tall grass: lift the obstacle floor above the blade tips, demand
-        # more frames + bigger blobs, drop weak lidar returns (grass);
-        # scepticism comes from min_hits/cluster — NOT from miss>hit
-        'cam_obstacle_min_h': 0.25, 'cam_obstacle_max_h': 0.8,
-        'cam_min_cluster_pts': 4, 'cam_cluster_radius_m': 0.2,
-        'lidar_min_intensity': 6.0,
-        'hit_inc': 0.5, 'miss_dec': 0.3, 'occ_thresh': 0.8,
-        'free_thresh': -0.4, 'min_hits': 4,
-        'lidar_free_dec': 0.08, 'occ_erode_factor': 0.3,
-    },
-    'Paved yard': {
-        # hard surfaces, walls/fences matter: converge fast, take tall stuff;
-        # lidar is trustworthy here so its free rays may erode a bit more
-        'cam_obstacle_min_h': 0.10, 'cam_obstacle_max_h': 1.5,
-        'cam_min_cluster_pts': 1, 'cam_cluster_radius_m': 0.15,
-        'lidar_min_intensity': 0.0,
-        'hit_inc': 0.7, 'miss_dec': 0.4, 'occ_thresh': 0.85,
-        'free_thresh': -0.4, 'min_hits': 2,
-        'lidar_free_dec': 0.2, 'occ_erode_factor': 0.5,
-    },
-    'Bushes / edge': {
-        # soft moving vegetation: slow accumulation, sticky once confirmed
-        'cam_obstacle_min_h': 0.20, 'cam_obstacle_max_h': 1.8,
-        'cam_min_cluster_pts': 5, 'cam_cluster_radius_m': 0.2,
-        'lidar_min_intensity': 4.0,
-        'hit_inc': 0.4, 'miss_dec': 0.3, 'occ_thresh': 0.9,
-        'free_thresh': -0.4, 'min_hits': 5,
-        'lidar_free_dec': 0.08, 'occ_erode_factor': 0.3,
-    },
-    'Default (yaml)': {
-        'cam_obstacle_min_h': 0.15, 'cam_obstacle_max_h': 0.5,
-        'cam_min_cluster_pts': 1, 'cam_cluster_radius_m': 0.15,
-        'lidar_min_intensity': 0.0,
-        'hit_inc': 0.5, 'miss_dec': 0.4, 'occ_thresh': 0.85,
-        'free_thresh': -0.4, 'min_hits': 3,
-        'lidar_free_dec': 0.12, 'occ_erode_factor': 0.5,
-    },
-}
 
 
 class DirectRasterNode:
@@ -233,7 +174,7 @@ class DirectRasterNode:
         # GLOBAL (cross-site) custom environment presets — sites share one
         # environment vocabulary, unlike the per-site overrides above.
         self.presets_path = os.path.expanduser(rospy.get_param(
-            '~presets_path', '~/.vitulus/mapping_v3/direct_presets.json'))
+            '~presets_path', DEFAULT_PATH))
         self.custom_presets = self._load_presets()
 
         # XY-only gate: fused mode blocks on pose freshness / jumps / map-corr
@@ -361,40 +302,18 @@ class DirectRasterNode:
     # ---- environment presets (global, cross-site) ---------------------------
     # keys a preset may carry: environment character only — never the source
     # enables/ranges, those stay the user's live choice
-    PRESET_KEYS = ('cam_obstacle_min_h', 'cam_obstacle_max_h',
-                   'cam_min_cluster_pts', 'cam_cluster_radius_m',
-                   'lidar_min_intensity', 'hit_inc', 'miss_dec',
-                   'lidar_free_dec', 'occ_erode_factor',
-                   'occ_thresh', 'free_thresh', 'min_hits',
-                   'lo_clamp', 'hi_clamp')
+    PRESET_KEYS = PRESET_KEYS
 
     def _load_presets(self):
-        try:
-            if os.path.exists(self.presets_path):
-                with open(self.presets_path) as f:
-                    p = json.load(f)
-                if isinstance(p, dict):
-                    return p
-        except Exception as e:
-            rospy.logwarn('direct_raster: could not load presets: %s', e)
-        return {}
+        return load_custom(self.presets_path,
+                           log=lambda f, *a: rospy.logwarn('direct_raster: ' + f, *a))
 
     def _save_presets(self):
-        try:
-            os.makedirs(os.path.dirname(self.presets_path), exist_ok=True)
-            with open(self.presets_path, 'w') as f:
-                json.dump(self.custom_presets, f, indent=1)
-        except Exception as e:
-            rospy.logwarn('direct_raster: could not save presets: %s', e)
+        save_custom(self.presets_path, self.custom_presets,
+                    log=lambda f, *a: rospy.logwarn('direct_raster: ' + f, *a))
 
     def _presets_dict(self):
-        out = []
-        for name, vals in BUILTIN_PRESETS.items():
-            if name not in self.custom_presets:
-                out.append({'name': name, 'builtin': True, 'values': vals})
-        for name, vals in self.custom_presets.items():
-            out.append({'name': name, 'builtin': False, 'values': vals})
-        return out
+        return presets_list(self.custom_presets)
 
     def cb_direct_preset(self, msg):
         """{'action': 'apply'|'save'|'delete', 'name': str}. A custom preset
