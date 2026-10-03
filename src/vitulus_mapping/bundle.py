@@ -46,7 +46,7 @@ __all__ = [
     "load_paths", "save_paths",
     "load_zones", "save_zones",
     "load_edits", "save_edits", "edits_path", "edits_utm_zone",
-    "load_programs", "save_programs",
+    "load_programs", "save_programs", "program_names",
     "epsg_for_zone", "crs_member",
     "newest_mtime", "file_mtime", "any_mtime",
 ]
@@ -446,6 +446,16 @@ def load_programs(site):
     if isinstance(data, dict) and "programs" in data:
         return list(data["programs"])
     return list(data)
+
+
+def program_names(site):
+    """Names of the programs that belong to the site.  [] if none or the
+    file is unreadable (never raises - used by status / delete warnings)."""
+    try:
+        return [str(p["name"]) for p in load_programs(site)
+                if isinstance(p, dict) and p.get("name")]
+    except Exception:
+        return []
 
 
 def save_programs(site, programs):

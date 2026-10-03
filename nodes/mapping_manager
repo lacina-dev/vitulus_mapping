@@ -130,6 +130,7 @@ class MappingManager:
         # new/removed raster (or a rewritten pgm) invalidates it, a meta parse
         # does not repeat while unchanged.
         self._raster_list_cache = {}
+        self._programs_cache = {}  # name -> (programs.yaml mtime, [names])
         self.session_resolution = None  # M13: resolution the active session
                                         # started with (None when stopped)
         self.edits_applied = 0     # WP-D1: number of human edits composited
@@ -804,10 +805,17 @@ class MappingManager:
             rospy.logwarn('mapping_manager: refusing to remove currently-'
                           'serving site %s — serve another site first', site)
             return
+        # the site's programs go with it (programs.yaml lives in the site dir)
+        programs = bundle.program_names(site)
         shutil.rmtree(path)
         self._dem_m2_cache.pop(site, None)   # M12: drop cache for removed site
         self._raster_list_cache.pop(site, None)   # per-raster mgmt cache too
+        self._programs_cache.pop(site, None)
         rospy.logwarn('mapping_manager: removed site %s', site)
+        if programs:
+            rospy.logwarn('mapping_manager: %d program(s) of site %s were '
+                          'removed with it: %s', len(programs), site,
+                          ', '.join(programs))
         self.show_site('')
 
     def shutdown(self):
@@ -1782,7 +1790,23 @@ class MappingManager:
         info['raster_list'] = self._raster_list(name)
         # COMBINED: derived all-sessions map (None until first build)
         info['combined'] = composite.combined_info(d)
+        # programs that belong to this map (the UI warns before deleting it)
+        info['programs'] = self._site_programs(name)
         return info
+
+    def _site_programs(self, name):
+        """Program names of the site, cached on the programs.yaml mtime (the
+        status tick runs at 1 Hz)."""
+        try:
+            mtime = os.path.getmtime(bundle.programs_path(name))
+        except OSError:
+            self._programs_cache.pop(name, None)
+            return []
+        cached = self._programs_cache.get(name)
+        if cached is None or cached[0] != mtime:
+            cached = (mtime, bundle.program_names(name))
+            self._programs_cache[name] = cached
+        return cached[1]
 
     def tick_status(self, _evt):
         # AUDIT P2-2: the dead-launch reaper mutates the same lifecycle state
