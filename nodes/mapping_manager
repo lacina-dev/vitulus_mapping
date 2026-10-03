@@ -907,15 +907,21 @@ class MappingManager:
             rospy.logwarn('mapping_manager: preview failed: %s', e)
 
     # ---- site_map server (WP1, LOCALIZATION_V2_PLAN.md) ----------------------
-    def _newest_raster_in(self, site):
+    def _newest_raster_in(self, site, enabled_only=False):
         """Newest (by .pgm mtime) SESSION raster dir under <site>/rasters, or
-        None. The derived 'combined' raster is never a session."""
+        None. The derived 'combined' raster is never a session. With
+        `enabled_only` the sessions excluded from the combined map are
+        skipped."""
         rasters = os.path.join(self.base_dir, site, 'rasters')
         if not os.path.isdir(rasters):
             return None
+        excluded = set()
+        if enabled_only:
+            excluded = set(composite.load_config(
+                os.path.join(self.base_dir, site))['exclude'])
         best_name, best_mtime = None, -1.0
         for name in os.listdir(rasters):
-            if composite.is_combined(name):
+            if composite.is_combined(name) or name in excluded:
                 continue
             pgm = os.path.join(rasters, name, name + '.pgm')
             if not os.path.exists(pgm):
@@ -927,10 +933,12 @@ class MappingManager:
 
     def _preferred_raster(self, site):
         """What '<site>' serves by default: the COMBINED map when the site has
-        one, else its newest session raster (None when the site has none)."""
+        one, else its newest INCLUDED session raster; an excluded session only
+        when nothing else is left (None when the site has none)."""
         if composite.combined_info(os.path.join(self.base_dir, site)):
             return composite.COMBINED_NAME
-        return self._newest_raster_in(site)
+        return self._newest_raster_in(site, enabled_only=True) \
+            or self._newest_raster_in(site)
 
     def _rebuild_combined(self, site, reserve=True):
         """Rebuild <site>/rasters/combined from the enabled session rasters.
@@ -952,8 +960,12 @@ class MappingManager:
             cdir = os.path.join(site_dir, 'rasters', composite.COMBINED_NAME)
             if os.path.isdir(cdir):
                 shutil.rmtree(cdir, ignore_errors=True)
-                rospy.logwarn('mapping_manager: %s has no session raster — '
-                              'combined map removed', site)
+                if composite.session_versions(site_dir):
+                    rospy.logwarn('mapping_manager: every session of %s is '
+                                  'excluded — combined map removed', site)
+                else:
+                    rospy.logwarn('mapping_manager: %s has no session raster '
+                                  '— combined map removed', site)
             if self.serving and self.serving.get('site') == site \
                     and self.serving.get('raster') == composite.COMBINED_NAME:
                 fb = self._newest_site_with_raster()
@@ -1015,9 +1027,8 @@ class MappingManager:
             return
         site_dir = os.path.join(self.base_dir, site)
         if flag == 'off':
-            ex = set(composite.load_config(site_dir)['exclude'])
-            left = [v for v in composite.session_versions(site_dir)
-                    if v not in ex and v != raster]
+            left = [v for v in composite.enabled_versions(site_dir)
+                    if v != raster]
             if not left:
                 self._serve_reject('at least one session must stay included '
                                    'in the combined map of %s' % site)
@@ -1252,6 +1263,13 @@ class MappingManager:
                 and self.serving.get('raster') == raster:
             self._serve_reject('cannot delete the SERVED raster %s — serve '
                                'another first' % payload)
+            return
+        # same rule as layer_enable off: the other sessions are all excluded,
+        # deleting this one would drop the combined map of the site
+        if composite.is_last_enabled(os.path.join(self.base_dir, site),
+                                     raster):
+            self._serve_reject('cannot delete the last included session of '
+                               '%s — include another session first' % site)
             return
         # clearing the preview first avoids leaving a latched grid pointing at a
         # just-deleted raster

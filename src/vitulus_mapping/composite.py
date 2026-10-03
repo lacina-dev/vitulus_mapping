@@ -114,6 +114,22 @@ def save_config(site_dir, cfg):
     os.replace(tmp, path)
 
 
+def enabled_versions(site_dir):
+    """Session rasters INCLUDED in the combination (not on the exclude list),
+    oldest first."""
+    ex = set(load_config(site_dir)['exclude'])
+    return [v for v in session_versions(site_dir) if v not in ex]
+
+
+def is_last_enabled(site_dir, raster):
+    """True when `raster` is the ONLY included session of a site that still
+    has other (excluded) sessions: taking it away would leave the site with
+    sessions but no combined map."""
+    versions = session_versions(site_dir)
+    return (enabled_versions(site_dir) == [raster]
+            and any(v != raster for v in versions))
+
+
 def set_layer_enabled(site_dir, raster, enabled):
     """Include/exclude one session raster from the combination. Returns the
     new exclude list."""
