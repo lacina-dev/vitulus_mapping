@@ -22,12 +22,12 @@
     <rosparam command="load" file="$(find vitulus_mapping)/config/mapping_v3.yaml"/>
 
     <node pkg="vitulus_mapping" type="insertion_gate" name="insertion_gate"
-          output="screen">
+          output="log">
       <param name="output_dir" value="$(arg output_dir)"/>
     </node>
 
     <node pkg="vitulus_mapping" type="trajectory_dem" name="trajectory_dem"
-          output="screen">
+          output="log">
       <param name="output_dir" value="$(arg output_dir)"/>
       <param name="resolution" value="$(arg resolution)"/>
     </node>
@@ -38,7 +38,7 @@
          plagued the retired octomap/band chain. This is now the SOLE mapper.
          ~direct_enabled=false disables it cleanly. Same per-site resolution. -->
     <node pkg="vitulus_mapping" type="direct_raster" name="direct_raster"
-          output="screen">
+          output="log">
       <param name="output_dir" value="$(arg output_dir)"/>
       <param name="resolution" value="$(arg resolution)"/>
     </node>
