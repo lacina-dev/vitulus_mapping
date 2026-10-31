@@ -175,6 +175,10 @@ class DirectRasterNode:
         self.overrides_path = os.path.join(self.output_dir,
                                            'direct_overrides.json')
         self._load_overrides()
+        # lidar settings changed in Settings > Lidar while nothing recorded
+        self.pending_path = os.path.expanduser(rospy.get_param(
+            '~pending_path', '~/.vitulus/mapping_v3/direct_pending.json'))
+        self._apply_pending()
 
         # GLOBAL (cross-site) custom environment presets — sites share one
         # environment vocabulary, unlike the per-site overrides above.
@@ -296,6 +300,28 @@ class DirectRasterNode:
         except Exception as e:
             rospy.logwarn('direct_raster: could not load overrides: %s', e)
 
+    def _apply_pending(self):
+        """Settings > Lidar writes direct_pending.json when no session runs
+        (this node is what /mapping/set_direct talks to, and it runs only
+        during a recording). Taken over once: applied on top of the site's
+        overrides, kept there by _save_overrides, the file removed. A rejected
+        file stays, so a value is never silently lost."""
+        try:
+            if not os.path.exists(self.pending_path):
+                return
+            with open(self.pending_path) as f:
+                pending = json.load(f)
+            vals = {k: pending[k] for k in self.PENDING_KEYS if k in pending}
+            applied, err = self._apply_settings(vals)
+            if err:
+                rospy.logwarn('direct_raster: pending settings rejected: %s', err)
+                return
+            os.remove(self.pending_path)
+            rospy.loginfo('direct_raster: pending lidar settings applied: %s',
+                          json.dumps(vals))
+        except Exception as e:
+            rospy.logwarn('direct_raster: could not apply pending settings: %s', e)
+
     def _save_overrides(self):
         try:
             os.makedirs(self.output_dir, exist_ok=True)
@@ -308,6 +334,8 @@ class DirectRasterNode:
     # builtins, keys and the custom file live in vitulus_mapping.presets,
     # shared with mapping_manager (vitulus-field#23)
     PRESET_KEYS = presets.PRESET_KEYS
+    PENDING_KEYS = ('use_lidar', 'lidar_max_range_m', 'lidar_free_no_hit',
+                    'lidar_min_intensity')
 
     def _load_presets(self):
         try:
