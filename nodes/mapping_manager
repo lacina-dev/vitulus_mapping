@@ -79,7 +79,7 @@ from sensor_msgs.msg import CompressedImage
 from std_msgs.msg import String
 from tf.transformations import euler_from_quaternion
 
-from vitulus_mapping import bundle, composite, editmask, geo, presets
+from vitulus_mapping import bundle, composite, editmask, geo, objnames, presets
 from vitulus_mapping.demgrid import DemGrid
 from vitulus_mapping.pgmio import load_occupancy_pgm
 from vitulus_mapping.preview import dem_to_png
@@ -217,6 +217,10 @@ class MappingManager:
                          self.cb_save_edit, queue_size=4)
         rospy.Subscriber('/mapping_manager/remove_edit', String,
                          self.cb_remove_edit, queue_size=4)
+        self.pub_rename_result = rospy.Publisher(objnames.RENAME_RESULT_TOPIC,
+                                                 String, queue_size=10)
+        rospy.Subscriber('/mapping_manager/rename_edit', String,
+                         self.cb_rename_edit, queue_size=4)
         # M9: watch the pipeline's gate_status so Stop can tell whether the
         # session ever captured a georef datum.
         # AUDIT A14: direct_raster snapshot ack/nack — lets the stop wait abort
@@ -1643,6 +1647,9 @@ class MappingManager:
             return
         edits = bundle.load_edits(site)
         name = (req.get('name') or '').strip() or self._next_edit_name(edits)
+        if name == '*':     # '*' means "all edits" to remove_edit
+            self._serve_reject('save_edit: the name * cannot be used')
+            return
         rec = {'name': name, 'kind': kind, 'vertices': verts_utm}
         if kind == 'wall':
             rec['width_m'] = float(req.get('width_m', 0.10))
@@ -1665,6 +1672,40 @@ class MappingManager:
                       'replaced' if replaced else 'added', name, kind,
                       len(pts), site)
         self._reserve_current()   # re-composite + republish site_map/edit_list
+
+    def cb_rename_edit(self, msg):
+        """Rename a human edit on the SERVING site. Payload JSON {from, to}. The
+        name carries no geometry and the list order stays (last writer wins), so
+        the raster is not re-served, only edit_list."""
+        old, new, code = '', '', 'failed'
+        try:
+            old, new = objnames.parse_request(msg.data)
+            site = self._serving_site()
+            if site is None:
+                code = 'no_site'
+                return
+            edits = bundle.load_edits(site)
+            code = objnames.check_rename(old, new,
+                                         [e.get('name') for e in edits]) or 'ok'
+            if code != 'ok':
+                return
+            for e in edits:
+                if e.get('name') == old:
+                    e['name'] = new
+            datum = self._load_datum(site)
+            bundle.save_edits(site, edits,
+                              utm_zone=datum.get('utm_zone') if datum else None)
+            rospy.loginfo('mapping_manager: edit %r renamed to %r on %s',
+                          old, new, site)
+            self._publish_edit_list(site)
+        except ValueError:
+            code = 'bad_request'
+        except Exception as e:
+            rospy.logerr('mapping_manager: rename_edit failed: %s', e)
+            code = 'failed'
+        finally:
+            self.pub_rename_result.publish(String(
+                objnames.result_json('edit', old, new, code)))
 
     def cb_remove_edit(self, msg):
         """Remove a human edit by name from the SERVING site; payload '*'
