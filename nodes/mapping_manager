@@ -2077,6 +2077,9 @@ class MappingManager:
         info['combined'] = composite.combined_info(d)
         # programs that belong to this map (the UI warns before deleting it)
         info['programs'] = self._site_programs(name)
+        # ... and what the Programs panel shows of them when another map is on
+        # (vitulus-field#46: every program of every map can be started).
+        info['programs_info'] = self._site_programs_info(name)
         return info
 
     def _site_programs(self, name):
@@ -2089,9 +2092,24 @@ class MappingManager:
             return []
         cached = self._programs_cache.get(name)
         if cached is None or cached[0] != mtime:
-            cached = (mtime, bundle.program_names(name))
+            info = []
+            try:
+                for prog in bundle.load_programs(name):
+                    if isinstance(prog, dict) and prog.get('name'):
+                        info.append({k: prog.get(k) for k in (
+                            'name', 'area', 'length', 'last_result',
+                            'last_duration_minutes', 'speed', 'rpm', 'cut_height',
+                            'zone_names') if k in prog})
+            except Exception:
+                info = []        # same as program_names: status never raises
+            cached = (mtime, bundle.program_names(name), info)
             self._programs_cache[name] = cached
         return cached[1]
+
+    def _site_programs_info(self, name):
+        self._site_programs(name)        # refreshes the cache
+        cached = self._programs_cache.get(name)
+        return cached[2] if cached else []
 
     def tick_status(self, _evt):
         # AUDIT P2-2: the dead-launch reaper mutates the same lifecycle state
@@ -2122,6 +2140,8 @@ class MappingManager:
             'serving': self.serving,
             'previewing': self.previewing,            # per-raster mgmt
             'serve_error': self.serve_error,
+            'serve_error_t': getattr(self, '_serve_error_t', 0.0)
+                             if self.serve_error else 0.0,
             'resolution': self.session_resolution,   # M13
             'datum_warning': self.datum_warning,      # M9
             'edits_applied': self.edits_applied,      # WP-D1
