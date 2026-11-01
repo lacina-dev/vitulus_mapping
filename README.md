@@ -74,10 +74,14 @@ mapping_manager (permanent, started from vitulus_ui.launch)
 | `/mapping/gate`, `/mapping/gate_status`, `/mapping/gate_mode` | out/in | gate decision, JSON detail, mode switch (`rtk`/`force_on`/`off`) |
 | `/mapping/terrain` | out | `grid_map_msgs/GridMap` (ground_elevation, confidence, …) |
 | `/mapping/save_direct`, `/mapping/save_dem`, `/mapping/set_direct` | in | snapshot raster / save DEM / live tuning JSON |
+| `/mapping_manager/profile_cmd`, `/mapping_manager/profile_state` | in/out | the mapping profile of the site: JSON commands, latched state (`src/vitulus_mapping/profiles.py`) |
 
 ### Data layout (`~/.vitulus/mapping_v3/<site>/`)
 
 * `dem.npz` — canonical trajectory DEM (atomic autosave)
+* `mapping_profile.json` — the mapping profile of this site + what differs from it
+  (custom profiles: `~/.vitulus/mapping_v3/mapping_profiles.json`, global);
+  `direct_overrides.json` is generated from it for direct_raster
 * `rasters/<name>/` — pgm + yaml + meta.json snapshots
 * `datum.yaml` — site georef anchor (UTM pose of the map origin, captured once
   under sustained RTK quality)

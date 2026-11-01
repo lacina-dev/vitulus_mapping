@@ -142,9 +142,9 @@ trajectory_dem:
 # evidence DIRECTLY from the per-frame segmented clouds, discarding absolute z, so
 # global pose-z drift (the whole phantom class) cannot occur. This is now the SOLE
 # mapper (the octomap/band pipeline was retired 2026-07-19). All keys below are
-# live-settable via /mapping/set_direct (String JSON) and persisted per-site to
-# direct_overrides.json
-# (loaded on start, layered on top of these). resolution comes from the launch arg.
+# live-settable via /mapping/set_direct (String JSON). Each site's values come from
+# its mapping profile: mapping_manager writes them to direct_overrides.json, loaded
+# on start on top of these. resolution comes from the launch arg.
 direct_raster:
   direct_enabled: true               # false = node idles cleanly (no subs)
   refresh_hz: 1.5                    # live /mapping/direct_map publish rate
@@ -155,11 +155,11 @@ direct_raster:
   lidar_free_no_hit: true           # a max-range/no-return beam frees the ray
   # (2) camera OBSTACLES: rtabmap obstacles_detection /obstacles_cloud (already
   # segmented NOT-ground against the LOCAL plane -> pose-z immune).
+  # Height, reach and blobs: the profile `wide` of vitulus_depth_obstacles only
+  # (Settings > Camera), part of the mapping profile; no second filter here.
   use_cam_obstacle: true
-  obstacle_max_range_m: 2.8         # D435 conservative depth cap
   # (3) camera FREE/ground: /ground_cloud (erodes stale obstacles).
   use_cam_free: true
-  free_max_range_m: 2.8
   # log-odds model. An obstacle cell shows only after min_hits DISTINCT frames
   # AND log-odds >= occ_thresh; free/miss erodes transients back to unknown/free.
   hit_inc: 0.5                       # +log-odds per obstacle frame
@@ -178,17 +178,6 @@ direct_raster:
   occ_thresh: 0.85                   # render OCCUPIED at/above this (2 hits)
   free_thresh: -0.4                  # render FREE at/below this (1 miss)
   min_hits: 3                        # frames of obstacle evidence before it shows
-  # camera-obstacle LIVE re-filter (2026-08-09): the WIDE obstacles chain
-  # (obstacles_detection_wide in the RTABMAP_OBSTACLES container, window
-  # 0.05..2.0 m, depth 4.0 m) hands over MORE candidates than the retired
-  # narrow topics did; the final decision window/blob size is applied in
-  # direct_raster in base_link z and is live-settable (set_direct + UI
-  # sliders + environment presets). Defaults reproduce the old narrow
-  # 0.15..0.5 m behaviour exactly.
-  cam_obstacle_min_h: 0.15           # obstacle floor above base_link z (m)
-  cam_obstacle_max_h: 0.5            # obstacle ceiling (m)
-  cam_min_cluster_pts: 1             # min points per blob (1 = off)
-  cam_cluster_radius_m: 0.15         # blob connect radius (m)
   lidar_min_intensity: 0.0           # weak lidar return gate (0 = off)
   lidar_scan_topic: /rplidar/scan_filtered
   obstacle_cloud_topic: /mapping/obstacles_cloud_wide

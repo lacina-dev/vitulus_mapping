@@ -1,14 +1,8 @@
-"""Direct-raster environment presets (shared, ROS-free).
+"""The old environment presets (2026-08-09), in their old keys.
 
-Environment presets (2026-08-09): named PARTIAL settings dicts applied via
-/mapping/direct_preset. Only the "environment character" keys — source
-enables and ranges are the user's own live choice and are never touched by
-a preset. Custom presets (saved from the UI) persist globally in
-direct_presets.json and shadow a builtin of the same name.
-
-direct_raster applies/saves/deletes them (session only); mapping_manager
-(always running) publishes the list on /mapping_manager/direct_presets so
-the UI can show it outside a session too (vitulus-field#23).
+Since 2026-11-01 a mapping profile (profiles.py) is what the Map tab selects.
+What stays here: the values of the built-in ones, translated by
+profiles.from_legacy, and the reader of direct_presets.json for the migration.
 """
 
 import json

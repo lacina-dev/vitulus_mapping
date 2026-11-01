@@ -39,12 +39,25 @@ Interfaces (absolute, UI-friendly):
                                      include/exclude one session from the
                                      site's COMBINED map (rebuilds it)
   in   /mapping_manager/rebuild_combined std_msgs/String  site ('' = served)
-  out  /mapping_manager/direct_presets std_msgs/String  latched JSON
-                                     {presets: [{name, builtin, values}]} —
-                                     the direct_raster environment presets,
-                                     available with or without a session
-                                     (vitulus-field#23); republished when
-                                     direct_presets.json changes
+  in   /mapping_manager/profile_cmd  std_msgs/String  JSON {id, cmd: select |
+                                     set | reset | save | delete, name, mapper,
+                                     camera, keys}: the mapping profile
+                                     (profiles.py). This node is its only writer
+  out  /mapping_manager/profile_state std_msgs/String  latched JSON: site,
+                                     active profile, values, what differs from
+                                     the profile, the list, the state of the
+                                     camera chain, the answer to the last cmd
+  in   /mapping/direct_preset        std_msgs/String  the old {action: apply |
+                                     save | delete, name}, for the agent's skill
+
+MAPPING PROFILE (2026-11-01): the site in use (recording, else served) has one;
+with the site it changes. The lidar + evidence part reaches direct_raster through
+<site>/direct_overrides.json at its start and /mapping/set_direct during a
+recording; the camera part is pushed to the profile `wide` of depth_obstacles
+(/depth_obstacles/set) until its ~config shows those values. depth_obstacles keeps
+one global store, the site's values are in the site: a change made in the Camera
+card (an answer on ~config that is not ours) is taken into the site's state, same
+for a raw /mapping/set_direct.
 
 COMBINED MAP (2026-09-13, composite.py): every site keeps ONE derived raster
 'combined' = all its session rasters merged through UTM, newer observed
@@ -79,7 +92,7 @@ from sensor_msgs.msg import CompressedImage
 from std_msgs.msg import String
 from tf.transformations import euler_from_quaternion
 
-from vitulus_mapping import bundle, composite, editmask, geo, objnames, presets
+from vitulus_mapping import bundle, composite, editmask, geo, objnames, profiles
 from vitulus_mapping.demgrid import DemGrid
 from vitulus_mapping.pgmio import load_occupancy_pgm
 from vitulus_mapping.preview import dem_to_png
@@ -182,17 +195,7 @@ class MappingManager:
             '/mapping_manager/track_baseline', String, queue_size=1, latch=True)
         self.pub_save_wp_at = rospy.Publisher(
             '/navi_manager/save_waypoint_at', String, queue_size=1)
-        # vitulus-field#23: direct_raster (the preset apply/save/delete owner)
-        # runs only during a session, so the UI had no preset list outside
-        # one. The manager runs permanently -> it publishes the list (read-only
-        # from direct_presets.json; direct_raster stays the only writer).
-        self.presets_path = os.path.expanduser(rospy.get_param(
-            '~presets_path', presets.DEFAULT_PATH))
-        self._presets_sig = None
-        self.pub_direct_presets = rospy.Publisher(
-            '/mapping_manager/direct_presets', String, queue_size=1,
-            latch=True)
-        self._publish_direct_presets()
+        self._profile_init()
         rospy.Subscriber('/mapping_manager/start', String, self.cb_start,
                          queue_size=1)
         rospy.Subscriber('/mapping_manager/stop', String, self.cb_stop,
@@ -270,29 +273,265 @@ class MappingManager:
         # per-raster mgmt: latch an empty raster_preview at boot so subscribers
         # (the UI 3D preview layer) always get an initial message.
         self._clear_preview()
+        self._profile_tick()
 
-    # ---- environment presets (vitulus-field#23) -------------------------------
-    def _publish_direct_presets(self):
-        """(Re)publish the latched preset list when direct_presets.json changed
-        (or on the first call). Called at boot and from the 1 Hz tick, so a
-        save/delete done by direct_raster in a session shows up within ~1 s
-        and survives the session's end."""
+    # ---- mapping profile (2026-11-01) -----------------------------------------
+    def _profile_init(self):
+        self.pf = profiles.Store(self.base_dir)
+        self.pf_lock = threading.RLock()
+        self.pf_site = None
+        self.pf_state = None
+        self.pf_last = None         # answer to the last command
+        self.pf_sent = None         # last published state (JSON)
+        self.wide = None            # profile `wide` of /depth_obstacles/config
+        self.cam_seq = 0
+        self.cam_push = None        # {id, sig, t} our change on its way
+        self.cam_refused = None     # {sig, errors}
+        self.cam_seen = None        # id of the last ~config answer handled
         try:
-            st = os.stat(self.presets_path)
-            sig = (st.st_mtime_ns, st.st_size)
-        except OSError:
-            sig = 'missing'
-        if sig == self._presets_sig:
-            return
-        self._presets_sig = sig
-        try:
-            custom = presets.load_custom(self.presets_path)
+            done = self.pf.migrate_all()
+            if done:
+                rospy.logwarn('mapping_manager: sites converted to mapping '
+                              'profiles: %s', ', '.join(done))
         except Exception as e:
-            # same fallback as direct_raster: builtins only
-            rospy.logwarn('mapping_manager: could not load presets: %s', e)
-            custom = {}
-        self.pub_direct_presets.publish(String(json.dumps(
-            {'presets': presets.presets_list(custom)})))
+            rospy.logerr('mapping_manager: profile migration: %s', e)
+        self.pub_profile = rospy.Publisher('/mapping_manager/profile_state',
+                                           String, queue_size=1, latch=True)
+        self.pub_set_direct = rospy.Publisher('/mapping/set_direct', String,
+                                              queue_size=2)
+        self.pub_depth_set = rospy.Publisher('/depth_obstacles/set', String,
+                                             queue_size=2)
+        rospy.Subscriber('/mapping_manager/profile_cmd', String,
+                         self.cb_profile_cmd, queue_size=8)
+        rospy.Subscriber('/mapping/direct_preset', String,
+                         self.cb_direct_preset, queue_size=2)
+        rospy.Subscriber('/mapping/set_direct', String, self.cb_set_direct_seen,
+                         queue_size=4)
+        self.sub_depth_cfg = rospy.Subscriber(
+            '/depth_obstacles/config', String, self.cb_depth_config,
+            queue_size=4)
+
+    def _profile_site(self):
+        if self.running():
+            return self.site
+        return self.serving.get('site') if self.serving else None
+
+    def _profile_activate(self, site):
+        """The state of `site` takes over. A site without one (new) starts as a
+        copy of what was in use."""
+        st = self.pf.load_state(site)
+        if st is None:
+            st = json.loads(json.dumps(self.pf_state)) if self.pf_state else {
+                'active': profiles.DEFAULT_PROFILE, 'camera': {}, 'mapper': {}}
+            self.pf.save_state(site, st)
+        self.pf_site, self.pf_state = site, st
+        self.cam_push = self.cam_refused = None
+        if self.pf.take_pending(st):
+            self.pf.save_state(site, st)
+        self.pf.write_overrides(site, st)
+        rospy.loginfo('mapping_manager: mapping profile of %s: %s', site or
+                      '(no map)', st['active'])
+
+    def _profile_tick(self):
+        """1 Hz: follow the site, keep the camera chain on the site's values."""
+        # a Stop holds this lock until the map is served again: no site in between
+        with self._lifecycle_lock:
+            site = self._profile_site()
+        with self.pf_lock:
+            try:
+                if self.pf_state is None or site != self.pf_site:
+                    self._profile_activate(site)
+                self._camera_sync()
+                self._profile_publish()
+            except Exception as e:
+                rospy.logerr('mapping_manager: profile tick: %s', e)
+
+    def _profile_changed(self):
+        """After every change of the state: file, overrides, recording, camera."""
+        self.pf.save_state(self.pf_site, self.pf_state)
+        self.pf.write_overrides(self.pf_site, self.pf_state)
+        if self.running():
+            vals = dict(self.pf.effective(self.pf_state)['mapper'], _by='manager')
+            self.pub_set_direct.publish(String(json.dumps(vals)))
+        self._camera_sync()
+
+    def _profile_publish(self):
+        st = self.pf_state
+        base = self.pf.profile(st['active'])
+        eff = self.pf.effective(st)
+        cam = dict(self.pf.camera_defaults, **eff['camera'])
+        base_cam = dict(self.pf.camera_defaults, **base['camera'])
+        doc = {'site': self.pf_site, 'recording': self.running(),
+               'active': st['active'],
+               'builtin': st['active'] in profiles.BUILTIN_PROFILES,
+               'custom': st['active'] in self.pf.custom,
+               'overrides': {'camera': st['camera'], 'mapper': st['mapper']},
+               'modified': len(st['camera']) + len(st['mapper']),
+               'values': {'camera': cam, 'mapper': eff['mapper']},
+               'base': {'camera': base_cam, 'mapper': base['mapper']},
+               'profiles': self.pf.listing(), 'camera_sync': self._camera_state(),
+               'last': self.pf_last}
+        text = json.dumps(doc, sort_keys=True)
+        if text != self.pf_sent:
+            self.pf_sent = text
+            self.pub_profile.publish(String(text))
+
+    def cb_profile_cmd(self, msg):
+        try:
+            req = json.loads(msg.data)
+            if not isinstance(req, dict):
+                raise ValueError('not an object')
+        except ValueError as e:
+            rospy.logwarn('mapping_manager: profile_cmd: %s', e)
+            return
+        with self.pf_lock:
+            if self.pf_state is None:
+                self._profile_activate(self._profile_site())
+            try:
+                ok, err = self._profile_do(req)
+            except Exception as e:      # a bad payload must not end the callback
+                rospy.logwarn('mapping_manager: profile_cmd: %s', e)
+                ok, err = False, str(e)
+            self.pf_last = {'id': req.get('id'), 'cmd': req.get('cmd'),
+                            'ok': ok, 'error': err}
+            if ok:
+                self._profile_changed()
+            self._profile_publish()
+
+    def _profile_do(self, req):
+        st, cmd = self.pf_state, req.get('cmd')
+        name = str(req.get('name') or '').strip()
+        if cmd == 'select':
+            if name not in self.pf.names():
+                return False, 'unknown profile'
+            st.update(active=name, camera={}, mapper={})
+            return True, None
+        if cmd == 'set':
+            return self.pf.set_mapper(st, req.get('mapper') or {})
+        if cmd == 'reset':
+            if req.get('camera') is None and req.get('mapper') is None:
+                self.pf.discard(st)
+            else:
+                self.pf.discard(st, req.get('camera') or [],
+                                req.get('mapper') or [])
+            return True, None
+        if cmd == 'save':
+            return self.pf.save_profile(st, name)
+        if cmd == 'delete':
+            return self.pf.delete_profile(name or st['active'], keep=st)
+        return False, 'unknown command'
+
+    def cb_direct_preset(self, msg):
+        """The old topic of the presets: same meaning, now on the profiles."""
+        try:
+            req = json.loads(msg.data)
+            cmd = {'apply': 'select', 'save': 'save',
+                   'delete': 'delete'}[req['action']]
+            name = req.get('name', '')
+        except (ValueError, KeyError, TypeError) as e:
+            rospy.logwarn('mapping_manager: direct_preset: %s', e)
+            return
+        self.cb_profile_cmd(String(json.dumps(
+            {'id': 'direct_preset', 'cmd': cmd, 'name': name})))
+
+    def cb_set_direct_seen(self, msg):
+        """set_direct from anybody else (the agent's skill, a page from before
+        the update): the value would end with the session, so it joins the state."""
+        try:
+            req = json.loads(msg.data)
+        except ValueError:
+            return
+        if not isinstance(req, dict) or '_by' in req:
+            return
+        vals = {k: v for k, v in req.items() if k in profiles.MAPPER_KEYS}
+        if not vals:
+            return
+        with self.pf_lock:
+            if self.pf_state is None:
+                return
+            ok, err = self.pf.set_mapper(self.pf_state, vals)
+            if not ok:
+                rospy.logwarn('mapping_manager: set_direct not kept: %s', err)
+                return
+            self.pf.save_state(self.pf_site, self.pf_state)
+            self.pf.write_overrides(self.pf_site, self.pf_state)
+            self._profile_publish()
+
+    def cb_depth_config(self, msg):
+        try:
+            cfg = json.loads(msg.data)
+        except ValueError:
+            return
+        wide = [p for p in cfg.get('profiles') or [] if p.get('name') == 'wide']
+        if not wide:
+            return
+        with self.pf_lock:
+            self.wide = wide[0]
+            self.pf.camera_defaults.update(self.wide.get('defaults') or {})
+            last = cfg.get('last') or {}
+            lid = last.get('id')
+            if last.get('profile') == 'wide' and lid and lid != self.cam_seen:
+                self.cam_seen = lid
+                if str(lid).startswith('mapprofile-'):
+                    if self.cam_push and self.cam_push['id'] == lid:
+                        if not last.get('ok'):
+                            self.cam_refused = {'sig': self.cam_push['sig'],
+                                                'errors': last.get('errors') or []}
+                        self.cam_push = None
+                elif last.get('ok') and self.pf_state is not None:
+                    # the Camera card: it belongs to this site from now on
+                    vals = self.wide.get('values') or {}
+                    self.pf.set_camera(self.pf_state, {
+                        k: vals[k] for k in last.get('changed') or [] if k in vals})
+                    self.pf.save_state(self.pf_site, self.pf_state)
+                    self.pf.write_overrides(self.pf_site, self.pf_state)
+            if self.pf_state is not None:
+                self._camera_sync()
+                self._profile_publish()
+
+    def _camera_diff(self):
+        """What separates the chain from the site: (values, keys to reset)."""
+        want = self.pf.effective(self.pf_state)['camera']
+        vals = self.wide.get('values') or {}
+        dflt = self.wide.get('defaults') or {}
+        push = {k: v for k, v in want.items()
+                if k not in vals or not profiles.same(vals[k], v)}
+        back = sorted(k for k in vals if k not in want and k in dflt
+                      and not profiles.same(vals[k], dflt[k]))
+        return push, back
+
+    def _camera_online(self):
+        return self.wide is not None and \
+            self.sub_depth_cfg.get_num_connections() > 0
+
+    def _camera_sync(self):
+        if not self._camera_online():
+            return
+        push, back = self._camera_diff()
+        if not push and not back:
+            self.cam_push = self.cam_refused = None
+            return
+        sig = json.dumps([push, back], sort_keys=True)
+        if self.cam_refused and self.cam_refused['sig'] == sig:
+            return
+        if self.cam_push and self.cam_push['sig'] == sig and \
+                time.time() - self.cam_push['t'] < 3.0:
+            return
+        if self.pub_depth_set.get_num_connections() == 0:
+            return
+        self.cam_seq += 1
+        cid = 'mapprofile-%d-%d' % (os.getpid(), self.cam_seq)
+        self.cam_push = {'id': cid, 'sig': sig, 't': time.time()}
+        self.pub_depth_set.publish(String(json.dumps(
+            {'cmd': 'set', 'id': cid, 'profile': 'wide', 'values': push,
+             'reset': back})))
+
+    def _camera_state(self):
+        if not self._camera_online():
+            return {'state': 'offline'}
+        if self.cam_refused:
+            return {'state': 'refused', 'errors': self.cam_refused['errors']}
+        return {'state': 'pending' if any(self._camera_diff()) else 'ok'}
 
     # ---- lifecycle -----------------------------------------------------------
     def running(self):
@@ -485,6 +724,11 @@ class MappingManager:
             self.stop_proc()
         # M13: per-site voxel/raster resolution (site_config.json), default 0.05.
         res = self._site_resolution(site)
+        # the site's mapping profile, before direct_raster reads its overrides
+        with self.pf_lock:
+            if site != self.pf_site or self.pf_state is None:
+                self._profile_activate(site)
+            self._camera_sync()
         # DIRECT-RASTER-ONLY (2026-07-19): the launch has no octomap arg anymore;
         # direct_raster is the sole mapper. site + resolution are the only args.
         cmd = ['roslaunch', 'vitulus_mapping', 'mapping_v3.launch',
@@ -1865,7 +2109,7 @@ class MappingManager:
         if self.serve_error and time.time() - getattr(
                 self, '_serve_error_t', 0.0) > 20.0:
             self.serve_error = None
-        self._publish_direct_presets()
+        self._profile_tick()
         sites = sorted(n for n in os.listdir(self.base_dir)
                        if os.path.isdir(os.path.join(self.base_dir, n)))
         status = {
