@@ -37,12 +37,14 @@ import time
 
 import yaml
 
+from vitulus_mapping import objnames
+
 __all__ = [
     "SITES_ROOT", "site_dir", "site_exists", "list_sites",
     "manifest_path", "waypoints_path", "paths_path", "zones_path",
     "programs_path", "bundle_files",
     "load_manifest", "save_manifest",
-    "load_waypoints", "save_waypoints",
+    "load_waypoints", "save_waypoints", "migrate_dock_names",
     "load_paths", "save_paths",
     "load_zones", "save_zones",
     "load_edits", "save_edits", "edits_path", "edits_utm_zone",
@@ -207,7 +209,7 @@ def _utm_zone_for(site, utm_zone):
     # FRESH-SITE FIX (2026-07-19 night): virgin sites have no manifest (those
     # were only ever written by the one-time migration), which made EVERY
     # bundle save on a new site raise here — the silent killer of the
-    # auto-saved 'docked' waypoint. The session datum.yaml carries the zone;
+    # auto-saved DOCKED waypoint. The session datum.yaml carries the zone;
     # fall back to it, then to the robot's home zone.
     try:
         with open(os.path.join(site_dir(site), "datum.yaml")) as f:
@@ -238,8 +240,15 @@ def _feature(geometry, properties):
 # --------------------------------------------------------------------------
 # waypoints  (Point)
 # --------------------------------------------------------------------------
+def _canonical_waypoints(waypoints):
+    """The dock points named canonically, one of each (objnames)."""
+    kept = objnames.normalize_dock_names([wp.get("name") for wp in waypoints])
+    return [dict(waypoints[i], name=name) for i, name in kept]
+
+
 def load_waypoints(site):
-    """Return list of {name, e, n, yaw_rad, z?}.  [] if file absent."""
+    """Return list of {name, e, n, yaw_rad, z?}.  [] if file absent.  Dock points
+    always come out canonical, also from a file not migrated yet."""
     p = waypoints_path(site)
     if not os.path.exists(p):
         return []
@@ -256,14 +265,14 @@ def load_waypoints(site):
         elif props.get("z") is not None:
             wp["z"] = float(props["z"])
         out.append(wp)
-    return out
+    return _canonical_waypoints(out)
 
 
 def save_waypoints(site, waypoints, utm_zone=None):
     """waypoints: iterable of {name, e, n, yaw_rad, z?}."""
     zone = _utm_zone_for(site, utm_zone)
     feats = []
-    for wp in waypoints:
+    for wp in _canonical_waypoints(list(waypoints)):
         z = wp.get("z")
         coords = [float(wp["e"]), float(wp["n"])]
         if z is not None:
@@ -274,6 +283,45 @@ def save_waypoints(site, waypoints, utm_zone=None):
             props["z"] = float(z)
         feats.append(_feature({"type": "Point", "coordinates": coords}, props))
     _write_json(waypoints_path(site), _fc(zone, feats))
+
+
+def migrate_dock_names(site):
+    """Rewrite a site from before the uppercase names (owner 2026-11-01):
+    `docked` -> DOCKED in waypoints.geojson and in the objects_meta.json keys.
+    Idempotent, only writes what differs, safe with two callers and with any
+    file missing.  True if something changed."""
+    changed = False
+    p = waypoints_path(site)
+    if os.path.exists(p):
+        fc = _load_json(p)
+        feats = fc.get("features", [])
+        names = [(f.get("properties") or {}).get("name") for f in feats]
+        kept = objnames.normalize_dock_names(names)
+        if [n for _, n in kept] != names:
+            out = []
+            for i, name in kept:
+                feat = feats[i]
+                feat["properties"] = dict(feat.get("properties") or {}, name=name)
+                out.append(feat)
+            fc["features"] = out
+            _write_json(p, fc)
+            changed = True
+    p = os.path.join(site_dir(site), "objects_meta.json")
+    if os.path.exists(p):
+        meta = _load_json(p)
+        renamed = {}
+        for key in list(meta):
+            family, _, name = key.partition(":")
+            canon = objnames.canonical_name(name)
+            if family == "waypoint" and canon != name:
+                renamed[key] = "%s:%s" % (family, canon)
+        for key, target in renamed.items():
+            entry = meta.pop(key)
+            meta.setdefault(target, entry)
+        if renamed:
+            _write_json(p, meta)
+            changed = True
+    return changed
 
 
 # --------------------------------------------------------------------------

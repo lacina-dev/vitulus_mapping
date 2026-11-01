@@ -1,0 +1,283 @@
+#!/usr/bin/env python3
+"""map_objects_server -- one interface over every map object (docs/MAP_OBJECTS.md).
+
+The logic lives in vitulus_mapping.objects_engine, without ROS; this node is its
+topics and the wire to the owners of the files.
+
+  in   /map_objects/op           std_msgs/String JSON {req, actor, op, ...}
+  out  /map_objects/result       std_msgs/String JSON, latched (last result; pair by req)
+  out  /map_objects/objects      latched {site, seq, objects}
+  out  /map_objects/rules        latched {site, seq, stamp, rules}, on change only
+  out  /map_objects/history      latched {seq, can_undo, can_redo, entries}
+  out  /map_objects/suggestions  latched
+
+Owners keep writing their files: navi_man (waypoints, paths), node_planner
+(zones), mapping_manager (edits). Ops and the 1 Hz watcher run on the one main
+loop below; callbacks only store state and queue, so a slow zone regeneration
+holds up other ops and nothing else, and nothing here can publish from two
+threads at once.
+
+Sources of truth for readiness: /mapping_manager/status (served site, serve
+errors), /navi_manager/map_ready (navi_man holds that site; before this a save
+would export the previous site's points over the new one's file).
+"""
+
+import copy
+import json
+import queue
+import threading
+import time
+
+import rospy
+from geometry_msgs.msg import Point32
+from std_msgs.msg import Bool, String
+from vitulus_msgs.msg import MapEditZone, PlannerProgram, PlannerProgramList
+
+from vitulus_mapping import bundle, objects_engine, objnames
+from vitulus_mapping.objects_engine import Refuse
+
+RENAME_TOPICS = {'waypoint': '/navi_manager/rename_point',
+                 'path': '/navi_manager/rename_path',
+                 'edit': '/mapping_manager/rename_edit',
+                 'zone': '/web_plan/rename_zone'}
+OWNER_WAIT_S = 2.0
+
+
+class RosOwners:
+    """objects_engine's `owners` over the existing owner topics."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._site = None
+        self._serve_error = None
+        self._serve_error_t = 0.0
+        self._map_ready = {}
+        self._zone_results = {}    # name -> (time, message) of a refusal
+        self._renames = {}         # (kind, old) -> (time, message) of a refusal
+        self._busy = False
+        self._program = ''
+        self._programs = {}        # name -> PlannerProgram as the planner holds it
+        pub = lambda t, c=String: rospy.Publisher(t, c, queue_size=10)
+        self.pubs = {
+            'save_waypoint': pub('/navi_manager/save_waypoint_at'),
+            'remove_waypoint': pub('/navi_manager/remove_point'),
+            'save_path': pub('/navi_manager/save_path_at'),
+            'remove_path': pub('/navi_manager/remove_path'),
+            'save_edit': pub('/mapping_manager/save_edit'),
+            'remove_edit': pub('/mapping_manager/remove_edit'),
+            'save_zone': pub('/web_plan/save_zone', MapEditZone),
+            'remove_zone': pub('/web_plan/remove_zone'),
+            'save_program': pub('/web_plan/program_new', PlannerProgram),
+        }
+        self.rename_pubs = {k: pub(t) for k, t in RENAME_TOPICS.items()}
+        rospy.Subscriber('/mapping_manager/status', String, self._cb_status, queue_size=1)
+        rospy.Subscriber('/navi_manager/map_ready', String, self._cb_ready, queue_size=1)
+        rospy.Subscriber('/web_plan/zone_result', String, self._cb_zone, queue_size=10)
+        rospy.Subscriber(objnames.RENAME_RESULT_TOPIC, String, self._cb_rename, queue_size=10)
+        rospy.Subscriber('/web_plan/program_list', PlannerProgramList,
+                         self._cb_programs, queue_size=1)
+        rospy.Subscriber('/mower_smach/busy', Bool, self._cb_busy, queue_size=1)
+        rospy.Subscriber('/mower_smach/active_program', String, self._cb_program, queue_size=1)
+
+    # ---- callbacks: store, nothing else ------------------------------------
+    def _cb_status(self, msg):
+        try:
+            d = json.loads(msg.data)
+        except ValueError:
+            return
+        serving = d.get('serving') or {}
+        with self._lock:
+            self._site = serving.get('site') if isinstance(serving, dict) else None
+            self._serve_error = d.get('serve_error')
+            self._serve_error_t = float(d.get('serve_error_t') or 0.0)
+
+    def _cb_ready(self, msg):
+        try:
+            d = json.loads(msg.data)
+        except ValueError:
+            return
+        with self._lock:
+            self._map_ready = d
+
+    def _cb_zone(self, msg):
+        try:
+            d = json.loads(msg.data)
+        except ValueError:
+            return
+        if not d.get('ok'):
+            with self._lock:
+                self._zone_results[d.get('name')] = (time.time(), d.get('message') or 'failed')
+
+    def _cb_rename(self, msg):
+        try:
+            d = json.loads(msg.data)
+        except ValueError:
+            return
+        if not d.get('ok'):
+            with self._lock:
+                self._renames[(d.get('kind'), d.get('from'))] = (
+                    time.time(), d.get('code') or 'failed')
+
+    def _cb_programs(self, msg):
+        with self._lock:
+            self._programs = {p.name: p for p in msg.program_list}
+
+    def _cb_busy(self, msg):
+        with self._lock:
+            self._busy = bool(msg.data)
+
+    def _cb_program(self, msg):
+        with self._lock:
+            self._program = msg.data
+
+    # ---- engine interface --------------------------------------------------
+    def site(self):
+        with self._lock:
+            return self._site
+
+    def running_program(self):
+        with self._lock:
+            return self._program if self._busy and self._program else None
+
+    def mission_busy(self):
+        with self._lock:
+            return self._busy
+
+    def not_ready(self, family, site):
+        with self._lock:
+            if family in ('waypoint', 'path'):
+                m = self._map_ready
+                if not (m.get('ready') and m.get('site') == site and m.get('served') == site):
+                    return 'navi_not_ready'
+            elif family == 'edit' and self._site != site:
+                return 'no_site'
+        return None
+
+    def failure(self, family, name, since):
+        with self._lock:
+            if family == 'zone':
+                hit = self._zone_results.get(name)
+                if hit and hit[0] >= since:
+                    return hit[1]
+            elif family == 'edit' and self._serve_error and self._serve_error_t >= since:
+                return self._serve_error
+            hit = self._renames.get((family, name))
+            if hit and hit[0] >= since:
+                return hit[1]
+        return None
+
+    def _send(self, pub, msg):
+        """A publisher made seconds ago may not be connected yet, and an owner may
+        be down: then the op is refused, not silently dropped."""
+        t0 = time.time()
+        while pub.get_num_connections() == 0:
+            if time.time() - t0 > OWNER_WAIT_S or rospy.is_shutdown():
+                raise Refuse('owner_offline:' + pub.resolved_name)
+            time.sleep(0.05)
+        pub.publish(msg)
+
+    def save(self, family, obj):
+        if family == 'waypoint':
+            x, y = obj['points'][0]
+            payload = {'name': obj['name'], 'x': x, 'y': y, 'yaw': obj.get('yaw') or 0.0}
+        elif family == 'path':
+            payload = {'name': obj['name'], 'points': obj['points']}
+            if obj['props'].get('yaws'):
+                payload['yaws'] = obj['props']['yaws']
+        elif family == 'edit':
+            payload = {'name': obj['name'], 'kind': obj['type'], 'points': obj['points']}
+            if obj['type'] == 'wall':
+                payload['width_m'] = obj['props'].get('width_m', 0.10)
+        else:
+            self._send(self.pubs['save_zone'], self._zone_msg(obj))
+            return
+        self._send(self.pubs['save_' + family], String(json.dumps(payload)))
+
+    @staticmethod
+    def _zone_msg(obj):
+        p = obj['props']
+        z = MapEditZone()
+        z.header.stamp = rospy.Time.now()
+        z.header.frame_id = 'map'
+        z.name = obj['name']
+        z.type = str(p.get('type', 'normal'))
+        z.cut_height = int(p['cut_height'])
+        z.rpm = int(p['rpm'])
+        z.border_paths = int(p['border_paths'])
+        z.coverage_angle = int(p['coverage_angle'])
+        z.paths_distance = float(p['paths_distance'])
+        z.simplify = float(p['simplify'])
+        z.polygon.header = z.header
+        z.polygon.polygon.points = [Point32(x=x, y=y) for x, y in obj['points']]
+        return z
+
+    def remove(self, family, name):
+        self._send(self.pubs['remove_' + family], String(name))
+
+    def save_program(self, name, zone_names, added):
+        """The planner's own program save with everything but the zones as it holds
+        them. It swaps each zone for its workspace copy by name, so the zone just
+        restored may go by name alone. Any other name it does not hold stays out:
+        such a zone has no workspace copy and would land as a shell without paths,
+        and programs.yaml keeps it anyway (planner_io.merge_zone_names)."""
+        with self._lock:
+            known = self._programs.get(name)
+        if known is None:
+            raise Refuse('program_unknown:' + name)
+        msg = copy.deepcopy(known)
+        have = {z.name: z for z in msg.zone_list}
+        msg.zone_list = [have[n] if n in have else MapEditZone(name=n)
+                         for n in zone_names if n in have or n == added]
+        self._send(self.pubs['save_program'], msg)
+
+    def rename(self, family, old, new):
+        self._send(self.rename_pubs[family], String(json.dumps({'from': old, 'to': new})))
+
+
+class MapObjectsServer:
+    def __init__(self):
+        bundle.SITES_ROOT = rospy.get_param('~base_dir', bundle.SITES_ROOT)
+        self.ops = queue.Queue()
+        latched = lambda t: rospy.Publisher(t, String, queue_size=1, latch=True)
+        self.pubs = {k: latched('/map_objects/' + k) for k in
+                     ('result', 'objects', 'rules', 'history', 'suggestions')}
+        self.owners = RosOwners()
+        self.engine = objects_engine.Engine(self.owners, self.emit,
+                                            log=lambda t: rospy.logwarn('map_objects: %s', t))
+        rospy.Subscriber('/map_objects/op', String, self.cb_op, queue_size=50)
+        rospy.loginfo('map_objects_server up, sites in %s', bundle.SITES_ROOT)
+
+    def emit(self, what, payload):
+        self.pubs[what].publish(String(json.dumps(payload, ensure_ascii=False)))
+
+    def cb_op(self, msg):
+        self.ops.put(msg.data)
+
+    def spin(self):
+        next_tick = 0.0
+        while not rospy.is_shutdown():
+            try:
+                data = self.ops.get(timeout=0.2)
+            except queue.Empty:
+                data = None
+            if data is not None:
+                self._handle(data)
+            now = time.time()
+            if now >= next_tick:
+                next_tick = now + 1.0
+                try:
+                    self.engine.tick()
+                except Exception as e:
+                    rospy.logerr_throttle(30.0, 'map_objects: tick failed: %r' % (e,))
+
+    def _handle(self, data):
+        try:
+            msg = json.loads(data)
+        except ValueError:
+            msg = None
+        self.engine.handle(msg)
+
+
+if __name__ == '__main__':
+    rospy.init_node('map_objects_server')
+    MapObjectsServer().spin()

@@ -11,9 +11,43 @@ import json
 RENAME_RESULT_TOPIC = '/map_objects/rename_result'
 
 MAX_LEN = 60
-# Fixed meaning elsewhere: dock flows, the dock seed.
-RESERVED = ('DOCK', 'UNDOCK', 'docked')
+# Fixed meaning elsewhere: dock flows, the dock seed. All uppercase, everywhere
+# (owner 2026-11-01); sites from before hold `docked`, see normalize_dock_names.
+RESERVED = ('DOCK', 'UNDOCK', 'DOCKED')
 _RESERVED_FOLDED = {n.casefold() for n in RESERVED}
+_DOCK_CANONICAL = {n.casefold(): n for n in RESERVED}
+
+
+def canonical_name(name):
+    """The uppercase name for any case of DOCK/UNDOCK/DOCKED, else `name`."""
+    if isinstance(name, str):
+        return _DOCK_CANONICAL.get(name.strip().casefold(), name)
+    return name
+
+
+def is_dock_point(name):
+    """True for DOCK, UNDOCK, DOCKED in any case. These can move, never go."""
+    return isinstance(name, str) and name.strip().casefold() in _RESERVED_FOLDED
+
+
+def normalize_dock_names(names):
+    """[(index, name)] of the items to keep from the list `names`, in order.
+
+    A dock point in another case gets its canonical name. One point stays per
+    dock name, so a site never ends with `docked` beside `DOCKED`: the exact
+    canonical one wins (only new code writes it), else the first. Other names
+    pass untouched. Idempotent."""
+    exact = {n for n in names if n in RESERVED}
+    taken = set()
+    kept = []
+    for i, name in enumerate(names):
+        canon = canonical_name(name)
+        if canon in _DOCK_CANONICAL.values():
+            if canon in taken or (canon in exact and name != canon):
+                continue
+            taken.add(canon)
+        kept.append((i, canon))
+    return kept
 
 
 def parse_request(data):
@@ -64,7 +98,7 @@ def message_for(code, old, new):
         'empty': 'The name is empty.',
         'too_long': 'The name is longer than {} characters.'.format(MAX_LEN),
         'bad_chars': "The name '{}' contains characters that cannot be used.".format(new),
-        'reserved': "DOCK, UNDOCK and docked are reserved names.",
+        'reserved': "DOCK, UNDOCK and DOCKED are reserved names.",
         'exists': "The name '{}' is already used.".format(new),
         'busy': "'{}' is in use right now — stop it first.".format(old),
         'no_site': 'No map is active.',

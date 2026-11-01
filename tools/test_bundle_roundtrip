@@ -9,7 +9,7 @@ NO ROS required.  Checks:
      manifest.
   3. atomicity smoke: after a write no *.tmp.* files are left behind.
   4. REALITY check against the live pickle + site datum (no assert, prints):
-     the 'docked' waypoint of GARDEN_2026***env*OUTDOOR converted with the
+     the DOCKED waypoint of GARDEN_2026***env*OUTDOOR converted with the
      pickle's own datum vs with novamapa/datum.yaml -- quantifies the
      pickle-vs-site datum delta on a real point.
 
@@ -168,7 +168,7 @@ def test_bundle_io():
 
 
 def test_reality():
-    print("[4] REALITY: 'docked' waypoint pickle-datum vs site datum.yaml")
+    print("[4] REALITY: DOCKED waypoint pickle-datum vs site datum.yaml")
     import pickle
     import yaml
     try:
@@ -197,11 +197,11 @@ def test_reality():
         return
     pt = None
     for p in md.points:
-        if p.name == "docked":
+        if p.name in ("docked", "DOCKED"):
             pt = p
             break
     if pt is None:
-        print("      (skipped: no 'docked' waypoint)")
+        print("      (skipped: no DOCKED waypoint)")
         return
     x, y = pt.pose.position.x, pt.pose.position.y
     pdatum = geo.from_pickle_datum(md)
@@ -225,7 +225,7 @@ def test_reality():
     disc = math.hypot(e_s - e_p, n_s - n_p)
     de, dn, dalt, dyaw = geo.datum_delta(pdatum, sdatum)
     print("      -> UTM via site datum.yaml = (%.3f, %.3f)" % (e_s, n_s))
-    print("      DISCREPANCY on 'docked' (pickle vs site datum) = %.4f m"
+    print("      DISCREPANCY on DOCKED (pickle vs site datum) = %.4f m"
           % disc)
     print("      datum delta site-minus-pickle: dE=%.4f dN=%.4f dAlt=%s "
           "dYaw=%.6f rad (%.3f mrad)"

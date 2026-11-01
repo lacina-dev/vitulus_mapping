@@ -1,0 +1,36 @@
+# map_world_recorder (docs/MAP_OBJECTS.md section 7). Code defaults match these.
+
+# Deck: a disc on base_link. Same numbers as the coverage planner
+# (vitulus_planner MapSpec.COVERAGE_DIAMETER, paths run the deck centre).
+deck_diameter_m: 0.29
+deck_offset_x_m: 0.0
+
+flush_s: 30.0          # contract
+layer_min_s: 30.0      # contract: layers at most this often
+slope_res_m: 0.5
+
+# awake while the blade turns or for this long after the last nonzero command
+active_hold_s: 20.0
+
+# one look around while driving, at least this far apart in time and space
+sample_period_s: 20.0
+sample_move_m: 1.0
+sample_radius_m: 5.0
+
+# contract thresholds, see vitulus_mapping/suggestions.py for the rest
+suggest:
+  min_seen: 3
+  min_positions: 2
+  min_span_s: 120.0
+
+# Mow load trail, see vitulus_mapping/mowtrail.py for the rest. trip_a must match
+# the firmware's ISENSE_MAX, printed by the mower config (PRINT on /mower/set_cmd).
+mow_trail:
+  trip_a: 1.54
+  stall_ratio: 0.25
+  overload_load: 0.85
+  temp_warn_c: 60.0
+  temp_max_c: 70.0
+  step_m: 0.10
+  period_s: 0.5
+  max_runs: 30

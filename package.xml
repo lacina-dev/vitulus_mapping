@@ -20,6 +20,8 @@
   <depend>tf2_ros</depend>
   <depend>ublox_msgs</depend>
   <depend>vitulus_msgs</depend>
+  <exec_depend>vitulus_ups</exec_depend>
+  <exec_depend>rosgraph_msgs</exec_depend>
 
   <exec_depend>laser_geometry</exec_depend>
 

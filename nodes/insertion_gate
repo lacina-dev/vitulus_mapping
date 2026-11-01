@@ -648,16 +648,16 @@ class InsertionGateNode:
                           '%.3f, %.3f | %.3f m), yaw %.3f deg -> %s',
                           len(samples), e, n, de, dn, delta,
                           math.degrees(yaw), datum_path)
-            # STEP 2d: the "docked" waypoint lives in the navi map pickle in
+            # STEP 2d: the DOCKED waypoint lives in the navi map pickle in
             # MAP-frame coords under the OLD datum. After a meaningful datum
-            # shift, the GPS-world <-> map alignment moved; re-save "docked"
+            # shift, the GPS-world <-> map alignment moved; re-save DOCKED
             # once while docked + well-localized so the dock seed and RTK agree.
             if delta > 0.05:
                 rospy.logwarn(
                     'insertion_gate: datum moved %.3f m — recommend re-saving '
-                    'the "docked" waypoint once while docked & well-localized: '
+                    'the DOCKED waypoint once while docked & well-localized: '
                     'rostopic pub -1 /navi_manager/save_waypoint std_msgs/String '
-                    '"data: \'docked\'"', delta)
+                    '"data: \'DOCKED\'"', delta)
         else:
             rospy.logwarn('insertion_gate: site georeference WRITTEN at stop '
                           '(%d samples): utm %.3f, %.3f -> %s',

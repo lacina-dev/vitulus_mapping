@@ -1,0 +1,12 @@
+<launch>
+  <!-- World layers and suggestions (docs/MAP_OBJECTS.md section 7). Permanent
+       node, runs with the robot, not per mapping session. enabled:=false keeps
+       the node up and doing nothing. -->
+  <arg name="enabled" default="true"/>
+
+  <node pkg="vitulus_mapping" type="map_world_recorder" name="map_world_recorder"
+        output="log" respawn="true" respawn_delay="10">
+    <rosparam command="load" file="$(find vitulus_mapping)/config/map_world_recorder.yaml"/>
+    <param name="enabled" value="$(arg enabled)"/>
+  </node>
+</launch>

@@ -1,0 +1,421 @@
+#!/usr/bin/env python3
+"""
+map_world_recorder -- records what the robot learns about the world while it
+works: coverage, GNSS quality, slope layer, suggestions. Robot feature, no agent
+dependency. Contract: docs/MAP_OBJECTS.md section 7. Logic lives in
+vitulus_mapping.worldlayers and vitulus_mapping.suggestions; this file is only
+the ROS adapter.
+
+  in   /mower/status                        vitulus_msgs/Mower  real rpm = blade on
+  in   /mobile_base_controller/cmd_vel      geometry_msgs/Twist wake signal
+  in   /gnss/navpvt                         ublox_msgs/NavPVT   only while awake
+  in   TF map->base_link                                        only while awake
+  one-shot while driving, about every 20 s:
+       /move_base_flex/global_costmap/costmap, /navi_manager/map,
+       /safety/lidar_objects
+  out  /map_objects/layer/<coverage|gnss|slope>   std_msgs/String latched JSON
+
+Mow load trail (vitulus_mapping.mowtrail, contract section 11):
+  in   /mower/stall, /mower_smach/busy, /mower_smach/active_program,
+       /mower_smach/stop_reason, /mower_smach/status, /map_rules/state,
+       /pm/power_status, /nav_tf/loc_status, /map_objects/mow_trail/request
+       while awake: /gnss/navpvt, /gnss/rxmrtcm (5.5 msg/s, counted, not parsed)
+       only during a run: /rosout_agg (the smach's event lines), /bno085/imu and
+       /base/*_wheel_state as raw bytes, parsed once per tick and not per message
+  out  /map_objects/mow_trail           append JSON, about 1 Hz while running
+       /map_objects/mow_trail/snapshot  latched, the current or last run
+       /map_objects/mow_trail/past      latched, the answer to a request
+       /map_objects/mow_trail/detail    the raw row behind a tap
+       /map_objects/mow_runs            latched list of runs
+
+COST. The NUC is shared. /tf at 63 Hz through rospy is what would make this node
+expensive, so TF and navpvt are subscribed only while awake. Awake = the blade
+turns, or the mux put out a nonzero command in the last ~active_hold_s. Docked or
+parked the node holds two quiet subscriptions and a 1 Hz stat loop.
+
+The costmap is taken one-shot: costmap_2d sends the full grid to each new
+subscriber, numpy_msg avoids building a Python tuple of it, and
+world_query.obstacles classifies it. world_query.collect (the 2-4 s path) is not
+used. The site comes from .last_served, the served site is what the map frame
+means; mapping_manager/status would mean a JSON parse at 1.4 Hz for the same fact.
+"""
+
+import json
+import math
+import os
+import threading
+import time
+
+import rospy
+from geometry_msgs.msg import Twist
+from nav_msgs.msg import OccupancyGrid
+from rosgraph_msgs.msg import Log
+from rospy.numpy_msg import numpy_msg
+from sensor_msgs.msg import Imu
+from std_msgs.msg import Bool, String
+from ublox_msgs.msg import NavPVT, RxmRTCM
+from vitulus_msgs.msg import Moteus_controller_state, Mower
+from vitulus_ups.msg import power_status
+
+from vitulus_mapping import bundle, mowtrail, suggestions, worldlayers
+
+try:
+    from vitulus_mapping import objects as map_objects
+except ImportError:
+    map_objects = None
+
+BLADE_STALE_S = 3.0     # /mower/status is 2 Hz; silence is not a turning blade
+GNSS_STALE_S = 1.5
+TF_STALE_S = 1.0
+LAYERS = ('coverage', 'gnss', 'slope')
+WHEELS = ('front_left', 'front_right', 'rear_left', 'rear_right')
+WHEEL_STALE_S = 1.0
+SMACH_NODE = '/node_mower_smach'
+
+
+def load_world_query():
+    """vitulus_navi.world_query, or None. setup.py of vitulus_navi does not list
+    the module, so it joins the package path the way scripts/world_query does."""
+    try:
+        import rospkg
+        import vitulus_navi
+        src = os.path.join(rospkg.RosPack().get_path('vitulus_navi'), 'src', 'vitulus_navi')
+        if src not in list(getattr(vitulus_navi, '__path__', [])):
+            vitulus_navi.__path__.append(src)
+        from vitulus_navi import world_query
+        return world_query
+    except Exception as exc:                               # noqa: BLE001
+        rospy.logwarn('map_world_recorder: no world_query, no suggestions: %s', exc)
+        return None
+
+
+class Node(object):
+    def __init__(self):
+        cfg = {}
+        for key in worldlayers.DEFAULTS:
+            value = rospy.get_param('~' + key, None)
+            if value is not None:
+                cfg[key] = value
+        self.suggest_cfg = {}
+        for key in suggestions.DEFAULTS:
+            value = rospy.get_param('~suggest/' + key, None)
+            if value is not None:
+                self.suggest_cfg[key] = value
+        base_dir = rospy.get_param('~base_dir', '')
+        if base_dir:
+            bundle.SITES_ROOT = os.path.expanduser(base_dir)
+
+        self.active_hold_s = float(rospy.get_param('~active_hold_s', 20.0))
+        self.sample_period_s = float(rospy.get_param('~sample_period_s', 20.0))
+        self.sample_move_m = float(rospy.get_param('~sample_move_m', 1.0))
+        self.sample_radius_m = float(rospy.get_param('~sample_radius_m', 5.0))
+        self.map_ttl_s = float(rospy.get_param('~map_ttl_s', 300.0))
+        self.costmap_topic = rospy.get_param('~costmap_topic',
+                                             '/move_base_flex/global_costmap/costmap')
+        self.map_topic = rospy.get_param('~map_topic', '/navi_manager/map')
+        self.objects_topic = rospy.get_param('~lidar_objects_topic', '/safety/lidar_objects')
+        self.gnss_topic = rospy.get_param('~gnss_topic', '/gnss/navpvt')
+        self.rtcm_topic = rospy.get_param('~rtcm_topic', '/gnss/rxmrtcm')
+        self.suggest_on = bool(rospy.get_param('~suggestions', True))
+
+        self.pubs = dict((name, rospy.Publisher('/map_objects/layer/' + name, String,
+                                                queue_size=1, latch=True))
+                         for name in LAYERS)
+        self.rec = worldlayers.WorldRecorder(self._publish, self._log, cfg)
+        trail_cfg = {'deck_m': self.rec.cfg['deck_diameter_m']}
+        for key in mowtrail.DEFAULTS:
+            value = rospy.get_param('~mow_trail/' + key, None)
+            if value is not None:
+                trail_cfg[key] = value
+        self.trail_pubs = {
+            'trail': rospy.Publisher('/map_objects/mow_trail', String, queue_size=4),
+            'snapshot': rospy.Publisher('/map_objects/mow_trail/snapshot', String,
+                                        queue_size=1, latch=True),
+            'past': rospy.Publisher('/map_objects/mow_trail/past', String, queue_size=1, latch=True),
+            'detail': rospy.Publisher('/map_objects/mow_trail/detail', String, queue_size=4),
+            'runs': rospy.Publisher('/map_objects/mow_runs', String, queue_size=1, latch=True),
+        }
+        self.trail = mowtrail.TrailRecorder(self._publish_trail, self._log, trail_cfg)
+
+        self.rpm = 0
+        self.rpm_t = 0.0
+        self.cmd_t = 0.0
+        self.run_subs = []             # only while a run is open
+        self.imu_raw = None
+        self.wheel_raw = {}            # wheel -> (bytes, time)
+        self.pvt = None
+        self.pvt_t = 0.0
+
+        self.tf_buf = None
+        self.tf_listener = None
+        self.sub_gnss = None
+        self.sub_rtcm = None
+
+        self.wq = load_world_query() if self.suggest_on else None
+        self.sample = None             # thread fetching one look
+        self.sample_result = None
+        self.sample_t = 0.0
+        self.sample_at = None
+        self.map_grid = None
+        self.map_t = 0.0
+
+        rospy.Subscriber('/mower/status', Mower, self._cb_mower, queue_size=1)
+        rospy.Subscriber(rospy.get_param('~cmd_topic', '/mobile_base_controller/cmd_vel'),
+                         Twist, self._cb_cmd, queue_size=1)
+        rospy.Subscriber('/mower/stall', String, self._cb_stall, queue_size=1)
+        rospy.Subscriber('/mower_smach/busy', Bool,
+                         lambda m: self.trail.feed_busy(m.data), queue_size=1)
+        rospy.Subscriber('/mower_smach/active_program', String,
+                         lambda m: self.trail.feed_program(m.data), queue_size=1)
+        rospy.Subscriber('/mower_smach/stop_reason', String,
+                         lambda m: self.trail.feed_stop_reason(m.data), queue_size=1)
+        rospy.Subscriber('/map_rules/state', String, self._cb_rules, queue_size=1)
+        rospy.Subscriber('/mower_smach/status', String,
+                         lambda m: self.trail.feed_smach(time.time(), m.data), queue_size=4)
+        rospy.Subscriber('/pm/power_status', power_status, self._cb_power, queue_size=1)
+        rospy.Subscriber('/nav_tf/loc_status', String, self._cb_loc, queue_size=1)
+        rospy.Subscriber('/map_objects/mow_trail/request', String, self._cb_request, queue_size=4)
+
+    # ---- callbacks -----------------------------------------------------------
+    def _cb_mower(self, msg):
+        now = time.time()
+        rpm = mowtrail.sane_rpm(msg.moto_rpm)
+        if rpm is not None:          # a garbage sample (-31966) is no turning blade
+            self.rpm = rpm
+            self.rpm_t = now
+        self.trail.feed_status(now, msg.status, msg.moto_rpm, msg.setpoint_rpm, msg.temp,
+                               msg.current_height)
+
+    def _cb_power(self, msg):
+        self.trail.feed_power(time.time(), msg.battery_voltage, msg.battery_capacity,
+                              msg.battery_discharge_power)
+
+    def _cb_loc(self, msg):
+        try:
+            self.trail.feed_owner(time.time(), json.loads(msg.data).get('owner'))
+        except (ValueError, AttributeError):
+            pass
+
+    def _cb_log(self, msg):
+        if msg.name == SMACH_NODE:
+            self.trail.feed_log(time.time(), msg.msg)
+
+    def _cb_imu_raw(self, msg):
+        self.imu_raw = msg._buff
+
+    def _cb_wheel_raw(self, msg, wheel):
+        self.wheel_raw[wheel] = (msg._buff, time.time())
+
+    def _run_signals(self, on):
+        """100 Hz IMU and four wheels at 50 Hz: subscribed for a run, and raw, so
+        nothing is parsed per message. The log only when something can be said."""
+        if on == bool(self.run_subs):
+            return
+        if not on:
+            for sub in self.run_subs:
+                sub.unregister()
+            self.run_subs = []
+            self.imu_raw = None
+            self.wheel_raw = {}
+            self.trail.attitude = self.trail.wheel = None
+            return
+        self.run_subs = [
+            rospy.Subscriber('/rosout_agg', Log, self._cb_log, queue_size=8),
+            rospy.Subscriber('/bno085/imu', rospy.AnyMsg, self._cb_imu_raw, queue_size=1)]
+        for wheel in WHEELS:
+            self.run_subs.append(rospy.Subscriber(
+                '/base/%s_wheel_state' % wheel, rospy.AnyMsg, self._cb_wheel_raw,
+                callback_args=wheel, queue_size=1))
+
+    def _parse_run_signals(self, now):
+        raw = self.imu_raw
+        if raw is not None:
+            try:
+                q = Imu().deserialize(raw).orientation
+                self.trail.attitude = (
+                    math.atan2(2.0 * (q.w * q.x + q.y * q.z), 1.0 - 2.0 * (q.x * q.x + q.y * q.y)),
+                    math.asin(max(-1.0, min(1.0, 2.0 * (q.w * q.y - q.z * q.x)))))
+            except Exception:                              # noqa: BLE001
+                self.trail.attitude = None
+        total, seen = 0.0, 0
+        for buff, stamp in list(self.wheel_raw.values()):
+            if now - stamp <= WHEEL_STALE_S:
+                try:
+                    total += abs(Moteus_controller_state().deserialize(buff).torque)
+                    seen += 1
+                except Exception:                          # noqa: BLE001
+                    pass
+        self.trail.wheel = total * 4.0 / seen if seen else None
+
+    def _cb_stall(self, msg):
+        self.trail.feed_stall(time.time(), msg.data)
+
+    def _cb_rules(self, msg):
+        try:
+            self.trail.feed_rule(time.time(), json.loads(msg.data).get('blade'))
+        except (ValueError, AttributeError):
+            pass
+
+    def _cb_request(self, msg):
+        try:
+            item = json.loads(msg.data)
+        except ValueError:
+            return
+        if isinstance(item, dict):
+            self.trail.request(item)
+
+    def _cb_cmd(self, msg):
+        if msg.linear.x or msg.linear.y or msg.angular.z:
+            self.cmd_t = time.time()
+        self.trail.feed_cmd(msg.linear.x)
+
+    def _cb_pvt(self, msg):
+        self.pvt = (int(msg.hAcc), worldlayers.fix_class(msg.fixType, msg.flags),
+                    int(msg.numSV), int(msg.pDOP))
+        self.pvt_t = time.time()
+
+    def _cb_rtcm(self, msg):
+        # flags bit 0 crc failed, bits 1-2 2 = used, as gnss_status reads them
+        self.trail.feed_rtcm(time.time(), ((msg.flags >> 1) & 3) == 2, bool(msg.flags & 1))
+
+    def _publish(self, layer, payload):
+        self.pubs[layer].publish(String(json.dumps(payload, separators=(',', ':'))))
+
+    def _publish_trail(self, kind, payload):
+        self.trail_pubs[kind].publish(String(json.dumps(payload, separators=(',', ':'))))
+
+    def _log(self, text):
+        rospy.logwarn_throttle(60.0, 'map_world_recorder: ' + text)
+
+    # ---- awake / asleep ------------------------------------------------------
+    def _wake(self):
+        if self.tf_listener is not None:
+            return
+        import tf2_ros
+        self.tf_buf = tf2_ros.Buffer(cache_time=rospy.Duration(5.0))
+        self.tf_listener = tf2_ros.TransformListener(self.tf_buf)
+        self.sub_gnss = rospy.Subscriber(self.gnss_topic, NavPVT, self._cb_pvt, queue_size=1)
+        self.trail.rtcm = mowtrail.RtcmMeter()   # no counting while asleep: no false gap
+        self.sub_rtcm = rospy.Subscriber(self.rtcm_topic, RxmRTCM, self._cb_rtcm, queue_size=16)
+        rospy.loginfo('map_world_recorder: awake')
+
+    def _sleep(self):
+        if self.tf_listener is None:
+            return
+        self.tf_listener.unregister()
+        self.sub_gnss.unregister()
+        self.sub_rtcm.unregister()
+        self.tf_listener = self.tf_buf = self.sub_gnss = self.sub_rtcm = None
+        self.pvt = None
+        rospy.loginfo('map_world_recorder: asleep')
+
+    def _pose(self):
+        """(x, y, yaw) of base_link in map, None when TF is missing or stale."""
+        try:
+            tr = self.tf_buf.lookup_transform('map', 'base_link', rospy.Time(0))
+        except Exception:                                  # noqa: BLE001
+            return None
+        if abs((rospy.Time.now() - tr.header.stamp).to_sec()) > TF_STALE_S:
+            return None
+        t, q = tr.transform.translation, tr.transform.rotation
+        yaw = math.atan2(2.0 * (q.w * q.z + q.x * q.y), 1.0 - 2.0 * (q.y * q.y + q.z * q.z))
+        return t.x, t.y, yaw
+
+    # ---- suggestions ---------------------------------------------------------
+    def _grid(self, topic):
+        msg = rospy.wait_for_message(topic, numpy_msg(OccupancyGrid), timeout=2.0)
+        o = msg.info.origin.position
+        return self.wq.Grid({'w': msg.info.width, 'h': msg.info.height,
+                             'res': msg.info.resolution, 'ox': o.x, 'oy': o.y,
+                             'data': msg.data, 'topic': topic})
+
+    def _fetch(self, robot, now):
+        """Runs in its own thread: the subscriptions wait, recording must not."""
+        rows = None
+        try:
+            if self.map_grid is None or now - self.map_t > self.map_ttl_s:
+                self.map_grid = self._grid(self.map_topic)
+                self.map_t = now
+            cost = self._grid(self.costmap_topic)
+            moving = []
+            try:
+                raw = rospy.wait_for_message(self.objects_topic, String, timeout=0.5)
+                moving = self.wq.moving_objects(json.loads(raw.data), robot)
+            except (rospy.ROSException, ValueError):
+                pass                 # no detector: persistence still filters movers
+            rows = self.wq.obstacles(cost, self.map_grid, robot,
+                                     radius_m=self.sample_radius_m, moving=moving, limit=24)
+        except Exception as exc:                           # noqa: BLE001
+            self._log('look around failed: %s' % exc)
+        self.sample_result = (rows, robot, now)
+
+    def _suggest(self, now, pose):
+        if self.sample_result is not None:
+            rows, robot, stamp = self.sample_result
+            self.sample_result = None
+            self.sample = None
+            site, datum = self.rec.site, self.rec.datum
+            if rows and site and datum:
+                known = None
+                if map_objects is not None:
+                    try:
+                        known = map_objects.load_all(site)
+                    except Exception as exc:               # noqa: BLE001
+                        self._log('objects: %s' % exc)
+                suggestions.observe(site, rows, robot, datum, known, stamp, self.suggest_cfg)
+        moved = (self.sample_at is None
+                 or math.hypot(pose[0] - self.sample_at[0],
+                               pose[1] - self.sample_at[1]) >= self.sample_move_m)
+        if (self.wq is None or self.rec.site is None or self.sample is not None
+                or now - self.sample_t < self.sample_period_s or not moved):
+            return
+        self.sample_t = now
+        self.sample_at = pose
+        robot = {'x': pose[0], 'y': pose[1], 'yaw': pose[2]}
+        self.sample = threading.Thread(target=self._fetch, args=(robot, now), daemon=True)
+        self.sample.start()
+
+    # ---- loop ----------------------------------------------------------------
+    def run(self):
+        rospy.on_shutdown(self.rec.close)
+        rospy.on_shutdown(self.trail.close)
+        while not rospy.is_shutdown():
+            now = time.time()
+            self.rec.poll(now)
+            self.trail.sync_site(self.rec.site, self.rec.datum, now)
+            blade = self.rpm > 0 and now - self.rpm_t <= BLADE_STALE_S
+            awake = (blade or now - self.cmd_t <= self.active_hold_s
+                     or self.trail.wants_pose(now))
+            pose = gnss = None
+            if awake:
+                self._wake()
+                pose = self._pose()
+                if self.pvt is not None and now - self.pvt_t <= GNSS_STALE_S:
+                    gnss = self.pvt
+            else:
+                self._sleep()
+            age = self.trail.rtcm.read(now) if gnss is not None else None
+            self.rec.step(now, pose, blade, gnss, age[1] if age else None)
+            if pose is not None:
+                self._suggest(now, pose)
+            self.rec.maintain(now)
+            self.trail.gnss = gnss
+            self._run_signals(self.trail.run is not None)
+            if self.run_subs:
+                self._parse_run_signals(now)
+            self.trail.step(now, pose)
+            self.trail.maintain(now)
+            time.sleep(0.2 if awake else 1.0)
+
+
+def main():
+    rospy.init_node('map_world_recorder')
+    if not rospy.get_param('~enabled', True):
+        rospy.loginfo('map_world_recorder: disabled by ~enabled')
+        rospy.spin()
+        return
+    Node().run()
+
+
+if __name__ == '__main__':
+    main()

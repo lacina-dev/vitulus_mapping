@@ -26,9 +26,12 @@ Interfaces (absolute, UI-friendly):
                                      newest raster of that site; '<site>/
                                      <raster>' = that exact raster ->
                                      publishes it as the site_map
-  out  /mapping_manager/site_map     nav_msgs/OccupancyGrid  latched, for
-                                     gloc_server's ~map_topic (WP1,
-                                     LOCALIZATION_V2_PLAN.md)
+  out  /mapping_manager/site_map     nav_msgs/OccupancyGrid  latched: the raster
+                                     + edits + active nogo rules, for the
+                                     planners and costmaps
+  out  /mapping_manager/site_map_loc nav_msgs/OccupancyGrid  latched: the same
+                                     without nogo, for gloc_server's ~map_topic
+                                     (a rule is no wall the lidar could see)
   in   /mapping_manager/preview_raster std_msgs/String  'site/raster' to show,
                                      '' to clear -> raw raster (NO edits)
   out  /mapping_manager/raster_preview nav_msgs/OccupancyGrid  latched raw
@@ -92,7 +95,8 @@ from sensor_msgs.msg import CompressedImage
 from std_msgs.msg import String
 from tf.transformations import euler_from_quaternion
 
-from vitulus_mapping import bundle, composite, editmask, geo, objnames, profiles
+from vitulus_mapping import (bundle, composite, dockpoints, editmask, geo, objects,
+                             objnames, profiles)
 from vitulus_mapping.demgrid import DemGrid
 from vitulus_mapping.pgmio import load_occupancy_pgm
 from vitulus_mapping.preview import dem_to_png
@@ -148,6 +152,15 @@ class MappingManager:
                                         # started with (None when stopped)
         self.edits_applied = 0     # WP-D1: number of human edits composited
                                    # onto the currently-served raster (status)
+        # Map rules (MAP_OBJECTS.md): a change of the active nogo set re-serves
+        # from the rules subscription and the 5 s timer, while cb_serve_site, a
+        # stop and the edit callbacks serve from their own threads. This lock
+        # makes "read serving + publish" one step, so a re-serve cannot put an
+        # older site back. Leaf lock: nothing inside takes _lifecycle_lock.
+        self._serve_lock = threading.RLock()
+        self._nogo_sig = None      # (site, rules_signature) stamped into site_map
+        self._nogo_last = (None, [])
+        self.nogo_stamped = 0
         # REPORT 2 (freeserve 2026-07-12): every stopped mapping session should be
         # immediately servable. Without this a just-mapped site had rasters=0 and
         # serve_site rejected it (serving fell back to the previously-served
@@ -178,6 +191,8 @@ class MappingManager:
         self.pub_site_map = rospy.Publisher('/mapping_manager/site_map',
                                             OccupancyGrid, queue_size=1,
                                             latch=True)
+        self.pub_site_map_loc = rospy.Publisher(
+            '/mapping_manager/site_map_loc', OccupancyGrid, queue_size=1, latch=True)
         # WP-D1: latched list of human edits for the serving site (MAP frame),
         # republished on every edit change and on every serve.
         self.pub_edit_list = rospy.Publisher('/mapping_manager/edit_list',
@@ -194,7 +209,7 @@ class MappingManager:
         self.pub_track_baseline = rospy.Publisher(
             '/mapping_manager/track_baseline', String, queue_size=1, latch=True)
         self.pub_save_wp_at = rospy.Publisher(
-            '/navi_manager/save_waypoint_at', String, queue_size=1)
+            '/navi_manager/save_waypoint_at', String, queue_size=10)
         self._profile_init()
         rospy.Subscriber('/mapping_manager/start', String, self.cb_start,
                          queue_size=1)
@@ -241,7 +256,11 @@ class MappingManager:
                          queue_size=1)
         rospy.Subscriber('/gloc/baseline', String, self.cb_gloc_baseline,
                          queue_size=1)
-        rospy.Timer(rospy.Duration(1.0), self.tick_status)
+        # The file decides, the topic only wakes us up sooner: this works with
+        # the server down too, and an expired rule leaves the map on time.
+        rospy.Subscriber('/map_objects/rules', String, self._rules_tick,
+                         queue_size=1)
+        rospy.Timer(rospy.Duration(5.0), self._rules_tick)
         rospy.on_shutdown(self.shutdown)
         self.show_site('')            # newest saved map visible right away
         rospy.loginfo('mapping_manager up, base_dir=%s', self.base_dir)
@@ -260,6 +279,9 @@ class MappingManager:
         # combined raster before the boot serve picks it.
         self._backfill_combined_all()
         self.auto_serve_last()
+        # Only now: status says what is served, and before the serve above it
+        # would tell a respawn from "nothing served" to everyone who listens.
+        rospy.Timer(rospy.Duration(1.0), self.tick_status)
         # WP-D1: ensure edit_list is latched even if nothing is served at boot
         # (auto_serve_last -> _publish_site_map already publishes it when a site
         # was restored). Republish for the restored serving site, else empty.
@@ -643,6 +665,35 @@ class MappingManager:
         return {'x': round(t.x, 3), 'y': round(t.y, 3),
                 'yaw_deg': round(math.degrees(yaw), 2)}
 
+    def _dock_points_to_save(self, site, wp):
+        """What the stop in the dock saves: DOCKED, plus DOCK and UNDOCK where the
+        site has none (owner 2026-11-01). Without the undock distance or the
+        names of the site only DOCKED goes out: a point the owner moved must
+        never be overwritten on a guess."""
+        yaw = math.radians(wp['yaw_deg'])
+        try:
+            existing = [p['name'] for p in bundle.load_waypoints(site)]
+        except Exception as e:
+            rospy.logwarn('mapping_manager: waypoints of %s unreadable (%s) - '
+                          'saving DOCKED only', site, e)
+            return dockpoints.points_to_save(None, wp['x'], wp['y'], yaw, None)
+        out_m = dockpoints.drive_out_m_from_params(rospy.get_param)
+        if out_m is None:
+            out_m = dockpoints.drive_out_m_from_yaml(self._dock_config_path())
+        if out_m is None:
+            rospy.logwarn('mapping_manager: undock distance unknown - DOCK and '
+                          'UNDOCK not created')
+        return dockpoints.points_to_save(existing, wp['x'], wp['y'], yaw, out_m)
+
+    @staticmethod
+    def _dock_config_path():
+        try:
+            import rospkg
+            return os.path.join(rospkg.RosPack().get_path('vitulus_dock'),
+                                'config', 'docking_controller.yaml')
+        except Exception:
+            return None
+
     def _verify_stop_in_dock(self, site):
         """PROTOCOL 2026-07-19: at Stop, check navi_transform's loc_status docked
         flag. DOCKED -> the dock<->map tie is fresh: record ended_docked + the
@@ -661,7 +712,7 @@ class MappingManager:
             rospy.loginfo('mapping_manager: session "%s" ended DOCKED — '
                           'dock<->map tie is fresh (map->base %s)', site,
                           json.dumps(pose) if pose else 'unavailable')
-            # PROTOCOL (user design, 2026-07-19): CREATE the 'docked' waypoint
+            # PROTOCOL (user design, 2026-07-19): CREATE the DOCKED waypoint
             # RIGHT NOW — the pose is still continuous with the RTK-anchored
             # drive, so this is the most accurate WORLD coordinate of the dock
             # available, captured exactly while GPS-denied at the dock. navi_man
@@ -983,21 +1034,23 @@ class MappingManager:
                 self._publish_site_map(stopped, raster)
                 # PROTOCOL order fix: now that the site is SERVED (navi_man has
                 # its serving context + finished the serving-change import),
-                # save the stop-in-dock 'docked' waypoint. 2 s oneshot lets the
-                # import land first; navi_man then adds the point and its
-                # bundle export persists it to waypoints.geojson.
+                # save the stop-in-dock DOCKED waypoint, and DOCK + UNDOCK when
+                # the site has none yet. 2 s oneshot lets the import land first;
+                # navi_man then adds the points and its bundle export persists
+                # them to waypoints.geojson.
                 wp = getattr(self, '_pending_dock_wp', None)
                 if wp is not None:
                     self._pending_dock_wp = None
-                    def _pub_dock_wp(_evt, _wp=wp):
+                    def _pub_dock_wp(_evt, _wp=wp, _site=stopped):
                         try:
-                            self.pub_save_wp_at.publish(String(json.dumps(
-                                {'name': 'docked', 'x': _wp['x'], 'y': _wp['y'],
-                                 'yaw': math.radians(_wp['yaw_deg'])})))
-                            rospy.loginfo('mapping_manager: docked waypoint '
-                                          'auto-saved (post-serve).')
+                            points = self._dock_points_to_save(_site, _wp)
+                            for point in points:
+                                self.pub_save_wp_at.publish(String(json.dumps(point)))
+                            rospy.loginfo('mapping_manager: dock waypoints %s '
+                                          'auto-saved (post-serve).',
+                                          ', '.join(p['name'] for p in points))
                         except Exception as e:
-                            rospy.logwarn('mapping_manager: docked waypoint '
+                            rospy.logwarn('mapping_manager: dock waypoints '
                                           'auto-save failed: %s', e)
                     rospy.Timer(rospy.Duration(2.0), _pub_dock_wp, oneshot=True)
             else:
@@ -1669,8 +1722,12 @@ class MappingManager:
         grid.info.height = 1
         grid.info.origin.orientation.w = 1.0
         grid.data = [-1]
-        self.pub_site_map.publish(grid)
-        self.serving = None
+        with self._serve_lock:
+            self.pub_site_map.publish(grid)
+            self.pub_site_map_loc.publish(grid)
+            self.serving = None
+            self._nogo_sig = None
+            self.nogo_stamped = 0
         self.edits_applied = 0                # WP-D1: nothing served -> no edits
         self.pub_edit_list.publish(String(json.dumps([])))
         # PROTOCOL: clear the baseline seed (empty grid -> gloc goes no_map; a
@@ -1688,7 +1745,28 @@ class MappingManager:
         rospy.loginfo('mapping_manager: site_map <- EMPTY (fresh session, '
                       'serving cleared)')
 
-    def _publish_site_map(self, site, raster):
+    def _grid_msg(self, data, resolution, origin_xy):
+        nx, ny = data.shape
+        grid = OccupancyGrid()
+        grid.header.stamp = rospy.Time.now()
+        grid.header.frame_id = self.map_frame
+        grid.info.resolution = resolution
+        grid.info.width = nx
+        grid.info.height = ny
+        grid.info.origin.position.x = origin_xy[0]
+        grid.info.origin.position.y = origin_xy[1]
+        grid.info.origin.orientation.w = 1.0
+        grid.data = data.T.ravel().tolist()   # row-major over y rows,
+                                               # matches the saved raster (pgmio)
+        return grid
+
+    def _publish_site_map(self, site, raster, rules_only=False):
+        """rules_only: only the active nogo set changed, so localization's map and
+        everything that follows a serve stay as they are."""
+        with self._serve_lock:
+            self._publish_site_map_locked(site, raster, rules_only)
+
+    def _publish_site_map_locked(self, site, raster, rules_only):
         base = os.path.join(self.base_dir, site, 'rasters', raster, raster)
         pgm_path = base + '.pgm'
         if not os.path.exists(pgm_path):
@@ -1705,18 +1783,29 @@ class MappingManager:
         self.edits_applied = self._composite_edits(data, site, resolution,
                                                     origin_xy)
 
-        grid = OccupancyGrid()
-        grid.header.stamp = rospy.Time.now()
-        grid.header.frame_id = self.map_frame
-        grid.info.resolution = resolution
-        grid.info.width = nx
-        grid.info.height = ny
-        grid.info.origin.position.x = origin_xy[0]
-        grid.info.origin.position.y = origin_xy[1]
-        grid.info.origin.orientation.w = 1.0
-        grid.data = data.T.ravel().tolist()   # row-major over y rows,
-                                               # matches the saved raster (pgmio)
+        # Only this copy goes to localization. Nogo last: an edit cannot erase it.
+        nogo = self._active_nogo(site)
+        loc = data.copy() if nogo else data
+        self.nogo_stamped = self._composite_nogo(data, nogo, resolution, origin_xy)
+        stamped = self.nogo_stamped == len(nogo)
+        # No signature unless it is in the map, so _check_rules tries again.
+        self._nogo_sig = (site, objects.rules_signature(nogo)) if stamped else None
+        if rules_only and not stamped:
+            # The map out there is still the better one, and a retry that
+            # publishes would regenerate every zone each 5 s.
+            rospy.logwarn_throttle(60.0, 'mapping_manager: nogo of %s not stamped '
+                                   '(%d of %d), retrying', site, self.nogo_stamped,
+                                   len(nogo))
+            return
+
+        grid = self._grid_msg(data, resolution, origin_xy)
         self.pub_site_map.publish(grid)
+        if rules_only:
+            rospy.loginfo('mapping_manager: site_map <- %s/%s, %d nogo stamped '
+                          '(rules changed)', site, raster, self.nogo_stamped)
+            return
+        self.pub_site_map_loc.publish(
+            self._grid_msg(loc, resolution, origin_xy) if nogo else grid)
 
         self.serving = {'site': site, 'raster': raster,
                         'mtime': int(os.path.getmtime(pgm_path))}
@@ -1803,6 +1892,54 @@ class MappingManager:
                           '— serving raw raster', site, e)
             return 0
 
+    def _active_nogo(self, site):
+        """Active nogo rules of the site (map frame). When they cannot be read the
+        last ones of this site stay, so a passing failure neither blocks serving
+        nor opens the nogo in the map."""
+        try:
+            rules = objects.load_rules(site)
+        except Exception as e:
+            rospy.logwarn('mapping_manager: rules of %s unreadable: %s', site, e)
+            rules = None
+        if rules is None:
+            return self._nogo_last[1] if self._nogo_last[0] == site else []
+        nogo = objects.stampable(rules)
+        self._nogo_last = (site, nogo)
+        return nogo
+
+    def _composite_nogo(self, data, nogo, resolution, origin_xy):
+        """Stamp nogo rules onto the array IN PLACE, as obstacles. Returns how many.
+        NEVER raises, same as _composite_edits."""
+        if not nogo:
+            return 0
+        try:
+            work = data.copy()
+            n = editmask.rasterize_edits(work, objects.nogo_stamp_edits(nogo),
+                                         resolution, origin_xy)
+            data[...] = work
+            return n
+        except Exception as e:
+            rospy.logwarn('mapping_manager: nogo stamping failed: %s', e)
+            return 0
+
+    def _rules_tick(self, _event=None):
+        """An exception out of a rospy.Timer callback ends that timer for good."""
+        try:
+            self._check_rules()
+        except Exception as e:
+            rospy.logerr_throttle(60.0, 'mapping_manager: rules check failed: %r' % (e,))
+
+    def _check_rules(self):
+        """Re-serve only when the active nogo set of the served site differs from
+        what is stamped: a serve regenerates every zone in the planner."""
+        with self._serve_lock:
+            if not self.serving:
+                return
+            site = self.serving['site']
+            sig = (site, objects.rules_signature(self._active_nogo(site)))
+            if sig != self._nogo_sig:
+                self._publish_site_map(site, self.serving['raster'], rules_only=True)
+
     def _edit_records_map(self, site):
         """Return [{name, kind, width_m, points:[[x,y],...] MAP frame}] for the
         site's edits, converting canonical UTM back to the current map frame.
@@ -1839,9 +1976,10 @@ class MappingManager:
     def _reserve_current(self):
         """Re-serve the current raster (re-composites edits + republishes
         site_map/edit_list). Used after an edit change."""
-        if self.serving:
-            self._publish_site_map(self.serving['site'],
-                                   self.serving['raster'])
+        with self._serve_lock:
+            if self.serving:
+                self._publish_site_map(self.serving['site'],
+                                       self.serving['raster'])
 
     def _next_edit_name(self, edits):
         """Autogenerate 'edit_<n>' not colliding with existing edit names."""
@@ -2145,6 +2283,7 @@ class MappingManager:
             'resolution': self.session_resolution,   # M13
             'datum_warning': self.datum_warning,      # M9
             'edits_applied': self.edits_applied,      # WP-D1
+            'nogo_stamped': self.nogo_stamped,
         }
         self.pub_status.publish(String(json.dumps(status)))
 
