@@ -20,8 +20,9 @@ Mow load trail (vitulus_mapping.mowtrail, contract section 11):
        /mower_smach/stop_reason, /mower_smach/status, /map_rules/state,
        /pm/power_status, /nav_tf/loc_status, /map_objects/mow_trail/request
        while awake: /gnss/navpvt, /gnss/rxmrtcm (5.5 msg/s, counted, not parsed)
-       only during a run: /rosout_agg (the smach's event lines), /bno085/imu and
-       /base/*_wheel_state as raw bytes, parsed once per tick and not per message
+       only during a run: /rosout_agg (the smach's event lines), /gloc/track_status,
+       /gnss/navsat (0.25 Hz), /gnss/monhw; /bno085/imu, /base/*_wheel_state and
+       /mobile_base_controller/odom as raw bytes, parsed once per tick, not per message
   out  /map_objects/mow_trail           append JSON, about 1 Hz while running
        /map_objects/mow_trail/snapshot  latched, the current or last run
        /map_objects/mow_trail/past      latched, the answer to a request
@@ -48,12 +49,12 @@ import time
 
 import rospy
 from geometry_msgs.msg import Twist
-from nav_msgs.msg import OccupancyGrid
+from nav_msgs.msg import OccupancyGrid, Odometry
 from rosgraph_msgs.msg import Log
 from rospy.numpy_msg import numpy_msg
 from sensor_msgs.msg import Imu
 from std_msgs.msg import Bool, String
-from ublox_msgs.msg import NavPVT, RxmRTCM
+from ublox_msgs.msg import MonHW, NavPVT, NavSAT, RxmRTCM
 from vitulus_msgs.msg import Moteus_controller_state, Mower
 from vitulus_ups.msg import power_status
 
@@ -71,6 +72,7 @@ LAYERS = ('coverage', 'gnss', 'slope')
 WHEELS = ('front_left', 'front_right', 'rear_left', 'rear_right')
 WHEEL_STALE_S = 1.0
 SMACH_NODE = '/node_mower_smach'
+EARTH_M = 6378137.0
 
 
 def load_world_query():
@@ -142,6 +144,9 @@ class Node(object):
         self.cmd_t = 0.0
         self.run_subs = []             # only while a run is open
         self.imu_raw = None
+        self.last_pose = None
+        self.odom_raw = None
+        self.check_pair = None         # (time, lat, lon, odometry bytes) of the last GPS message
         self.wheel_raw = {}            # wheel -> (bytes, time)
         self.pvt = None
         self.pvt_t = 0.0
@@ -200,6 +205,21 @@ class Node(object):
         if msg.name == SMACH_NODE:
             self.trail.feed_log(time.time(), msg.msg)
 
+    def _cb_odom_raw(self, msg):
+        self.odom_raw = msg._buff
+
+    def _cb_tracker(self, msg):
+        try:
+            self.trail.feed_tracker(time.time(), json.loads(msg.data))
+        except (ValueError, AttributeError, TypeError):
+            pass
+
+    def _cb_sat(self, msg):
+        used = [sv for sv in msg.sv if sv.flags & 8]
+        if used:
+            self.trail.feed_sat(time.time(), sum(sv.cno for sv in used) / float(len(used)),
+                                math.sqrt(sum((sv.prRes * 0.1) ** 2 for sv in used) / len(used)))
+
     def _cb_imu_raw(self, msg):
         self.imu_raw = msg._buff
 
@@ -215,13 +235,19 @@ class Node(object):
             for sub in self.run_subs:
                 sub.unregister()
             self.run_subs = []
-            self.imu_raw = None
+            self.imu_raw = self.odom_raw = self.check_pair = None
             self.wheel_raw = {}
-            self.trail.attitude = self.trail.wheel = None
+            self.trail.attitude = self.trail.wheel = self.trail.wheel_max = None
             return
         self.run_subs = [
             rospy.Subscriber('/rosout_agg', Log, self._cb_log, queue_size=8),
-            rospy.Subscriber('/bno085/imu', rospy.AnyMsg, self._cb_imu_raw, queue_size=1)]
+            rospy.Subscriber('/bno085/imu', rospy.AnyMsg, self._cb_imu_raw, queue_size=1),
+            rospy.Subscriber('/mobile_base_controller/odom', rospy.AnyMsg, self._cb_odom_raw,
+                             queue_size=1),
+            rospy.Subscriber('/gloc/track_status', String, self._cb_tracker, queue_size=2),
+            rospy.Subscriber('/gnss/navsat', NavSAT, self._cb_sat, queue_size=1),
+            rospy.Subscriber('/gnss/monhw', MonHW,
+                             lambda m: self.trail.feed_jam(time.time(), m.jamInd), queue_size=1)]
         for wheel in WHEELS:
             self.run_subs.append(rospy.Subscriber(
                 '/base/%s_wheel_state' % wheel, rospy.AnyMsg, self._cb_wheel_raw,
@@ -237,15 +263,35 @@ class Node(object):
                     math.asin(max(-1.0, min(1.0, 2.0 * (q.w * q.y - q.z * q.x)))))
             except Exception:                              # noqa: BLE001
                 self.trail.attitude = None
-        total, seen = 0.0, 0
+        total, seen, top = 0.0, 0, 0.0
         for buff, stamp in list(self.wheel_raw.values()):
             if now - stamp <= WHEEL_STALE_S:
                 try:
-                    total += abs(Moteus_controller_state().deserialize(buff).torque)
+                    torque = abs(Moteus_controller_state().deserialize(buff).torque)
+                    total += torque
+                    top = max(top, torque)
                     seen += 1
                 except Exception:                          # noqa: BLE001
                     pass
         self.trail.wheel = total * 4.0 / seen if seen else None
+        self.trail.wheel_max = top if seen else None
+        self._feed_check(now)
+
+    def _feed_check(self, now):
+        pair, self.check_pair = self.check_pair, None
+        pose = self.last_pose
+        if pair is None or pair[3] is None or pose is None:
+            return
+        try:
+            odom = Odometry().deserialize(pair[3]).pose.pose
+        except Exception:                                  # noqa: BLE001
+            return
+        q = odom.orientation
+        yaw = math.atan2(2.0 * (q.w * q.z + q.x * q.y), 1.0 - 2.0 * (q.y * q.y + q.z * q.z))
+        lat = math.radians(pair[1])
+        # only steps of a second matter: a tangent plane is plenty
+        self.trail.feed_check(pair[0], math.radians(pair[2]) * EARTH_M * math.cos(lat),
+                              lat * EARTH_M, odom.position.x, odom.position.y, yaw, pose[2])
 
     def _cb_stall(self, msg):
         self.trail.feed_stall(time.time(), msg.data)
@@ -272,6 +318,9 @@ class Node(object):
     def _cb_pvt(self, msg):
         self.pvt = (int(msg.hAcc), worldlayers.fix_class(msg.fixType, msg.flags),
                     int(msg.numSV), int(msg.pDOP))
+        # paired here: GPS and wheels then carry the same latency into the 1 s step
+        self.check_pair = (time.time(), msg.lat * 1e-7, msg.lon * 1e-7,
+                           self.odom_raw)
         self.pvt_t = time.time()
 
     def _cb_rtcm(self, msg):
@@ -401,6 +450,7 @@ class Node(object):
             self.rec.maintain(now)
             self.trail.gnss = gnss
             self._run_signals(self.trail.run is not None)
+            self.last_pose = pose
             if self.run_subs:
                 self._parse_run_signals(now)
             self.trail.step(now, pose)

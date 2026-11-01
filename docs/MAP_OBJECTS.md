@@ -204,20 +204,20 @@ closed 30 s after both ended. Load 0..1: 1.0 = the firmware cuts the motor, high
 rule hold`. Temperature is raw, the peak since the row before, spikes are never smoothed or dropped.
 
 Files `<site>/mow_load/`: `<run>.jsonl` while running, `<run>.npz` finished, `index.json`, last 30 runs. Raw on
-disk (26 columns, docstring of mowtrail.py, older 20-column runs load with the rest unknown); on the wire 15
+disk (34 columns, docstring of mowtrail.py, older 20 and 26-column runs load with the rest unknown); on the wire 18
 columns, downsampled, the rest by a tap.
 
 | Topic | Dir | Payload |
 |---|---|---|
-| `/map_objects/mow_trail` | out, about 1 Hz | `{"site","run","from","n","stride":15,"start","r":[...],"e":[...]}`; `end` when closed |
+| `/map_objects/mow_trail` | out, about 1 Hz | `{"site","run","from","n","stride":18,"start","r":[...],"e":[...]}`; `end` when closed |
 | `/map_objects/mow_trail/snapshot` | latched | current or last run, `{"site","run","active","program","start","n","ds","stride","r","limits"}`, at most 12000 rows |
 | `/map_objects/mow_trail/request` | in | `{"req","run"}`; run id, `current`, `list`; with `"t"` (0.1 s) the raw row |
 | `/map_objects/mow_trail/detail` | out | `{"req","ok","run","row":{...}}`, row with zone, path, chunk, owner, program, near events |
 | `/map_objects/mow_trail/past` | latched | answer with its `req`, a separate topic so one client never changes another's view |
-| `/map_objects/mow_runs` | latched | `{"site","active","runs":[{"id","program","start","end","stop_reason","rows","length_m","cut_m","mean_load","peak_load","peak_a","peak_temp","time_mow_s","time_transit_s","time_stop_s","stops","energy_wh","rtk_frac","rtcm_gaps","rtcm_rate","rtcm_age_max"}],"limits"}` |
+| `/map_objects/mow_runs` | latched | `{"site","active","runs":[{"id","program","start","end","stop_reason","rows","length_m","cut_m","mean_load","peak_load","peak_a","peak_temp","time_mow_s","time_transit_s","time_stop_s","stops","energy_wh","rtk_frac","rtcm_gaps","rtcm_rate","rtcm_age_max","wheel_mean","wheel_peak","fix_losses","gps_jumps","lidar_med","lidar_p95","jump_med","jump_p95"}],"limits"}` |
 
 Wire row: `x_cm, y_cm, load_pct, amps_ma, rpm, temp_dc, state (+16 = line break), t_ds, speed_cms, slope_dd, fix, rpm_dip,
-hacc_mm, rtcm_age_ds, rtcm_rate_ds`, unknown = -9999. Event on the wire: `t_ds, x_cm, y_cm, kind index` in `blocked hot overload rule temp recovery
-backup detour stall no_progress rewindow hold rtcm_gap fix_down fix_up`. `gnss_quality.npz` gained `rtcm_age_ds`
+hacc_mm, rtcm_age_ds, rtcm_rate_ds, wheel_cnm, lidar_cm, jump_cm`, unknown = -9999. Event on the wire: `t_ds, x_cm, y_cm, kind index` in `blocked hot overload rule temp recovery
+backup detour stall no_progress rewindow hold rtcm_gap fix_down fix_up gps_jump`. `gnss_quality.npz` gained `rtcm_age_ds`
 (worst age per cell), absent in older files.
 `worldlayers.layer_query(site, "mow_load", points|polygon|neither, run=None)`.

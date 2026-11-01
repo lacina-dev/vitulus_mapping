@@ -7,6 +7,7 @@ garbage sample -31966 with 91 C), storage, restart, pose jumps, site switch,
 bounds of the messages, the query for the agent.
 """
 import json
+import math
 import os
 import sys
 import tempfile
@@ -636,6 +637,121 @@ class Gnss(Base):
         self.assertGreater(again.h, 0)
         self.assertTrue((again.a['rtcm_age_ds'] == wl.RTCM_NONE).all())
         self.assertIsNone(wl.layer_query('a', 'gnss', points=[[1.0, 1.0]])['result'][0]['rtcm_age_max_s'])
+
+
+class Honesty(Base):
+    def test_tracker_only_while_gps_owns(self):
+        rec = self.recorder()
+        rec.feed_busy(True)
+        self.drive(rec, 1)
+        rec.feed_tracker(self.t, {'state': 'degenerate', 'corr_m': 1.0, 'rms': 0.05})
+        rec.feed_tracker(self.t, {'state': 'gps_owns', 'corr_m': 1.0, 'rms': 0.6})
+        rec.feed_tracker(self.t, {'state': 'ok', 'corr_m': 1.0, 'rms': 0.05})
+        self.assertIsNone(rec._read_lidar(self.t))
+        for corr in (0.10, 0.12, 0.90):
+            rec.feed_tracker(self.t, {'state': 'gps_owns', 'corr_m': corr, 'rms': 0.05, 'corr_yaw_deg': 1.5})
+        self.drive(rec, 1, x0=0.5, dt=0.1)
+        row = self.rows(rec)[-1]
+        self.assertEqual((int(row[mt.LIDAR]), int(row[mt.LIDAR_RMS]), int(row[mt.LIDAR_YAW])), (12, 50, 15))
+        self.t += 5
+        self.drive(rec, 1, x0=3.0)
+        self.assertEqual(int(self.rows(rec)[-1, mt.LIDAR]), mt.NONE)
+
+    def test_wheels_agree(self):
+        c = mt.GpsCheck()
+        self.assertIsNone(c.feed(T0, 100.0, 200.0, 0.0, 0.0, 0.0, 0.0))
+        got = c.feed(T0 + 1, 100.3, 200.0, 0.3, 0.0, 0.0, 0.0)
+        self.assertAlmostEqual(got, 0.0, places=6)
+
+    def test_rotated_frames(self):
+        # odometry starts 90 degrees from east, the pose knows the true heading
+        c = mt.GpsCheck()
+        c.feed(T0, 0.0, 0.0, 5.0, 5.0, 1.0, 0.0)
+        # the robot moves north; in odometry that is along its own yaw 1.0
+        got = c.feed(T0 + 1, 0.0, 0.3, 5.0 + 0.3 * math.cos(1.0), 5.0 + 0.3 * math.sin(1.0), 1.0, math.pi / 2)
+        self.assertAlmostEqual(got, 0.0, places=6)
+
+    def test_datum_yaw(self):
+        c = mt.GpsCheck()
+        c.feed(T0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.1)
+        # pose yaw 0.1 in a map turned 0.2 from east: the robot heads 0.3 from east
+        got = c.feed(T0 + 1, 0.3 * math.cos(0.3), 0.3 * math.sin(0.3), 0.3, 0.0, 0.0, 0.1, 0.2)
+        self.assertAlmostEqual(got, 0.0, places=6)
+
+    def test_lateral_jump_shows(self):
+        c = mt.GpsCheck()
+        c.feed(T0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+        self.assertAlmostEqual(c.feed(T0 + 1, 0.3, 0.2, 0.3, 0.0, 0.0, 0.0), 0.2, places=6)
+
+    def test_gps_moves_robot_stands(self):
+        c = mt.GpsCheck()
+        c.feed(T0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+        self.assertAlmostEqual(c.feed(T0 + 1, 3.8, 0.0, 0.0, 0.0, 0.0, 0.0), 3.8, places=6)
+
+    def test_turn_is_skipped(self):
+        c = mt.GpsCheck()
+        c.feed(T0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+        self.assertIsNone(c.feed(T0 + 1, 0.1, 0.1, 0.0, 0.0, 0.5, 0.5))
+        self.assertIsNone(c.read(T0 + 1))
+
+    def test_old_value_expires(self):
+        c = mt.GpsCheck()
+        c.feed(T0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+        c.feed(T0 + 1, 0.1, 0.0, 0.0, 0.0, 0.0, 0.0)
+        self.assertIsNotNone(c.read(T0 + 2))
+        self.assertIsNone(c.read(T0 + 9))
+
+    def test_jump_makes_an_event_and_a_row(self):
+        rec = self.recorder()
+        rec.feed_busy(True)
+        self.drive(rec, 2)
+        rec.feed_check(self.t, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+        self.t += 1.0
+        rec.feed_check(self.t, 0.9, 0.0, 0.2, 0.0, 0.0, 0.0)
+        self.drive(rec, 3, x0=1.0)
+        self.assertIn('gps_jump', [e[3] for e in rec.run.events])
+        self.assertEqual(int(self.rows(rec)[-1, mt.JUMP]), 70)
+
+    def test_sat_and_jam_in_the_row(self):
+        rec = self.recorder()
+        rec.feed_busy(True)
+        rec.feed_sat(self.t + 1, 25.1, 4.32)
+        rec.feed_jam(self.t + 1, 21)
+        self.drive(rec, 3)
+        row = self.rows(rec)[-1]
+        self.assertEqual((int(row[mt.CNO]), int(row[mt.PRRES]), int(row[mt.JAM])), (251, 432, 21))
+
+    def test_torque_totals(self):
+        rec = self.recorder()
+        rec.feed_busy(True)
+        rec.wheel, rec.wheel_max = 7.1, 2.6
+        self.drive(rec, 6)
+        rec.wheel = 21.0
+        self.drive(rec, 3, x0=2.0)
+        s = mt.summarize(self.rows(rec))
+        self.assertEqual(s['wheel_peak'], 21.0)
+        self.assertGreater(s['wheel_mean'], 7.0)
+        self.assertEqual(mt.wire(self.rows(rec))[-mt.WIRE_STRIDE:][15], 2100)
+        self.close_run(rec)
+        got = wl.layer_query('a', 'mow_load')['result']
+        self.assertEqual(got['wheel_peak'], 21.0)
+        got = wl.layer_query('a', 'mow_load', points=[[0.15, 0.0]])['result'][0]
+        self.assertEqual((got['wheel'], got['wheel_max']), (7.1, 2.6))
+
+    def test_every_old_width_loads(self):
+        os.makedirs(mt.run_dir('a'))
+        for i, width in enumerate((20, 26)):
+            run = '20261101_18431%d' % i
+            old = np.zeros((3, width), np.int32)
+            old[:, mt.WHEEL] = 710
+            meta = {'v': 1, 'run': run, 'site': 'a', 'start': T0, 'end': T0 + 9,
+                    'datum': [self.datum['utm_e'], self.datum['utm_n'], self.datum['yaw_rad']]}
+            mt._write_npz(os.path.join(mt.run_dir('a'), run + '.npz'), meta, old, [])
+            rows = mt.read_run('a', run, self.datum)[1]
+            self.assertEqual(rows.shape[1], mt.STRIDE)
+            self.assertEqual(int(rows[0, mt.LIDAR]), mt.NONE)
+            wired = mt.wire(rows)
+            self.assertEqual((wired[15], wired[16]), (710, mt.NONE))    # torque was there before
 
 
 class Query(Base):

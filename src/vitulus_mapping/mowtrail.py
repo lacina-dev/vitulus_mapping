@@ -52,11 +52,28 @@ ROW on disk, raw. Unknown = NONE, unless noted.
   22 rtcm_rate_d    0.1 msg/s      23 rtcm_age_d   0.1 s, base RTCM, RXM-RTCM of /gnss
   24 rtcm_used      % of the messages in the window the receiver used
   25 rtcm_crc       CRC failures in the window
-Files of format 1 have 20 columns: they load with NONE in the rest. A row of the
+  26 wheel_max_cnm  0.01 Nm, the wheel working hardest
+  27 lidar_cm       GPS against lidar on the map     28 lidar_rms_mm    29 lidar_yaw_dd
+  30 jump_cm        GPS step against wheels over 1 s
+  31 cno_dd         0.1 dB-Hz, mean C/N0 of used SV  32 prres_cm  RMS pseudorange residual
+  33 jam            MON-HW jamInd 0..255
+Older files have 20 or 26 columns: they load with NONE in the rest. A row of the
 open run may be short too, the driver of a restart can be the old version.
 
 ON THE WIRE a message carries only what the map colours by (WIRE columns, flat,
-stride 15, downsampled) and the map-worthy events; a tap asks for the raw row.
+stride 18, downsampled) and the map-worthy events; a tap asks for the raw row.
+
+GPS HONESTY. hAcc is what the receiver thinks of itself: 14 mm almost always, r = 0.03
+against the lidar below. Two checks that do not ask the receiver:
+  lidar_cm  gloc_server aligns every scan to the map even while GPS owns the pose
+            and does not apply it: state gps_owns, corr_m is how far the scan wants
+            the pose to move. 17 Oct bag, moving: median 9 cm, p90 36, p99 59.
+            Median of the last second, rms <= 0.2 m only. It measures against the
+            map, so a bad map reads as a bad GPS.
+  jump_cm   the GPS step over 1 s against the wheel step in the same second, as
+            vectors. Wheels cannot jump. Same bag, RTK fix, moving: median 3.8 cm,
+            p90 12, p99 31. Skipped while the robot turns (the antenna swings).
+C/N0, residuals and jamInd go along for the card.
 
 RPM. The speed PID holds rpm so well that a scale over rpm shows one colour, so the
 map colours by the dip = setpoint - rpm, only where the motor is at speed. It needs
@@ -92,13 +109,14 @@ __all__ = ["TrailRecorder", "STATES", "EVENTS", "BRK", "NONE", "STRIDE", "WIRE_S
            "parse_isense", "parse_log", "sane_rpm", "compute_load", "classify", "decimate",
            "summarize", "list_runs", "read_run", "query"]
 
-FORMAT_VERSION = 2
-OLD_STRIDE = 20
-STRIDE = 26
+FORMAT_VERSION = 3
+OLD_STRIDES = (20, 26)
+STRIDE = 34
 (X, Y, LOAD, AMPS, RPM, TEMP, STATE, T, SPEED, CMD, HEIGHT, SETPOINT, ROLL, PITCH, FIX, HACC,
  BATT_V, BATT_PCT, POWER, WHEEL, NUM_SV, PDOP, RTCM_RATE, RTCM_AGE, RTCM_USED,
- RTCM_CRC) = range(STRIDE)
-WIRE_STRIDE = 15          # x y load amps rpm temp state t speed slope fix dip hacc age rate
+ RTCM_CRC, WHEEL_MAX, LIDAR, LIDAR_RMS, LIDAR_YAW, JUMP, CNO, PRRES, JAM) = range(STRIDE)
+# x y load amps rpm temp state t speed slope fix dip hacc age rate wheel lidar jump
+WIRE_STRIDE = 18
 BRK = 16
 NONE = -9999
 STATES = ("cutting", "spinup", "transit", "blocked", "overload", "hot", "rule", "hold")
@@ -108,7 +126,8 @@ STATUS_STALE_S = 3.0            # /mower/status and /mower/stall are 2 Hz
 RULE_STALE_S = 5.0              # the guard repeats at 1 Hz
 # worst first: the map keeps the worst when icons crowd
 EVENTS = ("blocked", "hot", "overload", "rule", "temp", "recovery", "backup", "detour",
-          "stall", "no_progress", "rewindow", "hold", "rtcm_gap", "fix_down", "fix_up")
+          "stall", "no_progress", "rewindow", "hold", "rtcm_gap", "fix_down", "fix_up",
+          "gps_jump")
 CONTEXT = ("ctx", "owner", "program")
 STOP_KINDS = ("blocked", "hot", "overload", "rule", "recovery", "backup", "stall", "no_progress")
 _LOG_EVENTS = (("[EXE] STALL", "stall"), ("[EXE] stalled", "stall"),
@@ -158,6 +177,11 @@ DEFAULTS = {
     "max_msg_events": 500,      # one message
     "rtcm_gap_s": 3.0,          # event from here on, gnss_status corr_stale
     "fix_hold_s": 3.0,          # a fix class counts when it held this long
+    "lidar_max_rms": 0.2,       # gloc_server eff_max_rms, a worse match says nothing
+    "lidar_window_s": 1.5,
+    "jump_period_s": 1.0,
+    "jump_turn_rad": 0.25,      # more turn than this in the window: the antenna swung
+    "jump_event_m": 0.5,        # RTK fix reached 0.42 m at most in the 17 Oct bag
 }
 
 
@@ -227,6 +251,43 @@ class RtcmMeter(object):
         span = max(1.0, min(self.window_s, now - self.t0))
         used = int(round(100.0 * sum(1 for w in win if w[1]) / len(win))) if win else NONE
         return len(win) / span, now - self.last, used, sum(1 for w in win if w[2])
+
+
+class GpsCheck(object):
+    """GPS step against wheel step over about a second, as vectors, in east-north.
+
+    Each feed is one GPS position with the wheel odometry of that moment; the node
+    pairs them in the GPS callback, so both carry the same latency. pose_yaw - odom_yaw
+    turns odometry into the map, datum_yaw the map into east-north."""
+
+    def __init__(self, period_s=1.0, turn_rad=0.25):
+        self.period_s = period_s
+        self.turn_rad = turn_rad
+        self.anchor = None
+        self.value = None
+        self.t = 0.0
+
+    def feed(self, now, east, north, ox, oy, odom_yaw, pose_yaw, datum_yaw=0.0):
+        """The new residual in metres when a window closed, else None."""
+        a = self.anchor
+        if a is None or now - a[0] > 5.0 * self.period_s:
+            self.anchor = (now, east, north, ox, oy, odom_yaw)
+            return None
+        if now - a[0] < self.period_s:
+            return None
+        self.anchor = (now, east, north, ox, oy, odom_yaw)
+        if abs(geo.wrap_pi(odom_yaw - a[5])) > self.turn_rad:
+            self.value = None
+            return None
+        dx, dy = ox - a[3], oy - a[4]
+        turn = pose_yaw + datum_yaw - odom_yaw
+        c, s = math.cos(turn), math.sin(turn)
+        self.value = math.hypot(east - a[1] - (c * dx - s * dy), north - a[2] - (s * dx + c * dy))
+        self.t = now
+        return self.value
+
+    def read(self, now):
+        return self.value if self.value is not None and now - self.t <= 3.0 * self.period_s else None
 
 
 def sane_rpm(value):
@@ -322,7 +383,10 @@ def summarize(rows, events=()):
            "peak_load": None, "peak_a": None, "peak_temp": None, "time_mow_s": 0, "time_transit_s": 0,
            "time_stop_s": 0, "stops": sum(1 for e in events if e[3] in STOP_KINDS), "energy_wh": None,
            "rtk_frac": None, "rtcm_gaps": sum(1 for e in events if e[3] == "rtcm_gap"),
-           "rtcm_rate": None, "rtcm_age_max": None}
+           "rtcm_rate": None, "rtcm_age_max": None, "wheel_mean": None, "wheel_peak": None,
+           "fix_losses": sum(1 for e in events if e[3] == "fix_down"),
+           "gps_jumps": sum(1 for e in events if e[3] == "gps_jump"),
+           "lidar_med": None, "lidar_p95": None, "jump_med": None, "jump_p95": None}
     if not len(rows):
         return out
     state = rows[:, STATE] & (BRK - 1)
@@ -358,6 +422,16 @@ def summarize(rows, events=()):
     age = _known(rows[:, RTCM_AGE])
     if len(age):
         out["rtcm_age_max"] = round(float(age.max()) / 10.0, 1)
+    # the wheels work in transit too; standing still they do not
+    wheel = _known(rows[(state != HOLD), WHEEL])
+    if len(wheel):
+        out["wheel_mean"] = round(float(wheel.mean()) / 100.0, 1)
+        out["wheel_peak"] = round(float(wheel.max()) / 100.0, 1)
+    for name, col in (("lidar", LIDAR), ("jump", JUMP)):
+        vals = _known(rows[:, col])
+        if len(vals):
+            out[name + "_med"] = int(np.median(vals))
+            out[name + "_p95"] = int(np.percentile(vals, 95))
     return out
 
 
@@ -377,6 +451,9 @@ def wire(rows):
     out[:, 12] = rows[:, HACC]
     out[:, 13] = rows[:, RTCM_AGE]
     out[:, 14] = rows[:, RTCM_RATE]
+    out[:, 15] = rows[:, WHEEL]
+    out[:, 16] = rows[:, LIDAR]
+    out[:, 17] = rows[:, JUMP]
     return out.ravel().tolist()
 
 
@@ -468,7 +545,7 @@ def _read_jsonl(path):
                 if not isinstance(item, dict):
                     break
                 meta = item
-            elif isinstance(item, list) and len(item) in (OLD_STRIDE, STRIDE):
+            elif isinstance(item, list) and (len(item) == STRIDE or len(item) in OLD_STRIDES):
                 rows.append(item + [NONE] * (STRIDE - len(item)))
             elif isinstance(item, dict) and "e" in item:
                 events.append(item["e"])
@@ -568,7 +645,11 @@ def _row_dict(row, start):
             "wheel": _scaled(row[WHEEL], 100.0), "num_sv": _scaled(row[NUM_SV], 1.0, 0),
             "pdop": _scaled(row[PDOP], 100.0), "rtcm_rate": _scaled(row[RTCM_RATE], 10.0, 1),
             "rtcm_age": _scaled(row[RTCM_AGE], 10.0, 1), "rtcm_used": _scaled(row[RTCM_USED], 1.0, 0),
-            "rtcm_crc": _scaled(row[RTCM_CRC], 1.0, 0)}
+            "rtcm_crc": _scaled(row[RTCM_CRC], 1.0, 0), "wheel_max": _scaled(row[WHEEL_MAX], 100.0),
+            "lidar_m": _scaled(row[LIDAR], 100.0), "lidar_rms": _scaled(row[LIDAR_RMS], 1000.0, 3),
+            "lidar_yaw": _scaled(row[LIDAR_YAW], 10.0, 1), "jump_m": _scaled(row[JUMP], 100.0),
+            "cno": _scaled(row[CNO], 10.0, 1), "prres": _scaled(row[PRRES], 100.0),
+            "jam": _scaled(row[JAM], 1.0, 0)}
 
 
 def context_at(events, t_ds):
@@ -747,6 +828,13 @@ class TrailRecorder(object):
         self.wheel = None              # sum |torque| Nm, set by the node each tick
         self.gnss = None               # (h_acc_mm, fix_class, num_sv, pdop_c), same
         self.rtcm = RtcmMeter()
+        self.wheel_max = None          # the hardest wheel, Nm, set by the node each tick
+        self.lidar = []                # (t, corr_m, rms, yaw_deg) while GPS owns the pose
+        self.check = GpsCheck(self.cfg["jump_period_s"], self.cfg["jump_turn_rad"])
+        self.sat = None                # (mean cno, rms residual m), time
+        self.sat_t = 0.0
+        self.jam = None
+        self.jam_t = 0.0
         self._rtcm_gap = False
         self._fix_said = None          # the fix class last told
         self._fix_new = None           # (class, since) waiting to hold
@@ -793,6 +881,37 @@ class TrailRecorder(object):
     def feed_rtcm(self, now, used, crc_failed):
         """One RXM-RTCM message of the position receiver. Only counted."""
         self.rtcm.feed(now, used, crc_failed)
+
+    def feed_tracker(self, now, msg):
+        """/gloc/track_status while a run is open. Only a match that was not
+        applied while GPS owns the pose says something about the GPS."""
+        if (msg.get("state") == "gps_owns" and msg.get("corr_m") is not None
+                and (msg.get("rms") or 9.0) <= self.cfg["lidar_max_rms"]):
+            self.lidar = [e for e in self.lidar if now - e[0] <= self.cfg["lidar_window_s"]]
+            self.lidar.append((now, float(msg["corr_m"]), float(msg["rms"]),
+                               float(msg.get("corr_yaw_deg") or 0.0)))
+
+    def _read_lidar(self, now):
+        """(corr_m, rms, yaw) median of the last moments, None without a match."""
+        keep = [e for e in self.lidar if now - e[0] <= self.cfg["lidar_window_s"]]
+        if not keep:
+            return None
+        return tuple(float(np.median([e[i] for e in keep])) for i in (1, 2, 3))
+
+    def feed_check(self, now, east, north, ox, oy, odom_yaw, pose_yaw):
+        """One GPS position with the odometry of that moment, in the loop."""
+        got = self.check.feed(now, east, north, ox, oy, odom_yaw, pose_yaw,
+                              self.datum["yaw_rad"] if self.datum else 0.0)
+        if got is not None and got >= self.cfg["jump_event_m"]:
+            self.event(now, "gps_jump", "%.2f m" % got)
+
+    def feed_sat(self, now, cno, prres):
+        self.sat = (cno, prres)
+        self.sat_t = now
+
+    def feed_jam(self, now, jam):
+        self.jam = jam
+        self.jam_t = now
 
     def _watch_gnss(self, now):
         """rtcm_gap at the edge, fix changes once they held: a run with one float
@@ -977,6 +1096,8 @@ class TrailRecorder(object):
         self._anchor = None
         self._rtcm_gap = False
         self._fix_said = self._fix_new = None
+        self.check = GpsCheck(self.cfg["jump_period_s"], self.cfg["jump_turn_rad"])
+        self.lidar = []
         if self.program:
             self.event(now, "program", self.program)
         if self.owner:
@@ -1162,6 +1283,13 @@ class TrailRecorder(object):
             hacc, fix = min(int(self.gnss[0]), 99999), int(self.gnss[1])
             if len(self.gnss) > 3:
                 num_sv, pdop = int(self.gnss[2]), int(self.gnss[3])
+        lidar = self._read_lidar(now)
+        jump = self.check.read(now)
+        cno = prres = jam = NONE
+        if self.sat is not None and now - self.sat_t <= 12.0:     # NAV-SAT comes every 4 s
+            cno, prres = int(round(self.sat[0] * 10.0)), int(round(self.sat[1] * 100.0))
+        if self.jam is not None and now - self.jam_t <= 5.0:
+            jam = int(self.jam)
         rate = age = used = crc = NONE
         got = self.rtcm.read(now)
         if got is not None:
@@ -1184,7 +1312,13 @@ class TrailRecorder(object):
                  NONE if status is None else int(self.setpoint or 0),
                  roll, pitch, fix, hacc, volts, pct, watts,
                  NONE if self.wheel is None else int(round(self.wheel * 100.0)),
-                 num_sv, pdop, rate, age, used, crc))
+                 num_sv, pdop, rate, age, used, crc,
+                 NONE if self.wheel_max is None else int(round(self.wheel_max * 100.0)),
+                 NONE if lidar is None else int(round(lidar[0] * 100.0)),
+                 NONE if lidar is None else int(round(lidar[1] * 1000.0)),
+                 NONE if lidar is None else int(round(lidar[2] * 10.0)),
+                 NONE if jump is None else min(int(round(jump * 100.0)), 99999),
+                 cno, prres, jam))
         self._last = {"x": x, "y": y, "yaw": yaw, "t": now, "load": load_pct, "state": state,
                       "temp": temp}
         self.temp_peak = self.temp     # the next row starts from the current reading
