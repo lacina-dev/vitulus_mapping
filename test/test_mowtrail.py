@@ -126,6 +126,11 @@ class Signals(unittest.TestCase):
         self.assertEqual(got, ('ctx', 'Zone A|3|12|40'))
         self.assertIsNone(mt.parse_log('[EXE] END chunk_idx=1 outcome=ok'))
         self.assertIsNone(mt.parse_log('Moving'))
+        self.assertEqual(mt.parse_log('[MOWER_LINK] Mower link lost: robot stops, blade unknown')[0],
+                         'link_lost')
+        self.assertEqual(mt.parse_log('[MOWER_LINK] Blade stopped during mowing: robot stops')[0],
+                         'link_lost')
+        self.assertIsNone(mt.parse_log('[MOWER_LINK] hold released'))
 
     def test_the_smach_still_says_this(self):
         """The patterns live in another package: fail here when that one changes."""
@@ -137,6 +142,38 @@ class Signals(unittest.TestCase):
         for needle in ('[EXE] START zone=%s path=%d/%d chunk_idx=%d', '[EXE] no goal progress', '[EXE] STALL',
                        '[EXE] mux hold', '[NAV_RECOVERY] Backing up', '[BLOCKED_RECOVERY]', 'Detour around obstacle'):
             self.assertIn(needle, text)
+
+
+class LinkLost(Base):
+    """1. 11. 2026: minutes of rows with status gone read as transit."""
+
+    def _silent(self, rec, n, x):
+        for i in range(n):
+            self.t += 0.5
+            rec.step(self.t, (x + i * 0.15, 0.0, 0.0))
+            rec.maintain(self.t)
+
+    def _states(self, rec):
+        return [mt.STATES[int(s) & (mt.BRK - 1)] for s in self.rows(rec)[:, mt.STATE]]
+
+    def test_the_mission_said_so(self):
+        rec = self.recorder()
+        rec.feed_busy(True)
+        x = self.drive(rec)
+        rec.feed_log(self.t, '[MOWER_LINK] Mower link lost: robot stops, blade unknown')
+        self._silent(rec, 16, x)
+        self.assertEqual(self._states(rec)[-1], 'link_lost')
+        self.assertIn('link_lost', [e[3] for e in rec.run.events])
+        self.tick(rec, (x, 0.0, 0.0))
+        self.tick(rec, (x + 0.3, 0.0, 0.0))
+        self.assertNotEqual(self._states(rec)[-1], 'link_lost')
+
+    def test_a_board_restart_is_not_a_lost_link(self):
+        rec = self.recorder()
+        rec.feed_busy(True)
+        x = self.drive(rec)
+        self._silent(rec, 16, x)
+        self.assertNotIn('link_lost', self._states(rec))
 
 
 class Recording(Base):

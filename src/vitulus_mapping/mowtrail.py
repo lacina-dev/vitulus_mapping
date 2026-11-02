@@ -119,18 +119,24 @@ STRIDE = 34
 WIRE_STRIDE = 18
 BRK = 16
 NONE = -9999
-STATES = ("cutting", "spinup", "transit", "blocked", "overload", "hot", "rule", "hold")
-CUTTING, SPINUP, TRANSIT, BLOCKED, OVERLOAD, HOT, RULE, HOLD = range(len(STATES))
+STATES = ("cutting", "spinup", "transit", "blocked", "overload", "hot", "rule", "hold",
+          "link_lost")
+CUTTING, SPINUP, TRANSIT, BLOCKED, OVERLOAD, HOT, RULE, HOLD, LINK_LOST = range(len(STATES))
 RPM_LIMIT = 6000                # firmware rpm_callback refuses anything above
 STATUS_STALE_S = 3.0            # /mower/status and /mower/stall are 2 Hz
 RULE_STALE_S = 5.0              # the guard repeats at 1 Hz
 # worst first: the map keeps the worst when icons crowd
-EVENTS = ("blocked", "hot", "overload", "rule", "temp", "recovery", "backup", "detour",
+EVENTS = ("blocked", "link_lost", "hot", "overload", "rule", "temp", "recovery", "backup", "detour",
           "stall", "no_progress", "rewindow", "hold", "rtcm_gap", "fix_down", "fix_up",
           "gps_jump")
 CONTEXT = ("ctx", "owner", "program")
-STOP_KINDS = ("blocked", "hot", "overload", "rule", "recovery", "backup", "stall", "no_progress")
-_LOG_EVENTS = (("[EXE] STALL", "stall"), ("[EXE] stalled", "stall"),
+STOP_KINDS = ("blocked", "link_lost", "hot", "overload", "rule", "recovery", "backup", "stall",
+              "no_progress")
+_LOG_EVENTS = (("[MOWER_LINK] Mower link lost", "link_lost"),
+               ("[MOWER_LINK] Blade stopped", "link_lost"),
+               ("[MOWER_LINK] recovery failed", "link_lost"),
+               ("[MOWER_LINK] mower power switched off", "link_lost"),
+               ("[EXE] STALL", "stall"), ("[EXE] stalled", "stall"),
                ("[EXE] no goal progress", "no_progress"),
                ("[EXE] mux hold", "hold"), ("[DETOUR]", "detour"), ("[DETOUR_ESCALATE]", "detour"),
                ("[NAV_RECOVERY] Backing up", "backup"), ("[NAV_RECOVERY]", "recovery"),
@@ -818,6 +824,7 @@ class TrailRecorder(object):
         # signals
         self.status = None
         self.status_t = 0.0
+        self.link_lost = False          # the mission said so: a board restart is not this
         self.rpm = None
         self.setpoint = 0
         self.temp = None
@@ -865,6 +872,7 @@ class TrailRecorder(object):
             self.run_since = None
         self.status = status
         self.status_t = now
+        self.link_lost = False
         rpm = sane_rpm(rpm)
         if rpm is not None:
             self.rpm = rpm
@@ -954,6 +962,8 @@ class TrailRecorder(object):
         """A smach log line, already filtered to the smach node."""
         got = parse_log(text) if self.run is not None else None
         if got:
+            if text.startswith("[MOWER_LINK] Mower link lost"):
+                self.link_lost = True
             self.event(now, got[0], got[1])
 
     def feed_smach(self, now, text):
@@ -1246,6 +1256,8 @@ class TrailRecorder(object):
         load = compute_load(amps, rpm, self.setpoint, running and not spin_up, c)
         rule = self.rule and now - self.rule_t <= RULE_STALE_S
         state = classify(status, load, spin_up, self.busy, stationary, rule, c)
+        if self.link_lost and status is None:
+            state = LINK_LOST
         if last is not None and state != last["state"] and state in (BLOCKED, HOT, OVERLOAD, RULE):
             self.event(now, STATES[state], "")
         load_pct = -1 if load is None else int(round(load * 100.0))
