@@ -1,0 +1,436 @@
+#!/usr/bin/env python3
+"""
+grass_height -- height of the grass in front of the robot from the D435 depth,
+told apart from terrain. Robot feature, no agent dependency. Logic lives in
+vitulus_mapping.grass (how terrain and grass are told apart is described there);
+this file is only the ROS adapter. Docs: vitulus_mapping/docs/GRASS_HEIGHT.md.
+
+  in   /mobile_base_controller/cmd_vel  geometry_msgs/Twist  wake signal
+  in   /mower/status                    vitulus_msgs/Mower   blade rpm = wake, cut height
+  (a busy smach alone does not wake it: busy at the dock without motion = asleep)
+  only while awake:
+  in   /d435/depth/image_rect_raw       raw bytes, a frame parsed at most rate_hz
+  in   /d435/depth/camera_info          once
+  in   /bno085/imu                      roll and pitch against gravity
+  in   TF map->base_link (pose, yaw), base_link->camera (once)
+  out  /grass/ahead                     std_msgs/String JSON, every parsed frame
+       {canopy_mm, ground_mm, height_mm, class, terrain_source, slope_deg,
+        confidence, uncertainty_mm, reason, ...}
+       /map_objects/layer/grass         std_msgs/String latched JSON, worldlayers
+                                        layer format, at most every layer_min_s
+  file ~/.vitulus/mapping_v3/<site>/grass.npz   (served site, datum-aware)
+       ~/.vitulus/grass/calib.json              read, reloaded when it changes
+
+COST. Asleep (parked, docked) the node holds two small subscriptions and a 1 Hz
+loop. Awake it takes depth as raw bytes (no deserialisation of the 15 Hz stream)
+and parses rate_hz frames, decimated by `stride` pixels, ~4 ms of numpy each.
+Transport, measured 2026-11-08: the raw 15 Hz stream into a rospy AnyMsg
+subscriber costs 0.4 % of a core and nothing measurable in the camera manager.
+compressedDepth would add a PNG encode of every frame in the camera manager,
+a decimating nodelet would have to live in the camera's process; neither pays.
+
+FILE. grass.npz is merged, never overwritten with older data: cells resolved
+since the last save are kept in a journal; under an fcntl lock, if the file
+changed on disk (another instance, a restart) it is read again and the journal
+replayed onto it (grass.save_merged).
+
+THREADS. The frame loop never touches the grid: resolved cells go into a queue.
+A worker thread owns the grid, the site, the DEM and the calibration reload: it
+applies the queue, saves and draws the layer, so a 51 MB save or a layer render
+never delays a frame. self.grid_lock guards the grid (worker vs on_shutdown).
+"""
+
+import collections
+import json
+import os
+import threading
+import time
+
+import numpy as np
+import rospy
+from geometry_msgs.msg import Twist
+from sensor_msgs.msg import CameraInfo, Image, Imu
+from std_msgs.msg import String
+from vitulus_msgs.msg import Mower
+
+from vitulus_mapping import bundle, grass, worldlayers
+from vitulus_mapping.demgrid import DemGrid
+
+
+class Node(object):
+    def __init__(self):
+        cfg = {}
+        for key in grass.DEFAULTS:
+            value = rospy.get_param('~' + key, None)
+            if value is not None:
+                cfg[key] = value
+        base_dir = rospy.get_param('~base_dir', '')
+        if base_dir:
+            bundle.SITES_ROOT = os.path.expanduser(base_dir)
+        self.rate_hz = float(rospy.get_param('~rate_hz', 4.0))
+        self.stride = int(rospy.get_param('~stride', 4))
+        self.active_hold_s = float(rospy.get_param('~active_hold_s', 15.0))
+        self.always_on = bool(rospy.get_param('~always_on', False))
+        self.layer_min_s = float(rospy.get_param('~layer_min_s', 30.0))
+        self.flush_s = float(rospy.get_param('~flush_s', 30.0))
+        self.bounds_margin_m = float(rospy.get_param('~bounds_margin_m', 30.0))
+        self.map_frame = rospy.get_param('~map_frame', 'map')
+        self.base_frame = rospy.get_param('~base_frame', 'base_link')
+        self.depth_topic = rospy.get_param('~depth_topic', '/d435/depth/image_rect_raw')
+        self.info_topic = rospy.get_param('~info_topic', '/d435/depth/camera_info')
+        self.imu_topic = rospy.get_param('~imu_topic', '/bno085/imu')
+        self.calib_path = os.path.expanduser(rospy.get_param('~calib_path', grass.CALIB_PATH))
+
+        self.calib = self._load_calib()
+        self.calib_mtime = self._mtime(self.calib_path)
+        self.engine = grass.GrassEngine(cfg, self.calib, self._on_cell)
+        self.lock = threading.Lock()           # engine: frame loop vs sleep
+        self.grid_lock = threading.RLock()     # grid: worker vs on_shutdown (re-entrant: _poll flushes)
+        self.cellq = collections.deque()       # resolved cells -> worker
+
+        self.pub_ahead = rospy.Publisher('/grass/ahead', String, queue_size=2)
+        self.pub_layer = rospy.Publisher('/map_objects/layer/grass', String, queue_size=1,
+                                         latch=True)
+
+        self.site = self.datum = self.grid = None
+        self.dem = None
+        self.dem_mtime = 0.0
+        self.datum_mtime = 0.0
+        self.next_poll = 0.0
+        self.last_flush = time.time()
+        self.layer_t = 0.0
+        self.layer_pending = False
+        self.journal = []              # cells resolved since the last save
+        self.grid_mtime = 0.0          # grass.npz as we last read or wrote it
+        self.bounds = None             # (x0, y0, x1, y1) the site plausibly covers
+
+        self.cmd_t = 0.0
+        self.rpm = 0
+        self.rpm_t = 0.0
+        self.cut_mm = None
+        self.imu = grass.ImuBuffer()   # roll/pitch by stamp
+        self.rays = None
+        self.info = None               # CameraInfo, from a subscription while awake
+        self.frame_due = 0.0
+        self.raw = None                # newest raw depth message, taken by the loop
+        self.awake = False
+        self.subs = []
+        self.tf_buf = self.tf_listener = None
+        self.frames = 0
+        self.cpu_t = 0.0
+
+        rospy.Subscriber(rospy.get_param('~cmd_topic', '/mobile_base_controller/cmd_vel'),
+                         Twist, self._cb_cmd, queue_size=1)
+        rospy.Subscriber('/mower/status', Mower, self._cb_mower, queue_size=1)
+
+    # ---- small helpers --------------------------------------------------------
+    @staticmethod
+    def _mtime(path):
+        try:
+            return os.path.getmtime(path)
+        except OSError:
+            return 0.0
+
+    def _load_calib(self):
+        cal = grass.Calib.load(self.calib_path)
+        if cal.error:
+            rospy.logwarn('grass_height: NOT calibrated (%s): raw heights, /grass/ahead says '
+                          'reason uncalibrated. Run grass_calib (docs/GRASS_HEIGHT.md).', cal.error)
+        else:
+            rospy.loginfo('grass_height: calibration %s', json.dumps(cal.to_dict()))
+        return cal
+
+    def _on_cell(self, x, y, height_mm, t, source):
+        self.cellq.append((x, y, height_mm, t, source))      # frame loop: no grid work
+
+    def _apply_cells(self):
+        """Worker: queued cells into the grid (and the journal for the merge)."""
+        while self.cellq:
+            x, y, h, t, src = self.cellq.popleft()
+            b = self.bounds
+            if b is not None and not (b[0] <= x <= b[2] and b[1] <= y <= b[3]):
+                continue               # far from the site: a pose jump, not a garden cell
+            if self.grid is not None and self.grid.add(x, y, h, t, src):
+                self.journal.append((x, y, h, t, src))
+                self.layer_pending = True
+
+    # ---- callbacks ------------------------------------------------------------
+    def _cb_cmd(self, msg):
+        if msg.linear.x or msg.linear.y or msg.angular.z:
+            self.cmd_t = time.time()
+
+    def _cb_mower(self, msg):
+        if 0 < msg.moto_rpm < 6000:
+            self.rpm = msg.moto_rpm
+            self.rpm_t = time.time()
+        else:
+            self.rpm = 0
+        if 0 < msg.current_height < 200:
+            if self.cut_mm != float(msg.current_height):
+                self.layer_pending = True          # the layer is coloured against it
+            self.cut_mm = float(msg.current_height)
+
+    def _cb_info(self, msg):
+        self.info = msg
+
+    def _cb_imu(self, msg):
+        q = msg.orientation
+        if q.w == 0 and q.x == 0 and q.y == 0 and q.z == 0:
+            return
+        r, p, _y = grass.quat_rpy(q.x, q.y, q.z, q.w)
+        self.imu.add(msg.header.stamp.to_sec(), r, p)
+
+    def _cb_depth(self, msg):
+        now = time.time()
+        if now < self.frame_due:
+            return                       # decimation before any parsing
+        self.frame_due = now + 1.0 / self.rate_hz
+        self.raw = msg
+
+    # ---- awake / asleep -------------------------------------------------------
+    def _wake(self):
+        if self.awake:
+            return
+        import tf2_ros
+        self.tf_buf = tf2_ros.Buffer(cache_time=rospy.Duration(5.0))
+        self.tf_listener = tf2_ros.TransformListener(self.tf_buf)
+        self.subs = [
+            rospy.Subscriber(self.imu_topic, Imu, self._cb_imu, queue_size=50),
+            rospy.Subscriber(self.info_topic, CameraInfo, self._cb_info, queue_size=1),
+            rospy.Subscriber(self.depth_topic, rospy.AnyMsg, self._cb_depth, queue_size=1,
+                             buff_size=2 ** 22),
+        ]
+        self.awake = True
+        rospy.loginfo('grass_height: awake')
+
+    def _sleep(self):
+        if not self.awake:
+            return
+        for s in self.subs:
+            s.unregister()
+        self.subs = []
+        with self.lock:
+            self.engine.flush_pending(time.time(), self._dem_fn())
+            self.engine.reset()
+        self.tf_listener.unregister()
+        self.tf_listener = self.tf_buf = None
+        self.raw = None
+        self.awake = False
+        rospy.loginfo('grass_height: asleep (%s)', json.dumps(self.engine.stats))
+
+    # ---- site, DEM, calibration -----------------------------------------------
+    def _poll(self, now):
+        if now < self.next_poll:
+            return
+        self.next_poll = now + 5.0
+        m = self._mtime(self.calib_path)
+        if m != self.calib_mtime:
+            self.calib_mtime = m
+            self.calib = self._load_calib()
+            self.engine.calib = self.calib
+        site = worldlayers.read_served_site()
+        dm = self._mtime(os.path.join(bundle.site_dir(site), 'datum.yaml')) if site else 0.0
+        if site != self.site or dm != self.datum_mtime:
+            self._flush()
+            self.site, self.datum_mtime = site, dm
+            self.datum = worldlayers.read_datum(site) if site else None
+            self.grid = None
+            self.dem = None
+            self.dem_mtime = 0.0
+            self.journal = []
+            self.bounds = None
+            if self.datum is not None:
+                self._read_grid()
+            self.layer_pending = True
+        if self.site:
+            p = os.path.join(bundle.site_dir(self.site), 'dem.npz')
+            m = self._mtime(p)
+            if m and m != self.dem_mtime:
+                try:
+                    self.dem = DemGrid.load_npz(p)
+                    self.dem_mtime = m
+                    self._update_bounds()
+                except Exception as exc:                   # noqa: BLE001
+                    rospy.logwarn_throttle(300, 'grass_height: dem.npz: %s', exc)
+
+    def _grid_path(self):
+        return os.path.join(bundle.site_dir(self.site), grass.GrassGrid.FILENAME)
+
+    def _read_grid(self):
+        self.grid_mtime = self._mtime(self._grid_path())
+        self.grid = grass.GrassGrid.load(bundle.site_dir(self.site), self.datum)
+        self._update_bounds()
+
+    def _update_bounds(self):
+        """Where the site's cells may be: the DEM (driven ground) and what the
+        layer already has, plus a margin. Unknown = no limit (the grid caps size)."""
+        boxes = []
+        if self.dem is not None and self.dem.valid_bbox() is not None:
+            x0, y0, x1, y1 = self.dem.valid_bbox()
+            r = self.dem.res
+            boxes.append((self.dem.ox + x0 * r, self.dem.oy + y0 * r,
+                          self.dem.ox + (x1 + 1) * r, self.dem.oy + (y1 + 1) * r))
+        g = self.grid
+        if g is not None and g.h:
+            seen = g.a["count"] > 0
+            if seen.any():
+                rows = np.flatnonzero(seen.any(axis=1))
+                cols = np.flatnonzero(seen.any(axis=0))
+                boxes.append((g.ox + cols[0] * g.res, g.oy + rows[0] * g.res,
+                              g.ox + (cols[-1] + 1) * g.res, g.oy + (rows[-1] + 1) * g.res))
+        if not boxes:
+            self.bounds = None
+            return
+        m = self.bounds_margin_m
+        self.bounds = (min(b[0] for b in boxes) - m, min(b[1] for b in boxes) - m,
+                       max(b[2] for b in boxes) + m, max(b[3] for b in boxes) + m)
+
+    def _dem_fn(self):
+        return self.dem.query_many if self.dem is not None else None
+
+    def _flush(self):
+        with self.grid_lock:
+            self._apply_cells()
+            if self.grid is None or not self.grid.dirty or not self.site or not self.datum:
+                return
+            try:
+                self.grid, self.grid_mtime = grass.save_merged(
+                    self.grid, bundle.site_dir(self.site), self.site, self.datum,
+                    self.journal, self.grid_mtime)
+                self.journal = []
+            except (IOError, OSError, ValueError) as exc:
+                rospy.logwarn_throttle(60, 'grass_height: save: %s', exc)
+
+    def _publish_layer(self, now):
+        if not self.layer_pending or now - self.layer_t < self.layer_min_s:
+            return
+        self.layer_pending = False
+        self.layer_t = now
+        with self.grid_lock:
+            if self.grid is not None:
+                self.grid.changed = False
+            payload = grass.grass_layer(self.grid, self.site, now, self.cut_mm)
+        self.pub_layer.publish(String(json.dumps(payload, separators=(',', ':'))))
+
+    # ---- frames -----------------------------------------------------------------
+    def _setup_rays(self, frame_id, shape):
+        """Never blocks the loop: without camera info or the static TF yet, the
+        frame is skipped and the next one tries again."""
+        info = self.info
+        if info is None:
+            return False
+        try:
+            tr = self.tf_buf.lookup_transform(self.base_frame, frame_id, rospy.Time(0))
+        except Exception:                                  # noqa: BLE001
+            return False
+        q, t = tr.transform.rotation, tr.transform.translation
+        R = grass.quat_to_rot(q.x, q.y, q.z, q.w)
+        K = np.array(info.K).reshape(3, 3)
+        self.rays = grass.Rays(K, R, (t.x, t.y, t.z), shape, stride=self.stride)
+        rospy.loginfo('grass_height: camera %s %dx%d stride %d, %d rays', frame_id,
+                      shape[1], shape[0], self.stride, len(self.rays.dirs))
+        return True
+
+    def _pose_at(self, stamp):
+        """Pose at the frame's own time (the robot moves 0.1 m in 0.25 s). No
+        fallback to the newest pose: a frame without its pose has no map cell."""
+        if self.tf_buf is None:
+            return None, None
+        try:
+            tr = self.tf_buf.lookup_transform(self.map_frame, self.base_frame, stamp,
+                                              rospy.Duration(0.1))
+        except Exception:                                  # noqa: BLE001
+            return None, None
+        q, t = tr.transform.rotation, tr.transform.translation
+        r, p, y = grass.quat_rpy(q.x, q.y, q.z, q.w)
+        return (t.x, t.y, y), (r, p)
+
+    def _process(self, raw):
+        msg = Image()
+        msg.deserialize(raw._buff)
+        if msg.encoding not in ('16UC1', 'mono16'):
+            rospy.logwarn_throttle(60, 'grass_height: depth encoding %s not supported', msg.encoding)
+            return
+        depth = np.frombuffer(msg.data, np.uint16).reshape(msg.height, msg.width)
+        if self.rays is None or self.rays.shape != depth.shape:
+            if not self._setup_rays(msg.header.frame_id, depth.shape):
+                rospy.logwarn_throttle(30, 'grass_height: waiting for camera info / TF')
+                return
+        pts = self.rays.points(depth)
+        pose, tf_rp = self._pose_at(msg.header.stamp)
+        # attitude at the frame's own time from the IMU; IMU missing -> TF's,
+        # and then the calibrated IMU offset must not be removed
+        rp = self.imu.at(msg.header.stamp.to_sec())
+        rp_imu = rp is not None
+        if not rp_imu:
+            rp = tf_rp or (0.0, 0.0)
+            rospy.logwarn_throttle(60, 'grass_height: no IMU at the frame time, attitude from TF')
+        with self.lock:
+            out = self.engine.frame(msg.header.stamp.to_sec(), pts, pose, rp,
+                                    self.cut_mm, self._dem_fn(), rp_imu=rp_imu)
+        out['site'] = self.site
+        out['pending_cells'] = len(self.engine.pending)
+        self.pub_ahead.publish(String(json.dumps(out, separators=(',', ':'))))
+        self.frames += 1
+
+    # ---- loop -------------------------------------------------------------------
+    def _worker(self):
+        """Site, DEM, calibration, grid, saving and the layer: off the frame loop."""
+        while not rospy.is_shutdown():
+            now = time.time()
+            try:
+                with self.grid_lock:
+                    self._poll(now)
+                    self._apply_cells()
+                if now - self.last_flush >= self.flush_s:
+                    self.last_flush = now
+                    self._flush()
+                self._publish_layer(now)
+            except Exception as exc:                       # noqa: BLE001
+                rospy.logwarn_throttle(60, 'grass_height: worker: %s', exc)
+            time.sleep(0.5)
+
+    def _shutdown(self):
+        """Cells still waiting for the wheels: the DEM resolves what it can, then
+        the grid is saved (the other order would lose them)."""
+        try:
+            with self.lock:
+                self.engine.flush_pending(time.time(), self._dem_fn())
+        except Exception as exc:                           # noqa: BLE001
+            rospy.logwarn('grass_height: flush on shutdown: %s', exc)
+        self._flush()
+
+    def run(self):
+        rospy.on_shutdown(self._shutdown)
+        threading.Thread(target=self._worker, name='grass_worker', daemon=True).start()
+        while not rospy.is_shutdown():
+            now = time.time()
+            blade = self.rpm > 0 and now - self.rpm_t < 3.0
+            awake = (self.always_on or blade or now - self.cmd_t <= self.active_hold_s)
+            if awake:
+                self._wake()
+                raw, self.raw = self.raw, None
+                if raw is not None:
+                    c0 = time.process_time()
+                    try:
+                        self._process(raw)
+                    except Exception as exc:               # noqa: BLE001
+                        rospy.logwarn_throttle(30, 'grass_height: frame failed: %s', exc)
+                    self.cpu_t += time.process_time() - c0
+            else:
+                self._sleep()
+            rospy.logdebug_throttle(60, 'grass_height: %d frames, cpu %.1f s', self.frames, self.cpu_t)
+            time.sleep(0.05 if awake else 1.0)
+
+
+def main():
+    rospy.init_node('grass_height')
+    if not rospy.get_param('~enabled', True):
+        rospy.loginfo('grass_height: disabled by ~enabled')
+        rospy.spin()
+        return
+    Node().run()
+
+
+if __name__ == '__main__':
+    main()

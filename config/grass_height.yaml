@@ -1,0 +1,21 @@
+# grass_height (vitulus_mapping/docs/GRASS_HEIGHT.md). Code defaults match these.
+# The corridor in base_link where the grass is judged; grass_calib fit can
+# recommend another one (written to ~/.vitulus/grass/calib.json, used first).
+x_min: 0.8
+x_max: 1.6
+half_width: 0.35
+
+rate_hz: 4.0           # parsed depth frames per second while awake (D435 runs 15 Hz)
+stride: 4              # every 4th pixel in both axes: 160x120 rays
+active_hold_s: 15.0    # awake while the blade turns or this long after the last nonzero command
+
+cell: 0.2              # map cell of the deferred resolution and of the layer
+pending_ttl_s: 120.0   # a seen cell waits this long for the wheels, then DEM or dropped
+wheel_max_track_m: 4.0 # wheels resolve cells seen at most this far back along the track
+wheel_ahead_max_m: 3.0 # /grass/ahead uses wheel ground at most this far back
+slope_change_deg: 2.5  # carpet AND its lowest lane tilted against the expected ground = terrain change
+lane_step_mm: 25.0     # lanes side by side differing more = kerb (smooth) or mown|uncut edge (rough)
+conf_min: 0.6          # probability the class is right, below = unknown
+cut_default_mm: 60.0   # when /mower/status has no cut height
+layer_min_s: 30.0
+flush_s: 30.0

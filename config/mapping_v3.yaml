@@ -126,7 +126,9 @@ insertion_gate:
 
 trajectory_dem:
   resolution: 0.05
-  wheel_radius: 0.055                # vitulus4WD URDF
+  ground_offset_m: 0.0               # wheel contact z in base_link: base_link IS the contact
+                                     # plane (URDF wheel centre 0.105, radius 0.1025). Was
+                                     # wheel_radius 0.055 subtracted -> DEM 5.5 cm low until 2026-11-08
   z_offset: 0.0                      # field-calibration constant
   stamp_radius: 0.12
   min_travel: 0.05

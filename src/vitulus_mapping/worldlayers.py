@@ -204,7 +204,8 @@ class _Grid(object):
                 return True
             nc0, nr0 = min(c0, bx0), min(r0, by0)
             nc1, nr1 = max(c0 + self.w, bx1), max(r0 + self.h, by1)
-        if nc1 - nc0 > MAX_CELLS or nr1 - nr0 > MAX_CELLS:
+        cap = getattr(self, "MAX_CELLS", MAX_CELLS)      # a subclass may cap lower
+        if nc1 - nc0 > cap or nr1 - nr0 > cap:
             return False
         if self.h == 0:
             dx, dy = 0, 0
@@ -639,7 +640,7 @@ def _query_slope(site, res, points, polygon):
 def layer_query(site, layer, points=None, polygon=None, slope_res=0.5, run=None):
     """Read a recorded layer without ROS. Read-only, never raises.
 
-    layer    coverage | gnss | slope | mow_load | mow_report
+    layer    coverage | gnss | slope | grass | mow_load | mow_report
     points   [[x, y], ...] map frame -> "result" is a list, one row per point
     polygon  [[x, y], ...] map frame -> "result" is one stats dict
 
@@ -652,6 +653,8 @@ def layer_query(site, layer, points=None, polygon=None, slope_res=0.5, run=None)
     "report_path" the zone report of the run when it is written.
     mow_report: the zone report of the run (newest finished or `run`), see
     mowreport; points and polygon are not used.
+    grass: grass height measured ahead by nodes/grass_height (median, last,
+    count, time, ground source wheels|dem per 0.2 m cell), see grass.query_grass.
     """
     out = {"ok": False, "reason": "", "site": site, "layer": layer, "result": None}
     if layer == "mow_report":
@@ -680,6 +683,15 @@ def layer_query(site, layer, points=None, polygon=None, slope_res=0.5, run=None)
                 from . import mowreport
                 path = mowreport.report_path(site, res["run"])
                 res["report_path"] = path if os.path.exists(path) else None
+        elif layer == "grass":
+            from . import grass              # it imports this module
+            datum = read_datum(site)
+            if datum is None:
+                out["reason"] = "no datum for site %s" % site
+                return out
+            grid = grass.GrassGrid.load(bundle.site_dir(site), datum, readonly=True)
+            if grid.h:
+                out["result"] = grass.query_grass(grid, pts, ring)
         elif layer in ("coverage", "gnss"):
             datum = read_datum(site)
             if datum is None:

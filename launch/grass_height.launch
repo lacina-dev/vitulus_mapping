@@ -1,0 +1,14 @@
+<launch>
+  <!-- Grass height ahead (docs/GRASS_HEIGHT.md). Permanent node, sleeps unless the
+       robot drives or mows. enabled:=false keeps the node up and doing nothing.
+       respawn:=false for a hand-started instance: the stack's own launch then takes
+       the node name over without the two respawning against each other. -->
+  <arg name="enabled" default="true"/>
+  <arg name="respawn" default="true"/>
+
+  <node pkg="vitulus_mapping" type="grass_height" name="grass_height"
+        output="log" respawn="$(arg respawn)" respawn_delay="10">
+    <rosparam command="load" file="$(find vitulus_mapping)/config/grass_height.yaml"/>
+    <param name="enabled" value="$(arg enabled)"/>
+  </node>
+</launch>

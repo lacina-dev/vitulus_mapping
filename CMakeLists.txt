@@ -24,6 +24,8 @@ catkin_install_python(PROGRAMS
   nodes/map_world_recorder
   nodes/mow_report
   nodes/map_objects_server
+  nodes/grass_height
+  nodes/grass_calib
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
 

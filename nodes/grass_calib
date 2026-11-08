@@ -1,0 +1,379 @@
+#!/usr/bin/env python3
+"""
+grass_calib -- calibration of grass_height. Step by step for the owner:
+vitulus_mapping/docs/GRASS_HEIGHT.md (cs) and the robot UI help, topic Mowing.
+
+  grass_calib record --label beton|posekano|vysoka --true-mm N [--seconds 10] [--x 1.0]
+        Robot stands still, the sample lies in front of it at --x metres. Records
+        depth frames, writes statistics and the raw frames to
+        ~/.vitulus/grass/calib/<label>_x<x>_<time>.{json,npz}.
+  grass_calib fit [--dry-run] [--all | --session YYYYMMDD]
+        Camera zero from beton, scale from posekano + vysoka, writes
+        ~/.vitulus/grass/calib.json (grass_height reloads it by itself). Prints
+        the errors on the samples and the recommended corridor.
+  grass_calib check [--seconds 0]
+        Live: what the camera sees in the corridor now (own analysis, works with
+        the robot standing) and the last /grass/ahead of the node if it runs.
+  grass_calib list | clear --label L
+"""
+
+import argparse
+import glob
+import json
+import os
+import shutil
+import sys
+import time
+
+import numpy as np
+
+from vitulus_mapping import grass
+
+LABELS = ("beton", "posekano", "vysoka")
+STRIP_XS = [round(0.5 + 0.1 * i, 2) for i in range(16)]       # 0.5 .. 2.0 m
+STRIP_HALF = 0.05
+
+
+def ros_init():
+    import rospy
+    rospy.init_node('grass_calib', anonymous=True, disable_signals=True)
+    return rospy
+
+
+def camera(rospy, stride):
+    """Rays of the depth camera in base_link + the depth topic."""
+    import tf2_ros
+    from sensor_msgs.msg import CameraInfo, Image
+    buf = tf2_ros.Buffer()
+    tf2_ros.TransformListener(buf)
+    info = rospy.wait_for_message('/d435/depth/camera_info', CameraInfo, timeout=5.0)
+    msg = rospy.wait_for_message('/d435/depth/image_rect_raw', Image, timeout=5.0)
+    tr = buf.lookup_transform('base_link', msg.header.frame_id, rospy.Time(0),
+                              rospy.Duration(3.0))
+    q, t = tr.transform.rotation, tr.transform.translation
+    K = np.array(info.K).reshape(3, 3)
+    R = grass.quat_to_rot(q.x, q.y, q.z, q.w)
+    rays = grass.Rays(K, R, (t.x, t.y, t.z), (msg.height, msg.width), stride=stride)
+    yaw = None
+    try:
+        tm = buf.lookup_transform('map', 'base_link', rospy.Time(0), rospy.Duration(1.0))
+        q = tm.transform.rotation
+        yaw = round(float(np.degrees(grass.quat_rpy(q.x, q.y, q.z, q.w)[2])), 1)
+    except Exception:                                      # noqa: BLE001
+        pass                     # no map pose: no IMU offset from this record
+    return rays, K, R, np.array([t.x, t.y, t.z]), yaw
+
+
+def depth_of(msg):
+    return np.frombuffer(msg.data, np.uint16).reshape(msg.height, msg.width).copy()
+
+
+def expected_counts(rays, half_width):
+    """How many rays hit each strip of a flat ground (for the valid share)."""
+    d = rays.dirs
+    ok = d[:, 2] < -1e-3
+    s = -rays.t[2] / d[ok, 2]
+    gx = rays.t[0] + s * d[ok, 0]
+    gy = rays.t[1] + s * d[ok, 1]
+    out = {}
+    for x in STRIP_XS:
+        for lane, yc in enumerate(lanes(half_width)):
+            m = (gx >= x - STRIP_HALF) & (gx < x + STRIP_HALF) & (np.abs(gy - yc) < half_width / 3.0)
+            out[(x, lane)] = int(m.sum())
+    return out
+
+
+def lanes(half_width):
+    w = 2.0 * half_width / 3.0
+    return [-half_width + w * (i + 0.5) for i in range(3)]
+
+
+def frame_stats(P, half_width, x, cfg):
+    """Per-frame numbers: strips (x, lane) and the sample window."""
+    strips = {}
+    for xs in STRIP_XS:
+        for lane, yc in enumerate(lanes(half_width)):
+            m = ((P[:, 0] >= xs - STRIP_HALF) & (P[:, 0] < xs + STRIP_HALF)
+                 & (np.abs(P[:, 1] - yc) < half_width / 3.0)
+                 & (P[:, 2] > cfg["z_lo"]) & (P[:, 2] < cfg["z_hi"]))
+            z = P[m, 2] * 1000.0
+            if len(z) >= 10:
+                p10, p90 = np.percentile(z, [10, 90])
+                strips[(xs, lane)] = (float(np.median(z)), float(p90), len(z), float(p90 - p10) / 2.563)
+    s = grass.strip_stats(P, x - 0.15, x + 0.15, half_width, cfg["z_lo"], cfg["z_hi"])
+    # roughness with the node's own geometry (bins 0.1 m x 3 lanes over +-0.35 m,
+    # the same threshold compares the same number), a 0.4 m window at the sample
+    c = dict(grass.DEFAULTS)
+    c["min_bins"] = 6
+    an = grass.analyze_corridor(P, c, x - 0.2, x + 0.2)
+    return strips, s, (an["rough_mm"] if an else None)
+
+
+def summarize(frames, expected, half_width, x, cfg):
+    per = [frame_stats(P, half_width, x, cfg) for P in frames]
+    strips = []
+    for xs in STRIP_XS:
+        for lane, yc in enumerate(lanes(half_width)):
+            vals = [p[0][(xs, lane)] for p in per if (xs, lane) in p[0]]
+            if len(vals) < max(2, len(per) // 3):
+                strips.append({"x": xs, "y": round(yc, 3), "median_mm": None})
+                continue
+            med = np.array([v[0] for v in vals])
+            p90 = np.array([v[1] for v in vals])
+            n = np.array([v[2] for v in vals])
+            sig = np.array([v[3] for v in vals])
+            exp = expected.get((xs, lane), 0)
+            strips.append({"x": xs, "y": round(yc, 3), "median_mm": round(float(np.median(med)), 2),
+                           "p90_mm": round(float(np.median(p90)), 2),
+                           "noise_mm": round(float(np.std(p90)), 2),
+                           "sigma_mm": round(float(np.median(sig)), 2),
+                           "valid": round(float(np.median(n)) / exp, 2) if exp else None,
+                           "frames": len(vals)})
+    samples = [p[1] for p in per if p[1] is not None]
+    sample = None
+    if samples:
+        p90 = np.array([s["p90_mm"] for s in samples])
+        sample = {"x": x, "p90_mm": round(float(np.median(p90)), 2),
+                  "median_mm": round(float(np.median([s["median_mm"] for s in samples])), 2),
+                  "noise_mm": round(float(np.std(p90)), 2),
+                  "points": int(np.median([s["n"] for s in samples]))}
+    rough = [p[2] for p in per if p[2] is not None]
+    return strips, sample, (round(float(np.median(rough)), 2) if rough else None)
+
+
+# --------------------------------------------------------------------------
+def cmd_record(args):
+    if args.label not in LABELS:
+        sys.exit("label must be one of %s" % ", ".join(LABELS))
+    if args.label == "beton":
+        args.true_mm = 0.0
+    elif args.true_mm is None:
+        sys.exit("--true-mm is required (the height measured with a ruler, mm)")
+    rospy = ros_init()
+    from sensor_msgs.msg import Image, Imu
+    busy = None
+    try:
+        from std_msgs.msg import Bool
+        busy = rospy.wait_for_message('/mower_smach/busy', Bool, timeout=2.0).data
+    except Exception:                                      # noqa: BLE001
+        pass
+    if busy:
+        print("WARNING: /mower_smach/busy is True - the robot must stand still for a record")
+    rays, K, R, t, yaw = camera(rospy, args.stride)
+    cfg = dict(grass.DEFAULTS)
+    frames, depths, rp = [], [], []
+    imu = {}
+
+    def cb_imu(m):
+        q = m.orientation
+        imu['rp'] = grass.quat_rpy(q.x, q.y, q.z, q.w)[:2]
+
+    rospy.Subscriber('/bno085/imu', Imu, cb_imu, queue_size=1)
+    t_end = time.time() + args.seconds
+    print("recording %s (true %.0f mm) at x=%.2f m for %.0f s ..." % (
+        args.label, args.true_mm, args.x, args.seconds))
+    last = 0.0
+    while time.time() < t_end and not rospy.is_shutdown():
+        msg = rospy.wait_for_message('/d435/depth/image_rect_raw', Image, timeout=3.0)
+        if time.time() - last < 1.0 / args.rate:
+            continue
+        last = time.time()
+        d = depth_of(msg)
+        depths.append(d)
+        frames.append(rays.points(d))
+        rp.append(imu.get('rp', (np.nan, np.nan)))
+    if len(frames) < 5:
+        sys.exit("too few frames (%d): is the camera running?" % len(frames))
+    expected = expected_counts(rays, args.half_width)
+    strips, sample, rough = summarize(frames, expected, args.half_width, args.x, cfg)
+    rp = np.array(rp, float)
+    rec = {"label": args.label, "true_mm": float(args.true_mm), "x": args.x,
+           "half_width": args.half_width, "frames": len(frames), "stride": args.stride,
+           "created": time.strftime("%Y-%m-%d %H:%M:%S"), "rough_mm": rough,
+           "sample": sample, "strips": strips,
+           "imu_roll_deg": round(float(np.degrees(np.nanmedian(rp[:, 0]))), 2) if np.isfinite(rp).any() else None,
+           "imu_pitch_deg": round(float(np.degrees(np.nanmedian(rp[:, 1]))), 2) if np.isfinite(rp).any() else None,
+           "yaw_deg": yaw, "note": args.note or ""}
+    os.makedirs(args.dir, exist_ok=True)
+    stem = os.path.join(args.dir, "%s_x%.1f_%s" % (args.label, args.x, time.strftime("%Y%m%d_%H%M%S")))
+    with open(stem + ".json", "w") as f:
+        json.dump(rec, f, indent=1)
+    np.savez_compressed(stem + ".npz", depth=np.array(depths), K=K, R_bc=R, t_bc=t,
+                        rp=rp, meta=json.dumps(rec))
+    print("saved %s.json (+ .npz with %d raw frames)" % (stem, len(depths)))
+    if sample:
+        print("sample x=%.2f: p90 %.1f mm, median %.1f mm, noise %.1f mm, roughness %s mm, %d points"
+              % (args.x, sample["p90_mm"], sample["median_mm"], sample["noise_mm"], rough,
+                 sample["points"]))
+    else:
+        print("WARNING: no points in the sample window x=%.2f +- 0.15 m" % args.x)
+    for s in strips:
+        if s["y"] == lanes(args.half_width)[1] and s.get("median_mm") is not None and s["x"] in (0.8, 1.2, 1.6):
+            print("  strip x=%.1f: median %.1f p90 %.1f noise %.1f sigma %.1f valid %s" % (
+                s["x"], s["median_mm"], s["p90_mm"], s["noise_mm"], s["sigma_mm"], s["valid"]))
+
+
+def load_records(d, latest=True, session=None):
+    recs = []
+    for p in sorted(glob.glob(os.path.join(d, "*.json"))):
+        try:
+            with open(p) as f:
+                r = json.load(f)
+            r["_file"] = os.path.basename(p)
+            recs.append(r)
+        except (IOError, ValueError):
+            continue
+    if session:
+        recs = [r for r in recs if session in r["_file"]]
+    if latest:
+        recs = grass.latest_records(recs)
+    return recs
+
+
+def cmd_fit(args):
+    recs = load_records(args.dir, not args.all, args.session)
+    if not recs:
+        sys.exit("no records in %s - run grass_calib record first" % args.dir)
+    print("records: %s" % ", ".join("%s(x=%.1f, %s mm)" % (r["label"], r["x"], r["true_mm"]) for r in recs))
+    try:
+        cal, rep = grass.fit_calibration(recs, args.noise_max,
+                                         allow_single_direction=args.allow_single_direction)
+    except ValueError as exc:
+        sys.exit("fit failed: %s" % exc)
+    c = rep["calib"]
+    print("camera zero: offset %.1f mm, pitch %.2f deg, roll %.2f deg" % (
+        c["offset_mm"], c["pitch_deg"], c["roll_deg"]))
+    print("scale: true = %.3f * raw (concrete is the point 0,0)" % c["scale"])
+    print("IMU pitch offset: %s" % ("%.2f deg" % c["imu_pitch_offset_deg"] if c["imu_offset_measured"]
+                                     else "NOT measured (beton one way only)"))
+    print("mean residual per label (mm): %s" % rep["residual_mm"])
+    print("bare surface roughness limit %.1f mm (concrete %.1f, grass %s)" % (
+        c["rough_bare_mm"], rep["rough_beton_mm"], rep["rough_grass_mm"]))
+    print("errors on the samples:")
+    for e in rep["errors"]:
+        if e["label"] == "beton" and e["x"] not in (0.8, 1.2, 1.6):
+            continue
+        print("  %-9s x=%.1f true %6.1f  est %6.1f  err %+6.1f mm%s" % (
+            e["label"], e["x"], e["true_mm"], e["est_mm"], e["err_mm"],
+            "  (pitch %+.2f deg vs concrete corrected)" % e["dpitch_deg"] if e.get("dpitch_deg") else ""))
+    print("stereo noise by distance (sigma of the points on concrete, mm): %s" % rep["noise_by_x"])
+    print("recommended corridor: %s" % (rep["recommended_corridor_m"] or "keep the configured one"))
+    for w in rep["warnings"]:
+        print("WARNING: " + w)
+    if args.dry_run:
+        print("dry run, nothing written")
+        return
+    prev = args.out + ".prev"
+    had = os.path.exists(args.out)
+    if had:
+        shutil.copy2(args.out, prev)
+    try:
+        cal.save(args.out)       # atomic + fsync: the old file stays until the new one is whole
+    except (IOError, OSError) as exc:
+        if had and not os.path.exists(args.out):
+            os.replace(prev, args.out)
+        sys.exit("saving %s failed (%s), the previous calibration is kept" % (args.out, exc))
+    print("written %s (grass_height reloads it within 5 s, previous in .prev)" % args.out)
+
+
+def cmd_check(args):
+    rospy = ros_init()
+    from sensor_msgs.msg import Image, Imu
+    from std_msgs.msg import String
+    rays, _K, _R, _t, _yaw = camera(rospy, args.stride)
+    cal = grass.Calib.load(args.out)
+    eng = grass.GrassEngine(calib=cal)
+    state = {}
+
+    def cb_imu(m):
+        q = m.orientation
+        state['rp'] = grass.quat_rpy(q.x, q.y, q.z, q.w)[:2]
+
+    def cb_ahead(m):
+        state['ahead'] = (json.loads(m.data), time.time())
+
+    rospy.Subscriber('/bno085/imu', Imu, cb_imu, queue_size=1)
+    rospy.Subscriber('/grass/ahead', String, cb_ahead, queue_size=1)
+    print("calibration: %s" % ("yes, " + str(cal.created) if cal.calibrated
+                               else "NONE (raw numbers): %s" % cal.error))
+    t_end = time.time() + args.seconds if args.seconds > 0 else float("inf")
+    while time.time() < t_end and not rospy.is_shutdown():
+        msg = rospy.wait_for_message('/d435/depth/image_rect_raw', Image, timeout=3.0)
+        P = rays.points(depth_of(msg))
+        o = eng.frame(time.time(), P, None, state.get('rp', (0.0, 0.0)))
+        Z = cal.zero(P)
+        prof = []
+        for x in (0.8, 1.2, 1.6):
+            s = grass.strip_stats(Z, x - 0.05, x + 0.05, 0.35)
+            prof.append("%.1f:%s" % (x, "%.0f" % s["p90_mm"] if s else "-"))
+        print("%s  height %s mm  class %-9s src %-12s conf %.2f  carpet %s  rough %s  tilt %s  p90 %s%s" % (
+            time.strftime("%H:%M:%S"), o.get("height_mm"), o["class"], o["terrain_source"],
+            o["confidence"], o.get("canopy_mm"), o.get("rough_mm"), o.get("slope_rel_deg"),
+            " ".join(prof), (" reason " + o["reason"]) if o["reason"] else ""))
+        a = state.get('ahead')
+        if a and time.time() - a[1] < 2.0:
+            n = a[0]
+            print("          node: height %s class %s src %s conf %s" % (
+                n.get("height_mm"), n.get("class"), n.get("terrain_source"), n.get("confidence")))
+        time.sleep(max(0.0, args.period - 0.07))
+
+
+def cmd_list(args):
+    for r in load_records(args.dir):
+        s = r.get("sample") or {}
+        print("%-36s %-9s x=%.1f true %5.0f  p90 %s  noise %s  rough %s" % (
+            r["_file"], r["label"], r["x"], r["true_mm"], s.get("p90_mm"), s.get("noise_mm"),
+            r.get("rough_mm")))
+    if os.path.exists(args.out):
+        with open(args.out) as f:
+            print("calib.json: %s" % f.read().strip())
+
+
+def cmd_clear(args):
+    n = 0
+    for p in glob.glob(os.path.join(args.dir, "%s_x*" % args.label)):
+        os.remove(p)
+        n += 1
+    print("removed %d files" % n)
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="grass_calib", description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--dir", default=grass.CALIB_DIR)
+    ap.add_argument("--out", default=grass.CALIB_PATH)
+    sub = ap.add_subparsers(dest="cmd")
+    r = sub.add_parser("record")
+    r.add_argument("--label", required=True)
+    r.add_argument("--true-mm", type=float)
+    r.add_argument("--seconds", type=float, default=10.0)
+    r.add_argument("--x", type=float, default=1.0)
+    r.add_argument("--half-width", type=float, default=0.2)
+    r.add_argument("--rate", type=float, default=5.0)
+    r.add_argument("--stride", type=int, default=2)
+    r.add_argument("--note")
+    f = sub.add_parser("fit")
+    f.add_argument("--dry-run", action="store_true")
+    f.add_argument("--all", action="store_true",
+                   help="every record, not only the newest per label and distance")
+    f.add_argument("--allow-single-direction", action="store_true",
+                   help="accept beton recorded one way only (IMU tilt error not measured)")
+    f.add_argument("--session", help="only records whose file name contains this (e.g. 20261108)")
+    f.add_argument("--noise-max", type=float, default=5.0)
+    c = sub.add_parser("check")
+    c.add_argument("--seconds", type=float, default=0.0)
+    c.add_argument("--period", type=float, default=1.0)
+    c.add_argument("--stride", type=int, default=4)
+    sub.add_parser("list")
+    cl = sub.add_parser("clear")
+    cl.add_argument("--label", required=True)
+    args = ap.parse_args(argv)
+    if args.cmd is None:
+        ap.print_help()
+        return
+    {"record": cmd_record, "fit": cmd_fit, "check": cmd_check, "list": cmd_list,
+     "clear": cmd_clear}[args.cmd](args)
+
+
+if __name__ == "__main__":
+    main()
