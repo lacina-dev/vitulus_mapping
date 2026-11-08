@@ -1,0 +1,12 @@
+<launch>
+  <!-- Persistent terrain map of the served site (T30, vitulus_mapping/terrainlayers.py, terrainfuse.py).
+       Off unless the robot sets VITULUS_TERRAIN_GLOBAL=true (~/.bashrc, sourced by vitulus.service).
+       On = 1 / true / yes / on (any case, spaces ignored); anything else = off, never breaks the launch.
+       Needs traversability_local publishing /traversability/fuse (T30 C1). -->
+  <arg name="enabled" default="$(optenv VITULUS_TERRAIN_GLOBAL false)"/>
+  <node if="$(eval str(arg('enabled')).strip().lower() in ('1', 'true', 'yes', 'on'))"
+        pkg="vitulus_mapping" type="terrain_recorder" name="terrain_recorder"
+        output="log" respawn="true" respawn_delay="10" launch-prefix="nice -n 10">
+    <rosparam command="load" file="$(find vitulus_mapping)/config/terrain_recorder.yaml"/>
+  </node>
+</launch>

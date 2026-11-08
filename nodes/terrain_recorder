@@ -1,0 +1,124 @@
+#!/usr/bin/env python3
+"""terrain_recorder -- the persistent terrain map of the served site (T30 D2).
+
+Takes the local terrain window of traversability_local (vitulus_traversability)
+from /traversability/fuse (grid_map_msgs/GridMap + layer fuse_meta, contract
+~/vitulus/predavka/t30-kontrakt.md; deserialized with rospy.numpy_msg: 0.25 ms instead
+of 18 ms per 577 kB message on the laptop) and
+fuses it into ~/.vitulus/mapping_v3/<site>/terrain/ (vitulus_mapping.terrainlayers):
+UTM tiles of 12.8 m at 5 cm, visits, height alignment, changes over time.
+All logic is in vitulus_mapping.terrainfuse.RecorderCore; this file only wires ROS.
+
+Interfaces
+  in   /traversability/fuse     grid_map_msgs/GridMap  subscribed only while the
+                                                  localisation gate is open (the
+                                                  local node publishes only then)
+  in   /nav_tf/loc_status       std_msgs/String   owner, gps_good, heading_ok, anchors
+  in   /gnss/navpvt             ublox_msgs/NavPVT only while loc_status owner is gps
+  out  ~stats                   std_msgs/String   latched JSON every stats_period
+  out  /terrain_recorder/updates std_msgs/String  latched JSON {"site","stamp","tiles":[{tx,ty,version}]}
+                                                  after the tiles are written
+Files are written every flush_s and at shutdown (open visits closed first).
+Started by launch/terrain_recorder.launch only with VITULUS_TERRAIN_GLOBAL on.
+"""
+
+import json
+import threading
+
+import rospy
+from grid_map_msgs.msg import GridMap
+from rospy.numpy_msg import numpy_msg
+from std_msgs.msg import String
+
+from vitulus_mapping import terrainfuse
+
+
+class Node(object):
+    def __init__(self):
+        cfg = {}
+        for key in terrainfuse.DEFAULTS:
+            value = rospy.get_param('~' + key, None)
+            if value is not None:
+                cfg[key] = value
+        store = rospy.get_param('~store', {}) or {}
+        root = rospy.get_param('~sites_root', '') or None
+        self.fuse_topic = rospy.get_param('~fuse_topic', '/traversability/fuse')
+        self.gnss_topic = rospy.get_param('~gnss_topic', '/gnss/navpvt')
+        self.stats_period = float(rospy.get_param('~stats_period', 5.0))
+        self.budget_ms = float(rospy.get_param('~budget_fuse_ms', 60.0))
+        self.lock = threading.Lock()
+        self.core = terrainfuse.RecorderCore(cfg, store_params=store, sites_root=root,
+                                             log=self._log)
+        self.pub_stats = rospy.Publisher('~stats', String, queue_size=1, latch=True)
+        self.pub_updates = rospy.Publisher('/terrain_recorder/updates', String, queue_size=1,
+                                           latch=True)
+        self.sub_fuse = None
+        self.sub_pvt = None
+        self.stats_t = 0.0
+        rospy.Subscriber('/nav_tf/loc_status', String, self._cb_loc, queue_size=1)
+        rospy.on_shutdown(self._shutdown)
+        rospy.Timer(rospy.Duration(1.0), self._tick)
+
+    def _log(self, level, text):
+        {'info': rospy.loginfo, 'warn': rospy.logwarn,
+         'error': rospy.logerr}.get(level, rospy.loginfo)('[terrain_recorder] %s' % text)
+
+    # ---- callbacks ---------------------------------------------------------------
+    def _cb_loc(self, msg):
+        try:
+            st = json.loads(msg.data)
+        except (TypeError, ValueError):
+            st = {}
+        with self.lock:
+            self.core.gate.feed_loc(rospy.get_time(), st)
+        want_pvt = isinstance(st, dict) and st.get('owner') == 'gps'
+        if want_pvt and self.sub_pvt is None:
+            from ublox_msgs.msg import NavPVT
+            self.sub_pvt = rospy.Subscriber(self.gnss_topic, NavPVT, self._cb_pvt, queue_size=1)
+        elif not want_pvt and self.sub_pvt is not None:
+            self.sub_pvt.unregister()
+            self.sub_pvt = None
+
+    def _cb_pvt(self, msg):
+        with self.lock:
+            self.core.gate.feed_pvt(rospy.get_time(), msg.fixType, msg.flags, msg.hAcc)
+
+    def _cb_fuse(self, msg):
+        with self.lock:
+            self.core.feed(msg, rospy.get_time())
+
+    # ---- timer -------------------------------------------------------------------
+    def _tick(self, _evt):
+        now = rospy.get_time()
+        with self.lock:
+            self.core.poll(now)
+            want = self.core.want_subscription(now)
+            changed = self.core.flush(now)
+            site = self.core.site
+            status = self.core.status(now) if now - self.stats_t >= self.stats_period else None
+        if want and self.sub_fuse is None:
+            self.sub_fuse = rospy.Subscriber(self.fuse_topic, numpy_msg(GridMap), self._cb_fuse,
+                                             queue_size=1, buff_size=4 * 1024 * 1024)
+        elif not want and self.sub_fuse is not None:
+            self.sub_fuse.unregister()
+            self.sub_fuse = None
+        if changed:
+            self.pub_updates.publish(String(data=json.dumps(
+                {'site': site, 'stamp': now, 'tiles': changed})))
+        if status is not None:
+            self.stats_t = now
+            self.pub_stats.publish(String(data=json.dumps(status)))
+            p95 = status.get('fuse_ms_p95')
+            if p95 is not None and p95 > self.budget_ms:
+                rospy.logwarn_throttle(60.0, '[terrain_recorder] fuse p95 %.1f ms over budget %.1f ms'
+                                       % (p95, self.budget_ms))
+
+    def _shutdown(self):
+        with self.lock:
+            self.core.close()
+
+
+if __name__ == '__main__':
+    rospy.init_node('terrain_recorder')
+    Node()
+    rospy.spin()

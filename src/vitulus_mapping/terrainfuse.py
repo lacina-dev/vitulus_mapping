@@ -1,0 +1,520 @@
+#!/usr/bin/env python3
+"""
+terrainfuse.py -- the logic of nodes/terrain_recorder (T30 D2), without rospy.
+
+  decode_gridmap / build_gridmap   the /traversability/fuse message: GridMap +
+                              layer fuse_meta (contract ~/vitulus/predavka/t30-kontrakt.md, v1)
+  QualityGate                 own localisation gate: /gnss/navpvt (RTK FIXED,
+                              hAcc), /nav_tf/loc_status (owner gps, gps_good,
+                              heading_ok, anchors not frozen), freshness
+  RecorderCore                served site + datum -> terrainlayers.TerrainStore
+                              (site/<site>/terrain/), coverage.npz for "mowed",
+                              sessions, flushing, statistics; driven by plain
+                              calls (feed / poll / flush / close) with times
+
+The node only wires ROS topics to these calls, so all of it is tested without a
+ROS master (test/test_terrainfuse.py).
+"""
+
+import collections
+import json
+import math
+import os
+import time
+
+import numpy as np
+import yaml
+
+from . import bundle
+from . import geo
+from . import terrainlayers as tl
+
+__all__ = ["FUSE_VERSION", "LAYERS", "decode_gridmap", "build_gridmap", "QualityGate",
+           "RecorderCore", "DEFAULTS"]
+
+FUSE_VERSION = 1
+
+# data layers of the message, besides fuse_meta (t30-kontrakt.md)
+LAYERS = ("elevation", "variance", "points", "t_fused", "cost", "reason", "slope", "step", "roughness")
+
+DEFAULTS = {
+    # gate
+    "min_fix_class": 4,          # worldlayers.fix_class: 4 = RTK fixed
+    "max_hacc_mm": 30.0,
+    "pvt_max_age": 1.5,          # s
+    "loc_max_age": 3.0,          # s (loc_status is 1 Hz + edges)
+    "gate_hold_s": 1.0,          # the gate must have been open over [stamp - hold, stamp]
+    # messages
+    "max_age": 3.0,              # s: message stamp vs now
+    # subscription (the local node publishes only while somebody listens)
+    "subscribe_after_s": 2.0,    # gate open this long -> subscribe
+    "unsubscribe_after_s": 30.0, # gate closed this long -> unsubscribe
+    # site, files
+    "site_poll_s": 5.0,
+    "coverage_reload_s": 60.0,
+    "flush_s": 60.0,
+    "session_gap_s": 1800.0,     # no fused batch this long -> a new session
+}
+
+
+# --------------------------------------------------------------------------
+# message: grid_map_msgs/GridMap with the layer fuse_meta (contract t30-kontrakt.md)
+# --------------------------------------------------------------------------
+def _arr(layer_data):
+    """float32 numpy array of a Float32MultiArray's data (numpy_msg gives one, plain
+    genpy a tuple)."""
+    return np.asarray(layer_data, np.float32)
+
+
+def decode_gridmap(msg):
+    """Parse one /traversability/fuse GridMap (or any object with the same
+    attributes). Returns a dict: win (terrainlayers.Window), pose (x, y, yaw) or
+    None, stamp, robot (x, y, z, yaw), epoch, settling, z_correction. Raises
+    ValueError with the reason for a refused message."""
+    try:
+        info = msg.info
+        stamp = float(info.header.stamp.to_sec())
+        res = float(info.resolution)
+        lx, ly = float(info.length_x), float(info.length_y)
+        cx, cy = float(info.pose.position.x), float(info.pose.position.y)
+        names = list(msg.layers)
+        data = msg.data
+        outer, inner = int(msg.outer_start_index), int(msg.inner_start_index)
+    except (AttributeError, TypeError, ValueError) as e:
+        raise ValueError("field: %s" % e)
+    if not (0.0 < res < 1.0):
+        raise ValueError("resolution %s" % res)
+    nx, ny = int(round(lx / res)), int(round(ly / res))
+    if not (0 < nx <= 2000 and 0 < ny <= 2000):
+        raise ValueError("size %dx%d" % (nx, ny))
+    if outer != 0 or inner != 0:
+        raise ValueError("start index %d/%d (the contract has 0)" % (outer, inner))
+    missing = [k for k in LAYERS + ("fuse_meta",) if k not in names]
+    if missing:
+        raise ValueError("missing layers %s" % missing)
+    if len(data) != len(names):
+        raise ValueError("%d layers, %d data arrays" % (len(names), len(data)))
+    meta = _arr(data[names.index("fuse_meta")].data)
+    if meta.size < 12:
+        raise ValueError("fuse_meta has %d values" % meta.size)
+    meta = meta[:12].astype(np.float64)
+    if meta[0] != FUSE_VERSION:
+        raise ValueError("version %r" % meta[0])
+    arrs = {}
+    for k in LAYERS:
+        a = _arr(data[names.index(k)].data)
+        if a.size != nx * ny:
+            raise ValueError("layer %s: %d values, expected %d" % (k, a.size, nx * ny))
+        arrs[k] = np.ascontiguousarray(a.reshape(ny, nx)[::-1, ::-1])   # -> [iy, ix], row 0 = lowest y
+    robot = tuple(float(v) for v in meta[7:11])
+    pose = (float(meta[4]), float(meta[5]), float(meta[6])) if meta[3] > 0.5 else None
+    if not all(math.isfinite(v) for v in (stamp, cx, cy) + robot):
+        raise ValueError("non-finite number")
+    if pose is not None and not all(math.isfinite(v) for v in pose):
+        raise ValueError("non-finite map_from_odom")
+    epoch = int(meta[1]) if math.isfinite(meta[1]) else 0
+    settling = bool(meta[2] > 0.5)
+    pts = np.nan_to_num(arrs["points"], nan=0.0)
+    cost = np.where(np.isfinite(arrs["cost"]), arrs["cost"], -1.0).astype(np.float32)
+    reason = np.nan_to_num(arrs["reason"], nan=0.0)
+    win = tl.Window(cx - lx / 2.0, cy - ly / 2.0, res, arrs["elevation"], arrs["variance"], pts, cost,
+                    reason, slope=arrs["slope"], step=arrs["step"], roughness=arrs["roughness"],
+                    t_fused=stamp + arrs["t_fused"].astype(np.float64), stamp=stamp, epoch=epoch,
+                    settling=settling)
+    return {"win": win, "pose": pose, "stamp": stamp, "robot": robot, "epoch": epoch,
+            "settling": settling, "z_correction": float(meta[11])}
+
+
+class _NS(object):
+    def __init__(self, **kw):
+        self.__dict__.update(kw)
+
+
+class _Stamp(object):
+    def __init__(self, t):
+        self.t = float(t)
+
+    def to_sec(self):
+        return self.t
+
+
+def build_gridmap(stamp, origin, res, layers, map_from_odom, robot, epoch=0, settling=False,
+                  z_correction=0.0, classes=None):
+    """A /traversability/fuse message as the C1 node builds it (reference for tests).
+
+    layers: arrays [iy][ix] (row 0 = lowest y) for every key of LAYERS (NaN unknown,
+    t_fused relative to stamp). classes: None -> plain objects (no ROS); or
+    (GridMap, Float32MultiArray, MultiArrayDimension, rospy.Time) -> a real message."""
+    ny, nx = np.asarray(layers["elevation"]).shape
+    meta = np.full(nx * ny, np.nan, np.float32)
+    mo = map_from_odom
+    meta[:12] = [FUSE_VERSION, epoch, 1.0 if settling else 0.0, 0.0 if mo is None else 1.0,
+                 0.0 if mo is None else mo[0], 0.0 if mo is None else mo[1], 0.0 if mo is None else mo[2],
+                 robot[0], robot[1], robot[2], robot[3], z_correction]
+    flat = [np.ascontiguousarray(np.asarray(layers[k], np.float32)[::-1, ::-1]).reshape(-1) for k in LAYERS]
+    flat.append(meta)
+    names = list(LAYERS) + ["fuse_meta"]
+    cx = origin[0] + nx * res / 2.0
+    cy = origin[1] + ny * res / 2.0
+    if classes is None:
+        info = _NS(header=_NS(stamp=_Stamp(stamp), frame_id="odom"), resolution=res,
+                   length_x=nx * res, length_y=ny * res,
+                   pose=_NS(position=_NS(x=cx, y=cy, z=0.0)))
+        return _NS(info=info, layers=names, basic_layers=[], outer_start_index=0, inner_start_index=0,
+                   data=[_NS(data=a) for a in flat])
+    GridMap, F32, Dim, Time = classes
+    m = GridMap()
+    m.info.header.stamp = Time.from_sec(stamp)
+    m.info.header.frame_id = "odom"
+    m.info.resolution = res
+    m.info.length_x = nx * res
+    m.info.length_y = ny * res
+    m.info.pose.position.x = cx
+    m.info.pose.position.y = cy
+    m.info.pose.orientation.w = 1.0
+    m.layers = names
+    for a in flat:
+        d = F32()
+        d.layout.dim = [Dim("column_index", nx, nx * ny), Dim("row_index", ny, ny)]
+        d.data = a
+        m.data.append(d)
+    return m
+
+
+# --------------------------------------------------------------------------
+# gate
+# --------------------------------------------------------------------------
+def fix_class(fix_type, flags):
+    """Fix class from NAV-PVT fixType and flags (= worldlayers.fix_class)."""
+    if not flags & 0x01 or fix_type < 2 or fix_type > 4:
+        return 0
+    carr = (flags >> 6) & 0x03
+    if carr == 2:
+        return 4
+    if carr == 1:
+        return 3
+    if flags & 0x02:
+        return 2
+    return 1
+
+
+class QualityGate(object):
+    """Localisation good enough for the persistent map. Times are receive times
+    on one clock (the node: rospy.get_time())."""
+
+    def __init__(self, cfg=None):
+        self.cfg = dict(DEFAULTS)
+        if cfg:
+            self.cfg.update(cfg)
+        self.pvt = None          # (t, class, hacc_mm)
+        self.loc = None          # (t, dict)
+        self.last_bad = None     # last time seen closed
+        self.open_since = None
+        self.closed_since = None  # first time seen closed after being open (None: open / never seen)
+        self.reason = "no data"
+
+    def feed_pvt(self, now, fix_type, flags, hacc_mm):
+        self.pvt = (now, fix_class(fix_type, flags), float(hacc_mm))
+        self.check(now)
+
+    def feed_loc(self, now, status):
+        self.loc = (now, status if isinstance(status, dict) else {})
+        self.check(now)
+
+    def _why(self, now):
+        c = self.cfg
+        if self.pvt is None:
+            return "no navpvt"
+        t, cls, hacc = self.pvt
+        if now - t > c["pvt_max_age"]:
+            return "navpvt stale"
+        if cls < c["min_fix_class"]:
+            return "fix class %d" % cls
+        if hacc > c["max_hacc_mm"]:
+            return "hAcc %.0f mm" % hacc
+        if self.loc is None:
+            return "no loc_status"
+        t, st = self.loc
+        if now - t > c["loc_max_age"]:
+            return "loc_status stale"
+        if st.get("owner") != "gps":
+            return "owner %s" % st.get("owner")
+        if not st.get("gps_good", False):
+            return "gps not good"
+        if not st.get("heading_ok", False):
+            return "heading not ok"
+        if st.get("anchor_frozen") or st.get("heading_anchor_frozen"):
+            return "anchor frozen"
+        return None
+
+    def check(self, now):
+        """Evaluate now; returns True when open."""
+        why = self._why(now)
+        self.reason = why or "ok"
+        if why is None:
+            if self.open_since is None:
+                self.open_since = now
+            self.closed_since = None
+            return True
+        self.last_bad = now
+        self.open_since = None
+        if self.closed_since is None:
+            self.closed_since = now
+        return False
+
+    def ok_for(self, stamp, now):
+        """Open now and over [stamp - gate_hold_s, now]."""
+        if not self.check(now):
+            return False
+        return self.open_since is not None and self.open_since <= stamp - self.cfg["gate_hold_s"]
+
+    def open_for(self, now):
+        """Seconds the gate has been open (0 when closed)."""
+        return (now - self.open_since) if (self.check(now) and self.open_since is not None) else 0.0
+
+
+# --------------------------------------------------------------------------
+# recorder
+# --------------------------------------------------------------------------
+def read_served_site(root):
+    try:
+        with open(os.path.join(root, ".last_served")) as f:
+            data = json.load(f)
+        return str(data["site"]) if data.get("site") else None
+    except (IOError, OSError, ValueError, KeyError, AttributeError, TypeError):
+        return None
+
+
+def read_datum(site_dir):
+    path = os.path.join(site_dir, "datum.yaml")
+    try:
+        mtime = os.path.getmtime(path)
+        with open(path) as f:
+            return geo.from_datum_yaml(yaml.safe_load(f)), mtime
+    except (IOError, OSError, ValueError, KeyError, TypeError, AttributeError, yaml.YAMLError):
+        return None, None
+
+
+class _Coverage(object):
+    """last_mowed lookup at UTM points from coverage.npz (map frame of its datum)."""
+
+    def __init__(self, site_dir, datum):
+        from . import worldlayers            # numpy + yaml only; imported late for light tests
+        self.grid = worldlayers.CoverageGrid.load(site_dir, datum, readonly=True)
+        self.datum = datum
+
+    def __call__(self, e, n):
+        e = np.asarray(e, np.float64)
+        n = np.asarray(n, np.float64)
+        out = np.zeros(e.shape)
+        g = self.grid
+        lm = g.a.get("last_mowed") if hasattr(g, "a") else None
+        if lm is None or lm.size == 0:
+            return out
+        yaw = self.datum["yaw_rad"]
+        c, s = math.cos(yaw), math.sin(yaw)
+        dx, dy = e - self.datum["utm_e"], n - self.datum["utm_n"]
+        x = c * dx + s * dy
+        y = -s * dx + c * dy
+        col = np.floor((x - g.ox) / g.RES).astype(np.int64)
+        row = np.floor((y - g.oy) / g.RES).astype(np.int64)
+        ok = (row >= 0) & (row < lm.shape[0]) & (col >= 0) & (col < lm.shape[1])
+        out[ok] = lm[row[ok], col[ok]]
+        return out
+
+
+class RecorderCore(object):
+    """Everything of terrain_recorder except ROS (see module doc)."""
+
+    def __init__(self, cfg=None, store_params=None, sites_root=None, log=None):
+        self.cfg = dict(DEFAULTS)
+        if cfg:
+            unknown = set(cfg) - set(DEFAULTS)
+            if unknown:
+                raise ValueError("unknown parameters: %s" % sorted(unknown))
+            self.cfg.update(cfg)
+        self.store_params = dict(store_params or {})
+        self.root = sites_root or bundle.SITES_ROOT
+        self.log = log or (lambda level, text: None)
+        self.gate = QualityGate(self.cfg)
+        self.site = None
+        self.datum = None
+        self.datum_mtime = None
+        self.store = None
+        self.cov_t = 0.0
+        self.poll_t = None
+        self.flush_t = None
+        self.last_fused_stamp = None
+        self.subscribed = False
+        self.versions = {}
+        self.stats = collections.Counter()
+        self.fuse_ms = collections.deque(maxlen=200)
+        self.decode_ms = collections.deque(maxlen=200)
+        self.last_drop = None
+
+    # ---- site ------------------------------------------------------------------
+    def site_dir(self):
+        return os.path.join(self.root, self.site) if self.site else None
+
+    def poll(self, now, force=False):
+        """Served site and its datum (every site_poll_s); coverage reload."""
+        if not force and self.poll_t is not None and now - self.poll_t < self.cfg["site_poll_s"]:
+            return
+        self.poll_t = now
+        site = read_served_site(self.root)
+        if site != self.site:
+            self._close_store()
+            self.site = site
+            self.datum, self.datum_mtime = (None, None)
+            self.versions = {}
+            self.log("info", "site %s" % site)
+        if self.site is None:
+            return
+        datum, mtime = read_datum(self.site_dir())
+        if datum is None:
+            if self.store is not None:
+                self._close_store()
+            self.datum = None
+            return
+        if self.store is None:
+            self.datum, self.datum_mtime = datum, mtime
+            self.store = tl.TerrainStore(os.path.join(self.site_dir(), "terrain"), datum,
+                                         params=self.store_params)
+            self.versions = {k: v.get("version", 0) for k, v in self.store.index["tiles"].items()}
+            self.cov_t = 0.0
+            if self.store.broken:
+                self.log("warn", "broken terrain files moved aside: %s" % self.store.broken)
+        elif mtime != self.datum_mtime and datum != self.datum:
+            # the map frame moved under odom: no visit may mix both; stored data is UTM
+            self.store.close_all()
+            self.store.datum = dict(datum)
+            self.store.last_pose = None
+            self.datum, self.datum_mtime = datum, mtime
+            self.stats["datum_changes"] += 1
+            self.log("info", "datum changed, visits closed")
+        else:
+            self.datum_mtime = mtime
+        if now - self.cov_t >= self.cfg["coverage_reload_s"]:
+            self.cov_t = now
+            try:
+                self.store.mowed = _Coverage(self.site_dir(), self.datum)
+            except Exception as e:                       # noqa: BLE001
+                self.store.mowed = None
+                self.log("warn", "coverage.npz: %s" % e)
+
+    def _close_store(self):
+        if self.store is not None:
+            try:
+                self.store.close_all()
+                # a removed site (mapping_manager remove_site) is not created again
+                if os.path.isdir(os.path.join(self.root, self.site or "")) and self.site:
+                    self.store.save_dirty()
+            except Exception as e:                       # noqa: BLE001
+                self.log("error", "saving terrain: %s" % e)
+            self.store = None
+
+    # ---- subscription ------------------------------------------------------------
+    def want_subscription(self, now):
+        """Subscribe after the gate was open subscribe_after_s, unsubscribe after it
+        was closed unsubscribe_after_s (and without a site / datum)."""
+        if self.store is None:
+            self.subscribed = False
+            return False
+        if self.gate.check(now):
+            if not self.subscribed and self.gate.open_for(now) >= self.cfg["subscribe_after_s"]:
+                self.subscribed = True
+        elif self.subscribed and now - self.gate.closed_since >= self.cfg["unsubscribe_after_s"]:
+            self.subscribed = False
+        return self.subscribed
+
+    # ---- messages ------------------------------------------------------------
+    def _drop(self, why):
+        self.stats["drop_" + why] += 1
+        self.last_drop = why
+        return why
+
+    def feed(self, msg, now):
+        """One /traversability/fuse GridMap. Returns "queued" or the drop reason."""
+        self.stats["msgs"] += 1
+        t0 = time.perf_counter()
+        try:
+            m = decode_gridmap(msg)
+            self.decode_ms.append((time.perf_counter() - t0) * 1000.0)
+        except ValueError as e:
+            self.log("warn", "fuse message refused: %s" % e)
+            return self._drop("decode")
+        if self.store is None:
+            return self._drop("no_site")
+        if now - m["stamp"] > self.cfg["max_age"]:
+            return self._drop("stale")
+        if m["pose"] is None:
+            return self._drop("no_tf")
+        if not self.gate.ok_for(m["stamp"], now):
+            # the queue of the store must not keep batches from before the gate closed
+            if self.store.pending:
+                self.stats["drop_queue_gate"] += len(self.store.pending)
+                self.store.pending = []
+            return self._drop("gate")
+        if self.last_fused_stamp is not None and \
+                m["stamp"] - self.last_fused_stamp > self.cfg["session_gap_s"]:
+            self.store.new_session()
+            self.stats["sessions"] += 1
+        t0 = time.perf_counter()
+        r = self.store.fuse(m["win"], m["pose"], m["stamp"], robot=m["robot"])
+        self.fuse_ms.append((time.perf_counter() - t0) * 1000.0)
+        if r["dropped"]:
+            self.stats["drop_localisation"] += r["dropped"]
+        for info in r["processed"]:
+            if info.get("fused"):
+                self.stats["fused"] += 1
+                self.last_fused_stamp = info["stamp"]
+            elif info.get("refused"):
+                self.stats["refused_" + info["refused"]] += 1
+        if not r["queued"]:
+            return self._drop("settling")
+        return "queued"
+
+    # ---- files ------------------------------------------------------------------
+    def flush(self, now, force=False):
+        """Write dirty tiles (every flush_s). Returns the changed tiles
+        [{"tx", "ty", "version"}] (for /terrain_recorder/updates) or []."""
+        if self.store is None:
+            return []
+        if not force and self.flush_t is not None and now - self.flush_t < self.cfg["flush_s"]:
+            return []
+        self.flush_t = now
+        n = self.store.save_dirty()
+        if not n:
+            return []
+        changed = []
+        for key, meta in self.store.index["tiles"].items():
+            v = meta.get("version", 0)
+            if self.versions.get(key) != v:
+                tx, ty = (int(p) for p in key.split("_"))
+                changed.append({"tx": tx, "ty": ty, "version": v})
+                self.versions[key] = v
+        self.stats["flushes"] += 1
+        return changed
+
+    def close(self):
+        """Shutdown: close the visits and write everything (queued batches are lost:
+        they are younger than accept_delay)."""
+        self._close_store()
+
+    # ---- state --------------------------------------------------------------------
+    def status(self, now):
+        ms = sorted(self.fuse_ms)
+        st = {"site": self.site, "gate": self.gate.reason, "subscribed": self.subscribed,
+              "stats": dict(self.stats), "last_drop": self.last_drop,
+              "fuse_ms_avg": round(sum(ms) / len(ms), 2) if ms else None,
+              "fuse_ms_p95": round(ms[int(0.95 * (len(ms) - 1))], 2) if ms else None,
+              "fuse_ms_max": round(ms[-1], 2) if ms else None,
+              "decode_ms_avg": round(sum(self.decode_ms) / len(self.decode_ms), 2) if self.decode_ms else None}
+        if self.store is not None:
+            s = self.store.summary()
+            st.update({"tiles_loaded": s["tiles_loaded"], "tiles_indexed": s["tiles_indexed"],
+                       "open_visits": s["open_visits"], "queued": len(self.store.pending),
+                       "z_offset": s["z_offset"], "anchor_residual": s["anchor_residual"],
+                       "ram_mb": round(s["ram_bytes"] / 1e6, 1), "session": self.store.session,
+                       "epoch": self.store.epoch, "store": s["stats"], "broken": s["broken"]})
+        return st

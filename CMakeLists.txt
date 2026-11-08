@@ -22,6 +22,7 @@ catkin_install_python(PROGRAMS
   nodes/direct_raster
   nodes/mapping_manager
   nodes/map_world_recorder
+  nodes/terrain_recorder
   nodes/mow_report
   nodes/map_objects_server
   nodes/grass_height
