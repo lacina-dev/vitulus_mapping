@@ -94,10 +94,11 @@ check(up.get("site") == "testsite" and len(up.get("tiles", [])) >= 1, "updates a
 check(os.path.exists(os.path.join(SITE_DIR, "terrain", "index.json")), "index.json written")
 sv = got["state"] or {}
 print("state:", json.dumps({k: sv.get(k) for k in ("mode", "enabled", "gate", "map", "load", "export")}))
-check(sv.get("mode") == "recording" and sv.get("v") == 1, "state: mode recording (T31)")
-check(os.path.exists(os.path.join(SITE_DIR, "terrain_mosaic", "teren_testsite.json")) and
-      os.path.exists(os.path.join(SITE_DIR, "terrain_mosaic", "teren_testsite_cost_rgba.png")),
-      "export terrain_mosaic written (T31)")
+check(sv.get("mode") == "recording" and sv.get("v") == 2, "state: mode recording (T31 v2)")
+ej = os.path.join(SITE_DIR, "terrain_mosaic", "teren_testsite.json")
+efiles = json.load(open(ej))["files"] if os.path.exists(ej) else {}
+check(bool(efiles) and all(os.path.exists(os.path.join(SITE_DIR, "terrain_mosaic", f)) for f in efiles.values()),
+      "export terrain_mosaic written, every file the JSON names exists (T31, E1)")
 before = json.load(open(os.path.join(SITE_DIR, "terrain", "index.json")))
 pub_cmd.publish(String(data=json.dumps({"id": "c1", "cmd": "disable"})))
 for _ in range(30):

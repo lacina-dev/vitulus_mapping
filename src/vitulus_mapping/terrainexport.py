@@ -28,7 +28,7 @@ import numpy as np
 
 from . import terrainlayers as tl
 
-__all__ = ["export_mosaic", "nogo_candidates", "load_mosaic_dir", "write_png", "cost_rgba",
+__all__ = ["export_mosaic", "export_from_disk", "nogo_candidates", "load_mosaic_dir", "write_png", "cost_rgba",
            "REASONS_UI", "ENCODING"]
 
 REASONS_UI = {"0": "neznámé", "1": "sjízdné (cena < 50)", "2": "vyšší cena (50–99)",
@@ -93,19 +93,25 @@ def write_png(path, arr):
     _atomic(path, _png_bytes(arr))
 
 
-def cost_rgba(cost, known):
-    """RGBA of the mosaic: cost 0..99 green -> red (alpha 200), 100 dark red (alpha 230), unknown clear."""
-    h, w = cost.shape
-    rgba = np.zeros((h, w, 4), np.uint8)
-    f = known & (cost < 100)
-    t = np.clip(cost[f].astype(np.float64), 0, 99) / 99.0 * (len(_CMAP) - 1)
+def _rgba_lut():
+    lut = np.zeros((256, 4), np.uint8)               # 255 and anything else unknown: clear
+    t = np.arange(100) / 99.0 * (len(_CMAP) - 1)
     i = np.minimum(np.floor(t).astype(int), len(_CMAP) - 2)
     u = (t - i)[:, None]
-    rgba[f, :3] = np.round(_CMAP[i] * (1 - u) + _CMAP[i + 1] * u).astype(np.uint8)
-    rgba[f, 3] = 200
-    le = known & (cost >= 100)
-    rgba[le] = (60, 0, 0, 230)
-    return rgba
+    lut[:100, :3] = np.round(_CMAP[i] * (1 - u) + _CMAP[i + 1] * u).astype(np.uint8)
+    lut[:100, 3] = 200
+    lut[100] = (60, 0, 0, 230)
+    return lut
+
+
+_LUT = _rgba_lut()
+
+
+def cost_rgba(cost, known):
+    """RGBA of the mosaic: cost 0..99 green -> red (alpha 200), 100 dark red (alpha 230), unknown clear
+    (a lookup table: little memory on a big site)."""
+    c = np.where(known, np.clip(cost, 0, 255), 255).astype(np.uint8)
+    return _LUT[c]
 
 
 # --------------------------------------------------------------------------
@@ -151,28 +157,39 @@ def raster_map(store, margin=0.5):
     d = store.datum
     yaw = float(d.get("yaw_rad", 0.0))
     c, s = math.cos(yaw), math.sin(yaw)
-    cc, rr = np.meshgrid(np.arange(w), np.arange(h))
-    x = x0 + (cc.ravel() + 0.5) * res
-    y = y0 + (rr.ravel() + 0.5) * res
-    e = d["utm_e"] + c * x - s * y
-    n = d["utm_n"] + s * x + c * y
-    keys = tl.pack_keys(np.floor(e / res), np.floor(n / res))
-    hh = np.full(keys.size, np.nan, np.float32)
-    cost = np.full(keys.size, 255, np.uint8)
-    reason = np.zeros(keys.size, np.uint8)
-    for (tx, ty), sel, ly, lx in store._groups(keys):
-        t = store.tile(tx, ty)
-        if t is None:
-            continue
-        rz, cz, _tent = t.effective()
-        hh[sel] = t.h[ly, lx]
-        cost[sel] = cz[ly, lx]
-        reason[sel] = rz[ly, lx]
+    hh = np.full((h, w), np.nan, np.float32)
+    cost = np.full((h, w), 255, np.uint8)
+    reason = np.zeros((h, w), np.uint8)
+    eff = {}                                     # tile -> (reason, cost) computed once
+    xs = x0 + (np.arange(w) + 0.5) * res
+    for r0 in range(0, h, 128):                  # in stripes: bounded memory on a big site
+        r1 = min(h, r0 + 128)
+        ys = y0 + (np.arange(r0, r1) + 0.5) * res
+        x, y = np.meshgrid(xs, ys)
+        e = d["utm_e"] + c * x - s * y
+        n = d["utm_n"] + s * x + c * y
+        keys = tl.pack_keys(np.floor(e / res), np.floor(n / res)).ravel()
+        sh = np.full(keys.size, np.nan, np.float32)
+        sc = np.full(keys.size, 255, np.uint8)
+        sr = np.zeros(keys.size, np.uint8)
+        for (tx, ty), sel, ly, lx in store._groups(keys):
+            t = store.tile(tx, ty)
+            if t is None:
+                continue
+            if (tx, ty) not in eff:
+                rz, cz, _tent = t.effective()
+                eff[(tx, ty)] = (rz, cz)
+            rz, cz = eff[(tx, ty)]
+            sh[sel] = t.h[ly, lx]
+            sc[sel] = cz[ly, lx]
+            sr[sel] = rz[ly, lx]
+        hh[r0:r1] = sh.reshape(r1 - r0, w)
+        cost[r0:r1] = sc.reshape(r1 - r0, w)
+        reason[r0:r1] = sr.reshape(r1 - r0, w)
     known = np.isfinite(hh)
     cost[~known] = 255
     reason[~known] = 0
-    return {"origin_x": x0, "origin_y": y0, "width": w, "height": h,
-            "h": hh.reshape(h, w), "cost": cost.reshape(h, w), "reason": reason.reshape(h, w)}
+    return {"origin_x": x0, "origin_y": y0, "width": w, "height": h, "h": hh, "cost": cost, "reason": reason}
 
 
 # --------------------------------------------------------------------------
@@ -250,9 +267,30 @@ def nogo_candidates(r, min_cells=20, buffer_m=0.15, limit=50):
 # --------------------------------------------------------------------------
 # export
 # --------------------------------------------------------------------------
-def export_mosaic(store, out_dir, site, sessions=None, r=None):
-    """Write the mosaic files of the store to out_dir (JSON last). Returns the JSON dict
-    (with "version"), or None when the store has no known cell (old files removed)."""
+LAYER_KEYS = ("cost", "reason", "cost_rgba", "elevation16")
+
+
+def _old_versions(out_dir, prefix, keep):
+    """Versioned image files of earlier exports, except the versions in `keep`."""
+    out = []
+    for p in glob.glob(os.path.join(out_dir, prefix + "_v*_*.png")):
+        try:
+            v = int(os.path.basename(p)[len(prefix) + 2:].split("_", 1)[0])
+        except ValueError:
+            continue
+        if v not in keep:
+            out.append(p)
+    # unversioned images of the T31 v1 export
+    out += [p for p in (os.path.join(out_dir, "%s_%s.png" % (prefix, k)) for k in LAYER_KEYS) if os.path.exists(p)]
+    return out
+
+
+def export_mosaic(store, out_dir, site, sessions=None, r=None, extra=None):
+    """Write the mosaic files of the store to out_dir. Images get versioned names
+    (teren_<site>_v<N>_<layer>.png, written first), then teren_<site>.json is replaced
+    atomically (it names the images of version N), then images older than N - 1 are
+    removed: a reader that has the old JSON still finds its images. Returns the JSON
+    dict, or None when the store has no known cell (the JSON is removed first)."""
     os.makedirs(out_dir, exist_ok=True)
     prefix = "teren_%s" % site
     jpath = os.path.join(out_dir, prefix + ".json")
@@ -264,31 +302,76 @@ def export_mosaic(store, out_dir, site, sessions=None, r=None):
         pass
     r = raster_map(store) if r is None else r
     if r is None:
-        for p in glob.glob(os.path.join(out_dir, prefix + "*")):
+        if os.path.exists(jpath):
+            os.remove(jpath)
+        for p in _old_versions(out_dir, prefix, keep=()):
             os.remove(p)
         return None
+    v = version + 1
+    names = {k: "%s_v%d_%s.png" % (prefix, v, k) for k in LAYER_KEYS}
     known = np.isfinite(r["h"])
     flip = lambda a: np.ascontiguousarray(a[::-1])     # noqa: E731  row 0 = max y in the images
-    write_png(os.path.join(out_dir, prefix + "_cost_rgba.png"), flip(cost_rgba(r["cost"], known)))
-    write_png(os.path.join(out_dir, prefix + "_reason.png"), flip(r["reason"]))
-    write_png(os.path.join(out_dir, prefix + "_cost.png"), flip(r["cost"]))
+    write_png(os.path.join(out_dir, names["cost_rgba"]), flip(cost_rgba(r["cost"], known)))
+    write_png(os.path.join(out_dir, names["reason"]), flip(r["reason"]))
+    write_png(os.path.join(out_dir, names["cost"]), flip(r["cost"]))
     lo = float(np.nanmin(r["h"]))
     e16 = np.where(known, np.clip(np.round((r["h"] - lo) * 1000.0) + 1, 1, 65535), 0).astype(np.uint16)
-    write_png(os.path.join(out_dir, prefix + "_elevation16.png"), flip(e16))
+    write_png(os.path.join(out_dir, names["elevation16"]), flip(e16))
     yaw = float(store.datum.get("yaw_rad", 0.0))
+    now = time.time()
     meta = {
         "frame": "map", "resolution": tl.RES, "width": r["width"], "height": r["height"], "yaw": 0.0,
         "origin_x": round(r["origin_x"], 4), "origin_y": round(r["origin_y"], 4), "corner_note": CORNER_NOTE,
         "north_angle_rad": math.pi / 2.0 - yaw, "north_note": NORTH_NOTE,
-        "files": {"cost": prefix + "_cost.png", "reason": prefix + "_reason.png",
-                  "cost_rgba": prefix + "_cost_rgba.png", "elevation16": prefix + "_elevation16.png"},
-        "encoding": ENCODING, "reasons_ui": REASONS_UI, "tentative_note": TENTATIVE_NOTE,
+        "files": names, "encoding": ENCODING, "reasons_ui": REASONS_UI, "tentative_note": TENTATIVE_NOTE,
         "elevation_lowest_m": round(lo, 4),
-        "source": "terrain_recorder", "site": site, "version": version + 1, "stamp": time.time(),
-        "area_m2": round(int(known.sum()) * tl.RES ** 2, 1), "sessions": sessions,
+        "source": "terrain_recorder", "site": site, "version": v,
+        "generated": time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(now)), "generated_unix": round(now, 3),
+        "stamp": now, "area_m2": round(int(known.sum()) * tl.RES ** 2, 1), "sessions": sessions,
     }
+    if extra:
+        meta.update(extra)
     _atomic(jpath, json.dumps(meta, ensure_ascii=False, indent=1).encode("utf-8"))
+    for p in _old_versions(out_dir, prefix, keep=(v, v - 1)):
+        try:
+            os.remove(p)
+        except OSError:
+            pass
     return meta
+
+
+def export_from_disk(terrain_dir, datum, out_dir, site, sessions=None):
+    """The whole export from the stored tiles only (a separate, niced process: no lock
+    of the recorder, no shared memory). Returns a summary dict."""
+    t0 = time.process_time()
+    store = tl.TerrainStore(terrain_dir, datum, params={"max_loaded_tiles": 100000})
+    r = raster_map(store)
+    cands = nogo_candidates(r)
+    meta = export_mosaic(store, out_dir, site, sessions=sessions, r=r,
+                         extra={"nogo_candidates": cands})
+    return {"version": meta["version"] if meta else None, "area_m2": meta["area_m2"] if meta else 0.0,
+            "pixels": int(r["width"] * r["height"]) if r else 0, "nogo_candidates": cands,
+            "cpu_s": round(time.process_time() - t0, 3)}
+
+
+def main(argv=None):
+    """python3 -m vitulus_mapping.terrainexport --terrain DIR --datum JSON --out DIR --site S [--sessions N]
+    -> one JSON line on stdout (export_from_disk)."""
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--terrain", required=True)
+    ap.add_argument("--datum", required=True, help="JSON {utm_e, utm_n, yaw_rad}")
+    ap.add_argument("--out", required=True)
+    ap.add_argument("--site", required=True)
+    ap.add_argument("--sessions", type=int, default=None)
+    a = ap.parse_args(argv)
+    try:
+        out = export_from_disk(a.terrain, json.loads(a.datum), a.out, a.site, a.sessions)
+        out["ok"] = True
+    except Exception as e:                       # noqa: BLE001
+        out = {"ok": False, "error": "%s: %s" % (type(e).__name__, e)}
+    print(json.dumps(out))
+    return 0 if out.get("ok") else 1
 
 
 # --------------------------------------------------------------------------
@@ -327,3 +410,7 @@ def load_mosaic_dir(mdir):
         if a.shape != (h, w):
             raise ValueError("layer %s: %s, expected %s" % (k, a.shape, (h, w)))
     return meta, layers, t
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

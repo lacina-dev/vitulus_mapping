@@ -200,10 +200,12 @@ class Core(unittest.TestCase):
             json.dump({"enabled": enabled}, f)
         return path
 
-    def core(self, enabled=True, **store):
+    def core(self, enabled=True, cfg=None, **store):
         q = {"accept_delay": 2.0}
         q.update(store)
-        c = tf.RecorderCore({"flush_s": 0.0, "settings_file": self.settings(enabled)}, store_params=q,
+        cf = {"flush_s": 0.0, "settings_file": self.settings(enabled)}
+        cf.update(cfg or {})
+        c = tf.RecorderCore(cf, store_params=q,
                             sites_root=self.root, log=lambda lv, tx: self.logs.append((lv, tx)))
         c.poll(T0, force=True)
         return c
@@ -342,24 +344,55 @@ class Core(unittest.TestCase):
             c.feed_ref(t, 10.0 + d * math.cos(0.2), 5.0 + d * math.sin(0.2), 0.2)
             c.feed_odom(t, 0.3 * 0.05 * i, slew * 0.05 * i, yaw_slew * 0.05 * i)
 
-    def test_smooth_correction_drops_batches(self):
+    def test_correction_only_counted_by_default(self):
         c = self.core(accept_delay=2.0)
-        self.odom_pair(c, T0 - 15, 300)                      # 15 s quiet: no event
-        self.assertEqual(c.corr.n_events, 0)
+        c.corr_active = True
+        self.odom_pair(c, T0 - 15, 330)
         self.gate_ok(c, T0 - 15)
         self.drive(c, T0, 2)
-        self.assertEqual(len(c.store.pending), 2)
-        self.odom_pair(c, T0 + 1.5, 40, slew=0.10)            # pulled 10 cm/s sideways
+        self.odom_pair(c, T0 + 1.5, 40, slew=0.10)
         self.assertGreater(c.corr.n_events, 0)
-        self.assertEqual(c.store.pending, [])                # the queue went with it
-        self.assertEqual(c.stats["fused"], 0)
+        self.assertGreater(c.stats["corrections"], 0)
+        self.assertIsNone(c.store.fresh_after)
+        self.assertEqual(len(c.store.pending), 2)
+        self.gate_ok(c, T0 + 3.3)
+        self.assertEqual(c.feed(msg(T0 + 3), T0 + 3.3), "queued")
+
+    def test_correction_enforced_freshness_boundary(self):
+        c = self.core(cfg={"corr_enforce": True}, accept_delay=2.0)
+        c.corr_active = True
+        self.odom_pair(c, T0 - 15, 330)                      # quiet up to T0 + 1.5: no event
+        self.assertEqual(c.corr.n_events, 0)
+        self.gate_ok(c, T0 - 15)
+        self.assertEqual(self.drive(c, T0, 2), ["queued", "queued"])
+        self.odom_pair(c, T0 + 1.5, 40, slew=0.10)            # pulled 10 cm/s sideways
+        ev = c.corr.events[0]
+        self.assertGreaterEqual(c.store.fresh_after, ev + 3.0)
+        self.assertEqual(len(c.store.pending), 2)            # the queue stays, its stale cells go at processing
         self.gate_ok(c, T0 + 3.3)
         self.assertEqual(c.feed(msg(T0 + 3), T0 + 3.3), "correction")
+        c.store.drain()
+        self.assertGreater(c.store.last_batch["stale_epoch_cells"], 10000)
+        self.assertEqual(c.store.ov_keys.size, 0)            # nothing fresh entered the map
+        # no comparison around the stamp (reference odometry missing): fails closed
+        self.gate_ok(c, T0 + 20.3)
+        self.assertEqual(c.feed(msg(T0 + 20), T0 + 20.3), "corr_nodata")
         # yaw slew 1 deg/s is an event too; a quiet time after the settle time is not
         c2 = self.core()
         self.odom_pair(c2, T0, 60, yaw_slew=math.radians(1.0))
         self.assertGreater(c2.corr.n_events, 0)
         self.assertFalse(c2.corr.unsettled(T0 + 3 + 3.5 + 1))
+
+    def test_program_end_writes_and_requests_export(self):
+        c = self.core(accept_delay=0.0)
+        self.gate_ok(c, T0 - 15)
+        self.drive(c, T0, 3)
+        self.assertGreater(c.store.ov_keys.size, 0)
+        c.feed_busy(T0 + 4, True)
+        c.feed_busy(T0 + 5, False)                           # program over
+        self.assertEqual(c.store.ov_keys.size, 0)
+        self.assertEqual(c.export_req, "program_end")
+        self.assertTrue(os.path.exists(os.path.join(self.sdir, "terrain", "index.json")))
 
     def test_batch_log(self):
         path = os.path.join(self.root, "batches.csv")

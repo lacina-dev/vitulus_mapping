@@ -100,7 +100,7 @@ class Control(Base):
     def test_default_off_and_persistent_enable(self):
         c = self.core()
         st = c.state(T0)
-        self.assertEqual((st["enabled"], st["mode"], st["v"]), (False, "off", 1))
+        self.assertEqual((st["enabled"], st["mode"], st["v"]), (False, "off", 2))
         self.assertFalse(c.want_subscription(T0))
         r = self.cmd(c, cmd="enable")
         self.assertEqual((r["ok"], r["result"], r["id"]), (True, {"enabled": True}, "t"))
@@ -157,6 +157,25 @@ class Control(Base):
         self.assertGreater(c.state(T0)["backups"][0]["area_m2"], 25.0)
         self.assertNotEqual(tok, r1["result"]["confirm_token"])
 
+    def test_token_only_in_the_answer(self):
+        c = self.core()
+        self.fill(c)
+        r = self.cmd(c, cmd="delete_map")
+        self.assertEqual(len(r["result"]["confirm_token"]), 6)              # cmd_result carries it
+        lc = c.state(T0)["last_cmd"]
+        self.assertEqual((lc["result"]["confirm_token"], lc["result"]["token_sent"]), (None, True))
+        self.assertIn("confirm_token", c.last_cmd["result"])                 # the answer itself unchanged
+
+    def test_long_command_marked_running(self):
+        c = self.core()
+        c.mark_running(json.dumps({"id": "x", "cmd": "delete_map", "confirm": "abc"}))
+        self.assertEqual(c.state(T0)["last_cmd"], {"id": "x", "cmd": "delete_map", "ok": None, "error": None,
+                                                   "result": {}, "running": True})
+        c.mark_running(json.dumps({"id": "y", "cmd": "delete_map"}))         # step 1 is quick: unchanged
+        self.assertEqual(c.state(T0)["last_cmd"]["id"], "x")
+        r = self.cmd(c, cmd="list")
+        self.assertFalse(r["running"])
+
     def test_token_expires(self):
         c = self.core()
         self.fill(c)
@@ -186,6 +205,13 @@ class Control(Base):
         self.assertIsNone(r["result"]["backup"])
         r = self.cmd(c, cmd="import", source="mosaic", name="m1", mode="replace")
         self.assertIn("confirm_token", r["result"])
+        # a token given for m1 does not replace the map with another mosaic
+        os.makedirs(os.path.join(self.sdir, "terrain_import", "m9"))
+        shutil.copy(os.path.join(mdir, "teren_m1.json"), os.path.join(self.sdir, "terrain_import", "m9", "teren_m9.json"))
+        bad = self.cmd(c, cmd="import", source="mosaic", name="m9", mode="replace",
+                       confirm=r["result"]["confirm_token"])
+        self.assertEqual(bad["error"], "bad_token")
+        r = self.cmd(c, cmd="import", source="mosaic", name="m1", mode="replace")
         r = self.cmd(c, cmd="import", source="mosaic", name="m1", mode="replace",
                      confirm=r["result"]["confirm_token"])
         self.assertTrue(r["ok"], r)
@@ -202,13 +228,15 @@ class Export(Base):
         w.elevation[90:110, 90:110] = 0.4
         c.store.fuse(w, (0.0, 0.0, 0.0), T0 + 60)
         c.store.close_all()
-        meta = c.export()
+        meta = c.export_now()                                     # the niced child process, from the files
+        self.assertTrue(meta["ok"], meta)
         out = os.path.join(self.sdir, "terrain_mosaic")
         self.assertEqual(meta["version"], 1)
         with open(os.path.join(out, "teren_testsite.json")) as f:
             j = json.load(f)
         for k in ("frame", "resolution", "width", "height", "yaw", "origin_x", "origin_y", "corner_note",
-                  "north_angle_rad", "files", "encoding", "reasons_ui", "source", "version", "area_m2"):
+                  "north_angle_rad", "files", "encoding", "reasons_ui", "source", "version", "area_m2",
+                  "generated", "generated_unix", "nogo_candidates"):
             self.assertIn(k, j)
         self.assertEqual((j["frame"], j["source"], j["resolution"]), ("map", "terrain_recorder", 0.05))
         self.assertAlmostEqual(j["north_angle_rad"], np.pi / 2)
@@ -230,7 +258,9 @@ class Export(Base):
         self.assertEqual((int(cost[r, cc]), int(reason[r, cc]), int(rgba[r, cc, 3])), (10, 1, 200))
         self.assertEqual((int(cost[0, 0]), int(rgba[0, 0, 3])), (255, 0))   # margin: unknown
         self.assertAlmostEqual(j["area_m2"], c.state(T0)["map"]["area_m2"], delta=1.0)
-        self.assertEqual(c.export()["version"], 2)
+        self.assertEqual(j["files"]["cost"], "teren_testsite_v1_cost.png")
+        self.assertEqual(c.export_now()["version"], 2)
+        self.assertEqual(c.state(T0)["export"]["version"], 2)
 
     def test_nogo_candidates_only_listed(self):
         c = self.core()
@@ -242,7 +272,7 @@ class Export(Base):
             w.cost[40:60, 40:52] = 100
             c.store.fuse(w, (0.0, 0.0, 0.0), T0 + 60 * i)
             c.store.close_all()
-        c.export()
+        c.export_now()
         cands = c.state(T0)["nogo_candidates"]
         self.assertEqual(len(cands), 1)
         k = cands[0]
@@ -261,8 +291,80 @@ class Export(Base):
             w.cost[40:60, 40:52] = 100
             c.store.fuse(w, (0.0, 0.0, 0.0), T0 + 60 * i)
             c.store.close_all()
-        c.export()                                                # one session, one heading: tentative
+        c.export_now()                                            # one session, one heading: tentative
         self.assertEqual(c.state(T0)["nogo_candidates"], [])
+
+
+class ExportVersions(Base):
+    def test_versioned_files_and_cleanup_after_the_json(self):
+        c = self.core()
+        self.fill(c)
+        out = os.path.join(self.sdir, "terrain_mosaic")
+        for _ in range(4):
+            c.export_now()
+        with open(os.path.join(out, "teren_testsite.json")) as f:
+            j = json.load(f)
+        self.assertEqual(j["version"], 4)
+        pngs = sorted(p for p in os.listdir(out) if p.endswith(".png"))
+        # the JSON's version and the one before stay (a reader with the old JSON finds its images)
+        self.assertEqual(pngs, sorted("teren_testsite_v%d_%s.png" % (v, k) for v in (3, 4)
+                                      for k in ("cost", "reason", "cost_rgba", "elevation16")))
+        for k, name in j["files"].items():
+            self.assertTrue(os.path.exists(os.path.join(out, name)), name)
+
+    def test_async_export_interval_and_commands(self):
+        c = tf.RecorderCore({"flush_s": 0.0, "settings_file": self.settings, "export_s": 600.0},
+                            store_params={"accept_delay": 0.0}, sites_root=self.root)
+        c.poll(T0, force=True)
+        self.fill(c)
+        c.export_dirty = True
+        c.export_tick(T0)                                     # due: no export yet -> starts
+        self.assertIsNotNone(c.export_proc)
+        self.assertTrue(c.state(T0)["export"]["running"])
+        c._collect_export(wait=True)
+        self.assertEqual((c.export_info["version"], c.export_info["reason"]), (1, "interval"))
+        self.assertGreaterEqual(c.export_info["cpu_s"], 0.0)
+        c.export_dirty = True
+        c.export_tick(T0 + 60)                                # changed, but < export_s since the last
+        self.assertIsNone(c.export_proc)
+        r = self.cmd(c, cmd="rebuild_export")
+        self.assertEqual(r["result"], {"queued": True})
+        c.export_tick(T0 + 61)
+        c._collect_export(wait=True)
+        self.assertEqual((c.export_info["version"], c.export_info["reason"]), (2, "rebuild_export"))
+
+    def test_backups_pruned_to_the_newest(self):
+        c = tf.RecorderCore({"flush_s": 0.0, "settings_file": self.settings, "backup_keep": 2},
+                            store_params={"accept_delay": 0.0}, sites_root=self.root)
+        c.poll(T0, force=True)
+        root = os.path.join(self.sdir, "terrain_backup")
+        os.makedirs(root)
+        for name in ("20260101-000000", "20260102-000000", "20260103-000000"):
+            os.makedirs(os.path.join(root, name))
+        self.fill(c)
+        tok = self.cmd(c, cmd="delete_map")["result"]["confirm_token"]
+        name = self.cmd(c, cmd="delete_map", confirm=tok)["result"]["backup"]
+        self.assertEqual(sorted(os.listdir(root)), sorted(["20260103-000000", name]))
+
+    def test_import_uses_the_mosaic_datum(self):
+        c = self.core()
+        mdir = os.path.join(self.sdir, "terrain_import", "m2")
+        os.makedirs(mdir)
+        h, w = 20, 20
+        np.savez_compressed(os.path.join(mdir, "teren_m2_layers.npz"), elevation=np.zeros((h, w), np.float32),
+                            elevation_std=np.full((h, w), 0.01, np.float32), cost=np.zeros((h, w), np.float32),
+                            reason=np.ones((h, w), np.uint8), slope_deg=np.zeros((h, w), np.float32),
+                            step=np.zeros((h, w), np.float32), roughness=np.zeros((h, w), np.float32))
+        with open(os.path.join(mdir, "teren_m2.json"), "w") as f:
+            json.dump({"frame": "map", "yaw": 0.0, "resolution": 0.05, "width": w, "height": h, "origin_x": 0.0,
+                       "origin_y": 0.0, "files": {"layers": "teren_m2_layers.npz"}}, f)
+        # the mosaic was made when the map origin lay 5 m further east
+        with open(os.path.join(mdir, "datum.yaml"), "w") as f:
+            yaml.safe_dump(dict(DATUM, utm_e=E0 + 5.0), f)
+        r = self.cmd(c, cmd="import", source="mosaic", name="m2", mode="merge")
+        self.assertEqual((r["ok"], r["result"]["datum"]), (True, "mosaic"))
+        self.assertTrue(np.isfinite(c.store.sample_utm(E0 + 5.5, N0 + 0.5)["h"][0]))
+        self.assertFalse(np.isfinite(c.store.sample_utm(E0 + 0.5, N0 + 0.5)["h"][0]))
 
 
 if __name__ == "__main__":

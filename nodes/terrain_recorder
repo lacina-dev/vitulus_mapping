@@ -29,7 +29,8 @@ Interfaces
 Files are written every flush_s and at shutdown (open visits closed first).
 Started by launch/terrain_recorder.launch only with VITULUS_TERRAIN_GLOBAL on; composing the map is
 off until the owner switches it on from the UI (stored in ~/.vitulus/terrain_recorder.json).
-After every write the map is exported for the UI to <site>/terrain_mosaic/.
+The map is exported for the UI to <site>/terrain_mosaic/ by a niced child process from the stored tiles
+(every export_s while it changes, at the end of a program, on rebuild_export / import / delete).
 """
 
 import json
@@ -68,12 +69,14 @@ class Node(object):
         self.sub_lock = threading.Lock()
         self.core = terrainfuse.RecorderCore(cfg, store_params=store, sites_root=root,
                                              log=self._log)
+        self.core.corr_active = bool(self.odom_ref_topic)
         self.pub_stats = rospy.Publisher('~stats', String, queue_size=1, latch=True)
         self.pub_updates = rospy.Publisher('/terrain_recorder/updates', String, queue_size=1,
                                            latch=True)
         self.pub_state = rospy.Publisher('~state', String, queue_size=1, latch=True)
         self.pub_result = rospy.Publisher('~cmd_result', String, queue_size=10)
         self.state_t = 0.0
+        self.state_cache = None
         self.cpu_prev = None
         self.load = {}
         self.sub_fuse = None
@@ -110,9 +113,14 @@ class Node(object):
             self.core.gate.feed_pvt(rospy.get_time(), msg.fixType, msg.flags, msg.hAcc)
 
     def _cb_cmd(self, msg):
+        # a long command (import, delete with its token) is announced first: state.last_cmd running;
+        # while it holds the lock the timer keeps publishing the last state (no blocking)
+        with self.lock:
+            self.core.mark_running(msg.data)
+        self._publish_state(force=True)
         with self.lock:
             ans = self.core.command(msg.data, rospy.get_time())
-        self.pub_result.publish(String(data=json.dumps(ans)))
+        self.pub_result.publish(String(data=json.dumps(ans)))       # the token goes only here
         self._publish_state(force=True)
         self._apply_subscriptions()
 
@@ -129,13 +137,21 @@ class Node(object):
                          'rss_mb': round(rss, 1)}
         self.cpu_prev = (now, cpu)
 
-    def _publish_state(self, force=False):
+    def _publish_state(self, force=False, blocking=True):
         now = rospy.get_time()
         if not force and now - self.state_t < 2.0:
             return
         self.state_t = now
-        with self.lock:
-            st = self.core.state(now, self.load)
+        if self.lock.acquire(blocking):
+            try:
+                st = self.core.state(now, self.load)
+            finally:
+                self.lock.release()
+            self.state_cache = st
+        elif self.state_cache is not None:
+            st = dict(self.state_cache, stamp=now)       # busy with a long command: the last state
+        else:
+            return
         self.pub_state.publish(String(data=json.dumps(st)))
 
     def _cb_busy(self, msg):
@@ -164,11 +180,17 @@ class Node(object):
     # ---- timer -------------------------------------------------------------------
     def _tick(self, _evt):
         now = rospy.get_time()
-        with self.lock:
+        if not self.lock.acquire(False):       # a long command runs: only the cached state goes out
+            self._publish_state(blocking=False)
+            return
+        try:
             self.core.poll(now)
             changed = self.core.flush(now)
+            self.core.export_tick(now)        # the export runs in a niced child process
             site = self.core.site
             status = self.core.status(now) if now - self.stats_t >= self.stats_period else None
+        finally:
+            self.lock.release()
         self._apply_subscriptions()
         self._measure_load()
         self._publish_state(force=bool(changed))

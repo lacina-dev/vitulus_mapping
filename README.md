@@ -106,8 +106,13 @@ headings — and even then only listed as `nogo_candidates`, never written anywh
   `VITULUS_TERRAIN_GLOBAL=true`; composing is then **off until switched on from the UI** (`enable`, stored in
   `~/.vitulus/terrain_recorder.json`). `nice -n 19`.
 * Fused only while: RTK FIXED + hAcc ≤ 30 mm (`/gnss/navpvt`), `/nav_tf/loc_status` owner `gps` with heading,
-  both for the last 10 s; not settling (local node) and no smooth correction pulled into odom (`/odometry/odom`
-  vs `/odometry/ekf_wheel_odom` over 1 s, > 3 cm / 0.5°); a batch is fused 3 s (≥ period + 1 s) after its stamp.
+  both for the last 10 s; not settling (local node); a batch is fused 3 s (≥ period + 1 s) after its stamp.
+  Smooth corrections pulled into odom (`/odometry/odom` vs `/odometry/ekf_wheel_odom` over 1 s, > 3 cm / 0.5°) are
+  only counted by default (`corr_enforce: false`); switched on they set a freshness boundary (event + 3 s) and
+  batches without a comparison of both odometries are dropped (fails closed).
+* Export for the UI (`<site>/terrain_mosaic/`, versioned image names, JSON written last): a child process at
+  `nice 19` from the stored tiles, at most every `export_s` (600 s) while the map changes, at the end of a program
+  and on `rebuild_export` / `import` / `delete_map`; `terrain_backup/` keeps the newest `backup_keep` (5).
   Sessions: rising edge of `/mower_smach/busy` or 30 min without fusion (a respawn is no new session).
 * Interfaces: `/terrain_recorder/state` (latched JSON for the UI), `/terrain_recorder/cmd` →
   `/terrain_recorder/cmd_result` (enable, disable, pause, resume, delete_map with a confirmation token and a

@@ -592,6 +592,7 @@ class TerrainStore(object):
         self.last_batch = {}
         self.epoch = None
         self.pending = []
+        self.fresh_after = None         # unix s: cells last fused at or before are stale (correction detector)
         self._load_index()
         # sessions come from the mowing program (new_session), not from starting the process: a respawn
         # in the middle of a program stays in its session
@@ -907,10 +908,14 @@ class TerrainStore(object):
         m = int(round(p["edge_margin"] / win.res))
         valid = np.isfinite(el) & np.isfinite(var) & (var <= p["max_variance"]) & \
             (pts >= p["min_points"]) & (ix >= m) & (ix < W - m) & (iy >= m) & (iy < H - m)
-        if getattr(win, "epoch_t", None) is not None and win.t_fused is not None:
-            # cells last fused before the epoch event lie in the old odom: neither map nor reference
+        bound = getattr(win, "epoch_t", None)
+        if self.fresh_after is not None:
+            bound = self.fresh_after if bound is None else max(bound, self.fresh_after)
+        if bound is not None and win.t_fused is not None:
+            # cells last fused before the epoch event (or a correction + its settling time) lie in the
+            # old odom: neither map nor reference
             tfe = win.t_fused[iy, ix]
-            stale_ep = ~(np.isfinite(tfe) & (tfe > win.epoch_t))
+            stale_ep = ~(np.isfinite(tfe) & (tfe > bound))
             info["stale_epoch_cells"] = int(np.count_nonzero(valid & stale_ep))
             valid &= ~stale_ep
         if win.t_fused is not None and self.last_stamp is not None:
@@ -1080,7 +1085,7 @@ class TerrainStore(object):
             tile.commit(ly, lx, v, self.p, None if mowed_all is None else mowed_all[sel])
 
     # ---- import -------------------------------------------------------------------
-    def import_map_grid(self, origin, res, layers, t, overwrite=False, align=True):
+    def import_map_grid(self, origin, res, layers, t, overwrite=False, align=True, datum=None):
         """Seed the store from a grid in the map frame of the store's datum (the
         offline mosaic). Every imported cell is ONE tentative visit (the mosaic's
         per-cloud runs are no visits): flags F_TENTATIVE, visits 1, a terrain lethal
@@ -1091,11 +1096,16 @@ class TerrainStore(object):
         (0..7), slope [rad], step [m], roughness [m]; t: unix s (scalar or array).
         Only unknown cells are filled unless `overwrite`. With `align` the grid is
         first shifted in height onto the cells the store already knows (each mosaic
-        has its own height reference; >= align_min_cells of overlap, Huber).
+        has its own height reference; >= align_min_cells of overlap, Huber). `datum`: the
+        site datum the grid's map frame was made in (default: the store's).
         Returns (cell count, height offset applied)."""
         elev = np.asarray(layers["elevation"], np.float64)
         H, W = elev.shape
-        c, s, te, tn = self.utm_from_odom((0.0, 0.0, 0.0))     # map frame = "odom" with identity
+        if datum is not None:                                  # the datum the grid was made in
+            yd = float(datum.get("yaw_rad", 0.0))
+            c, s, te, tn = math.cos(yd), math.sin(yd), float(datum["utm_e"]), float(datum["utm_n"])
+        else:
+            c, s, te, tn = self.utm_from_odom((0.0, 0.0, 0.0))     # map frame = "odom" with identity
         x0, y0 = float(origin[0]), float(origin[1])
         cx = np.array([x0, x0 + W * res, x0, x0 + W * res])
         cy = np.array([y0, y0, y0 + H * res, y0 + H * res])

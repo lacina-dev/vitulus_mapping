@@ -67,11 +67,16 @@ DEFAULTS = {
     "corr_yaw_deg": 0.5,
     "corr_settle_s": 3.0,        # a batch with a stamp in [event - window, event + settle] is not fused
     "corr_max_dt": 0.15,         # s: nearest samples of both odometries at least this close
-    "corr_enforce": True,        # False = only count the events (replays with another reference odometry)
+    "corr_enforce": False,       # True = act on events (freshness boundary, drop unsettled / uncovered batches);
+                                 # False (default until measured on the robot) = only count them in ~stats
     "batch_log": "",             # CSV of every message / fused batch (diagnostics, replays); "" = off
     # T31: control from the UI
     "settings_file": "",         # "" = ~/.vitulus/terrain_recorder.json: {"enabled": bool} (owner's choice)
-    "export": True,              # write <site>/terrain_mosaic/ after every flush that changed the map
+    "export": True,              # write <site>/terrain_mosaic/ (a niced child process, from the stored tiles)
+    "export_s": 600.0,           # at most this often while the map changes; also at the end of a program
+                                 # (falling edge of /mower_smach/busy) and on rebuild_export / import / delete
+    "export_nice": 19,
+    "backup_keep": 5,            # terrain_backup/: the newest N are kept
     "token_s": 60.0,             # confirmation token lifetime (delete_map, import replace)
 }
 
@@ -326,6 +331,7 @@ class CorrectionDetector(object):
         self.odom = collections.deque(maxlen=400)
         self.ref = collections.deque(maxlen=400)
         self.events = collections.deque(maxlen=200)
+        self.evals = collections.deque(maxlen=600)      # times of successful comparisons
         self.last_eval = None
         self.n_events = 0
         self.last_diff = None
@@ -374,6 +380,7 @@ class CorrectionDetector(object):
         r1 = self._at(self.ref, t, c["corr_max_dt"])
         if o0 is None or r0 is None or r1 is None:
             return False
+        self.evals.append(t)
         a = _rel(o0[1:], (x, y, yaw))
         b = _rel(r0[1:], r1[1:])
         dxy = math.hypot(a[0] - b[0], a[1] - b[1])
@@ -384,6 +391,11 @@ class CorrectionDetector(object):
             self.n_events += 1
             return True
         return False
+
+    def covered(self, stamp, half=0.5):
+        """A comparison of both odometries exists within +-half s of the stamp (missing
+        samples = not known to be settled: the caller fails closed)."""
+        return any(abs(e - stamp) <= half for e in reversed(self.evals))
 
     def unsettled(self, stamp):
         """A batch with this stamp lies in [event - window, event + settle] of an event."""
@@ -475,6 +487,7 @@ class RecorderCore(object):
         self.last_drop = None
         self.corr = CorrectionDetector(self.cfg)
         self.busy = None
+        self.corr_active = False        # the node subscribes a reference odometry (set by the node)
         self.session_pending = False
         self.session_has_data = True    # the stored session may hold data: the first edge starts a new one
         self._log_f = None
@@ -485,7 +498,12 @@ class RecorderCore(object):
         self.paused = False
         self.token = None               # (token, cmd, expires, extra)
         self.last_cmd = None
-        self.export_info = {"version": None, "stamp": None, "dir": "terrain_mosaic", "ok": None, "error": None}
+        self.export_info = {"version": None, "stamp": None, "dir": "terrain_mosaic", "ok": None, "error": None,
+                            "running": False, "reason": None}
+        self.export_proc = None          # (Popen, output file, reason, start time)
+        self.export_req = None
+        self.export_dirty = False
+        self.export_t = None
         self.nogo = []
         self.last_epoch = None
         self.last_settling = False
@@ -575,6 +593,12 @@ class RecorderCore(object):
         busy = bool(busy)
         if busy and self.busy is False or busy and self.busy is None and self.last_fused_stamp is not None:
             self._new_session()
+        if not busy and self.busy and self.store is not None:
+            # end of a program: the visits into the map, written, exported
+            self.store.close_all()
+            if self.site and os.path.isdir(self.site_dir()):
+                self.store.save_dirty()
+            self.request_export("program_end")
         self.busy = busy
 
     def _new_session(self):
@@ -594,11 +618,11 @@ class RecorderCore(object):
         if self.corr.feed_odom(t, x, y, yaw):
             self.stats["corrections"] += 1
             if self.store is not None and self.cfg["corr_enforce"]:
-                if self.store.pending:
-                    self.stats["drop_queue_correction"] += len(self.store.pending)
-                    self.store.pending = []
-                if self.store.ov_keys.size:
-                    self.store.close_all()
+                # freshness boundary as for an epoch event: cells last fused before the end of the
+                # settling time are stale (queued batches too, at their processing); visits stay open
+                b = t + self.cfg["corr_settle_s"]
+                fa = self.store.fresh_after
+                self.store.fresh_after = b if fa is None else max(fa, b)
             self._blog("correction", t, t, "", "", "", "", "")
 
     def feed_ref(self, t, x, y, yaw):
@@ -658,11 +682,11 @@ class RecorderCore(object):
                 self.stats["drop_queue_gate"] += len(self.store.pending)
                 self.store.pending = []
             return self._drop("gate")
-        if self.cfg["corr_enforce"] and self.corr.unsettled(m["stamp"]):
-            if self.store.pending:
-                self.stats["drop_queue_correction"] += len(self.store.pending)
-                self.store.pending = []
-            return self._drop("correction")
+        if self.cfg["corr_enforce"] and self.corr_active:
+            if not self.corr.covered(m["stamp"]):
+                return self._drop("corr_nodata")          # fails closed
+            if self.corr.unsettled(m["stamp"]):
+                return self._drop("correction")
         if self.last_fused_stamp is not None and \
                 m["stamp"] - self.last_fused_stamp > self.cfg["session_gap_s"]:
             self._new_session()
@@ -706,8 +730,8 @@ class RecorderCore(object):
                 changed.append({"tx": tx, "ty": ty, "version": v})
                 self.versions[key] = v
         self.stats["flushes"] += 1
-        if changed and self.cfg["export"]:
-            self.export()
+        if changed:
+            self.export_dirty = True
         return changed
 
     def close(self):
@@ -749,6 +773,8 @@ class RecorderCore(object):
         fd, tmp = tempfile.mkstemp(prefix="terrain_recorder.", suffix=".tmp", dir=d)
         with os.fdopen(fd, "wb") as f:
             f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
         os.replace(tmp, self.settings_path)
 
     def _stop_store_work(self):
@@ -760,31 +786,114 @@ class RecorderCore(object):
                 self.store.save_dirty()
         self.subscribed = False
 
-    def export(self):
-        """Write <site>/terrain_mosaic/ (T31 §3) and the nogo candidates."""
+    # ---- export (T31 §3; E2: outside the lock, a niced child process) ---------------
+    def request_export(self, reason):
+        if self.cfg["export"] and self.store is not None and self.site:
+            self.export_req = reason
+            self.stats["export_requests"] += 1
+
+    def export_tick(self, now):
+        """From the timer: collect a finished export, start a requested / due one."""
+        self._collect_export()
+        if self.export_proc is not None or not self.cfg["export"] or self.store is None or not self.site:
+            return
+        if self.export_req is None and self.export_dirty and \
+                (self.export_t is None or now - self.export_t >= self.cfg["export_s"]):
+            self.export_req = "interval"
+        if self.export_req is None:
+            return
+        if os.path.isdir(self.site_dir()):
+            self.store.save_dirty()       # the child reads the stored tiles
+        self._spawn_export()
+        self.export_t = now
+        self.export_dirty = False
+
+    def _export_args(self):
+        d = self.store.datum
+        return ["--terrain", os.path.join(self.site_dir(), "terrain"),
+                "--datum", json.dumps({"utm_e": d["utm_e"], "utm_n": d["utm_n"], "yaw_rad": d.get("yaw_rad", 0.0)}),
+                "--out", os.path.join(self.site_dir(), "terrain_mosaic"), "--site", self.site,
+                "--sessions", str(self.store.session)]
+
+    def _spawn_export(self):
+        import subprocess
+        import sys
+        env = dict(os.environ)
+        env["PYTHONPATH"] = os.pathsep.join(p for p in sys.path if p)
+        out = tempfile.TemporaryFile(mode="w+")
+        cmd = ["nice", "-n", str(int(self.cfg["export_nice"])), sys.executable, "-m",
+               "vitulus_mapping.terrainexport"] + self._export_args()
+        try:
+            self.export_proc = (subprocess.Popen(cmd, stdout=out, stderr=subprocess.STDOUT, env=env), out,
+                                self.export_req, time.time())
+            self.export_info.update(running=True, reason=self.export_req)
+        except OSError as e:
+            out.close()
+            self.export_info.update(ok=False, error="spawn: %s" % e, running=False)
+        self.export_req = None
+
+    def _collect_export(self, wait=False):
+        if self.export_proc is None:
+            return None
+        proc, out, reason, t0 = self.export_proc
+        if wait:
+            proc.wait()
+        if proc.poll() is None:
+            return None
+        self.export_proc = None
+        out.seek(0)
+        text = out.read()
+        out.close()
+        res = None
+        for line in reversed(text.strip().splitlines()):
+            try:
+                res = json.loads(line)
+                break
+            except ValueError:
+                continue
+        if res and res.get("ok"):
+            self.nogo = res.get("nogo_candidates", [])
+            self.export_info.update(version=res.get("version"), stamp=time.time(), ok=True, error=None,
+                                    running=False, cpu_s=res.get("cpu_s"), wall_s=round(time.time() - t0, 2),
+                                    reason=reason)
+            self.stats["exports"] += 1
+        else:
+            err = (res or {}).get("error") or text.strip()[-300:] or "exit %s" % proc.returncode
+            self.export_info.update(ok=False, error=err, running=False, reason=reason)
+            self.log("error", "export: %s" % err)
+        return res
+
+    def _kill_export(self):
+        if self.export_proc is not None:
+            try:
+                self.export_proc[0].kill()
+                self.export_proc[0].wait()
+            except OSError:
+                pass
+            self.export_proc[1].close()
+            self.export_proc = None
+            self.export_info.update(running=False)
+
+    def export_now(self):
+        """Synchronous export (tests, offline): start it and wait for the child."""
         if self.store is None or not self.site:
             return None
-        try:
-            r = terrainexport.raster_map(self.store)
-            self.nogo = terrainexport.nogo_candidates(r)
-            meta = terrainexport.export_mosaic(self.store, os.path.join(self.site_dir(), "terrain_mosaic"),
-                                               self.site, sessions=self.store.session, r=r)
-            self.export_info.update(version=meta["version"] if meta else None, stamp=time.time(), ok=True,
-                                    error=None)
-            return meta
-        except Exception as e:                           # noqa: BLE001
-            self.export_info.update(ok=False, error=str(e))
-            self.log("error", "export: %s" % e)
-            return None
+        self._collect_export(wait=True)
+        self.export_req = self.export_req or "now"
+        if os.path.isdir(self.site_dir()):
+            self.store.save_dirty()
+        self._spawn_export()
+        self.export_dirty = False
+        return self._collect_export(wait=True)
 
     def _token(self, cmd, extra, now):
         tok = secrets.token_hex(3)
         self.token = (tok, cmd, now + self.cfg["token_s"], extra)
         return tok
 
-    def _check_token(self, cmd, given, now):
+    def _check_token(self, cmd, given, now, extra=None):
         t = self.token
-        ok = t is not None and given == t[0] and cmd == t[1] and now <= t[2]
+        ok = t is not None and given == t[0] and cmd == t[1] and now <= t[2] and t[3] == extra
         if ok:
             self.token = None
         return ok
@@ -803,6 +912,11 @@ class RecorderCore(object):
             dst = os.path.join(dst_root, "%s-%d" % (name, k))
             k += 1
         os.replace(src, dst)
+        keep = max(1, int(self.cfg["backup_keep"]))
+        old = sorted(glob.glob(os.path.join(dst_root, "*")))[:-keep]
+        for d in old:
+            shutil.rmtree(d, ignore_errors=True)
+            self.stats["backups_pruned"] += 1
         return os.path.basename(dst)
 
     def _fresh_store(self):
@@ -835,6 +949,19 @@ class RecorderCore(object):
             out.append({"name": os.path.basename(d), "area_m2": area})
         return out
 
+    LONG_CMDS = ("import", "delete_map")
+
+    def mark_running(self, data):
+        """Before a long command: state.last_cmd = {"id", "cmd", "ok": None, "running": True}."""
+        try:
+            c = json.loads(data) if isinstance(data, str) else dict(data)
+        except (TypeError, ValueError):
+            return
+        if isinstance(c, dict) and c.get("cmd") in self.LONG_CMDS and "confirm" in c or \
+                isinstance(c, dict) and c.get("cmd") == "import" and c.get("mode", "merge") == "merge":
+            self.last_cmd = {"id": c.get("id"), "cmd": c.get("cmd"), "ok": None, "error": None, "result": {},
+                             "running": True}
+
     def command(self, data, now):
         """One /terrain_recorder/cmd message (str or dict). Returns the answer dict
         {"id", "cmd", "ok", "error", "result"} (also kept as last_cmd)."""
@@ -844,7 +971,7 @@ class RecorderCore(object):
                 raise ValueError
         except (TypeError, ValueError):
             c = {}
-        ans = {"id": c.get("id"), "cmd": c.get("cmd"), "ok": False, "error": None, "result": {}}
+        ans = {"id": c.get("id"), "cmd": c.get("cmd"), "ok": False, "error": None, "result": {}, "running": False}
         try:
             ans["result"] = self._command(c, now)
             ans["ok"] = True
@@ -880,8 +1007,8 @@ class RecorderCore(object):
         if cmd == "rebuild_export":
             if self.store is None:
                 raise _CmdError("no_site")
-            meta = self.export()
-            return {"version": meta["version"] if meta else None}
+            self.request_export("rebuild_export")
+            return {"queued": True}
         if cmd == "delete_map":
             if self.store is None:
                 raise _CmdError("no_site")
@@ -892,6 +1019,7 @@ class RecorderCore(object):
             if not self._check_token("delete_map", c.get("confirm"), now):
                 raise _CmdError("bad_token")
             self._stop_store_work()
+            self._kill_export()
             name = self._backup()
             self._fresh_store()
             exp = os.path.join(self.site_dir(), "terrain_mosaic")
@@ -920,23 +1048,26 @@ class RecorderCore(object):
                 if "confirm" not in c:
                     return {"confirm_token": self._token("import", item["name"], now),
                             "expires_s": self.cfg["token_s"], "site": self.site}
-                if not self._check_token("import", c.get("confirm"), now):
+                if not self._check_token("import", c.get("confirm"), now, extra=item["name"]):
                     raise _CmdError("bad_token")
+            mdir = os.path.join(self.site_dir(), item["path"])
             try:
-                meta, layers, t = terrainexport.load_mosaic_dir(os.path.join(self.site_dir(), item["path"]))
+                meta, layers, t = terrainexport.load_mosaic_dir(mdir)
             except (ValueError, IOError, OSError, KeyError) as e:
                 raise _CmdError("bad_mosaic: %s" % e)
+            mdatum, _mt = read_datum(mdir)      # the site datum the mosaic was made in, when shipped along
             self._stop_store_work()
             backup = None
             if mode == "replace":
                 backup = self._backup()
                 self._fresh_store()
             n, off = self.store.import_map_grid((float(meta["origin_x"]), float(meta["origin_y"])),
-                                                float(meta["resolution"]), layers, t)
+                                                float(meta["resolution"]), layers, t, datum=mdatum)
             self.store.save_dirty()
-            self.export()
+            self.request_export("import")
             self.log("info", "imported %s (%s): %d cells" % (item["name"], mode, n))
-            return {"imported_cells": n, "height_offset_m": round(off, 4), "backup": backup}
+            return {"imported_cells": n, "height_offset_m": round(off, 4), "backup": backup,
+                    "datum": "mosaic" if mdatum else "site"}
         raise _CmdError("unknown_cmd")
 
     def state(self, now, load=None):
@@ -956,7 +1087,7 @@ class RecorderCore(object):
         ms = sorted(self.fuse_ms)
         drops = {k[5:]: v for k, v in self.stats.items() if k.startswith("drop_")}
         return {
-            "v": 1, "stamp": now, "running": True, "enabled": self.enabled, "paused": self.paused, "mode": mode,
+            "v": 2, "stamp": now, "running": True, "enabled": self.enabled, "paused": self.paused, "mode": mode,
             "site": self.site,
             "gate": {"open": gopen, "reason": self.gate.reason, "open_for_s": round(self.gate.open_for(now), 1)},
             "subscribed": self.subscribed,
@@ -973,8 +1104,21 @@ class RecorderCore(object):
             "export": dict(self.export_info),
             "nogo_candidates": self.nogo,
             "imports": self.list_imports(), "backups": self.list_backups(),
-            "last_cmd": self.last_cmd,
+            "last_cmd": self._last_cmd_public(),
         }
+
+    def _last_cmd_public(self):
+        """last_cmd for the latched state: without the confirmation token (it goes only to
+        cmd_result, to the UI that asked)."""
+        if not self.last_cmd:
+            return self.last_cmd
+        lc = dict(self.last_cmd)
+        res = dict(lc.get("result") or {})
+        if "confirm_token" in res:
+            res["confirm_token"] = None
+            res["token_sent"] = True
+        lc["result"] = res
+        return lc
 
     # ---- state --------------------------------------------------------------------
     def status(self, now):

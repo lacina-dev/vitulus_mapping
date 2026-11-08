@@ -20,6 +20,7 @@ rosparam load "$HERE/config/terrain_recorder.yaml" /terrain_recorder
 rosparam set /terrain_recorder/sites_root "$SITES"
 rosparam set /terrain_recorder/flush_s 3.0
 rosparam set /terrain_recorder/stats_period 1.0
+rosparam set /terrain_recorder/export_s 3.0
 setsid python3 "$HERE/nodes/terrain_recorder" __name:=terrain_recorder >"$JOB/recorder.log" 2>&1 & rec=$!
 timeout 120 python3 "$HERE/test/terrain_recorder_ros_check.py" "$SITES/testsite" "$rec"; rc=$?
 echo "logs: $JOB"

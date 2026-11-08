@@ -28,8 +28,11 @@ corr_window_s: 1.0
 corr_xy_m: 0.03
 corr_yaw_deg: 0.5
 corr_settle_s: 3.0
-corr_enforce: true
+corr_enforce: false      # only count the events until measured on the robot (E3)
 batch_log: ""            # CSV path for diagnostics
+export_s: 600.0          # export for the UI at most this often while the map changes (+ program end, commands)
+export_nice: 19
+backup_keep: 5           # terrain_backup/: the newest N are kept
 
 # the store (terrainlayers.DEFAULTS); only what differs from the code
 store:
