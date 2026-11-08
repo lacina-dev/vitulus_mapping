@@ -31,6 +31,12 @@ Mow load trail (vitulus_mapping.mowtrail, contract section 11):
        /map_objects/mow_trail/past      latched, the answer to a request
        /map_objects/mow_trail/detail    the raw row behind a tap
        /map_objects/mow_runs            latched list of runs
+       /map_objects/mow_trail/report    latched, the zone report a request {"report": run}
+                                        asked for (vitulus_mapping.mowreport)
+  After a run is stored (the idle list of runs goes out) the missing or stale
+  <run>.report.json files are written (mowreport.backfill). Report work runs in
+  mowreport.Worker: one thread, a merging queue of at most 8 jobs, each job a child
+  process `python3 -m vitulus_mapping.mowreport` at nice 19 (off this node's GIL).
 
 COST. The NUC is shared. /tf at 63 Hz through rospy is what would make this node
 expensive, so TF and navpvt are subscribed only while awake. Awake = the blade
@@ -62,7 +68,7 @@ from ublox_msgs.msg import MonHW, NavPVT, NavSAT, RxmRTCM
 from vitulus_msgs.msg import Moteus_controller_state, Mower
 from vitulus_ups.msg import power_status
 
-from vitulus_mapping import bundle, geo, mowtrail, suggestions, worldlayers
+from vitulus_mapping import bundle, geo, mowreport, mowtrail, suggestions, worldlayers
 
 try:
     from vitulus_mapping import objects as map_objects
@@ -140,7 +146,12 @@ class Node(object):
             'past': rospy.Publisher('/map_objects/mow_trail/past', String, queue_size=1, latch=True),
             'detail': rospy.Publisher('/map_objects/mow_trail/detail', String, queue_size=4),
             'runs': rospy.Publisher('/map_objects/mow_runs', String, queue_size=1, latch=True),
+            'report': rospy.Publisher('/map_objects/mow_trail/report', String, queue_size=1,
+                                      latch=True),
         }
+        # zone reports: one worker thread, each job a child process at nice 19
+        self.reports = mowreport.Worker(self._publish_report, self._log,
+                                        {'deck_m': trail_cfg['deck_m']})
         self.trail = mowtrail.TrailRecorder(self._publish_trail, self._log, trail_cfg)
 
         self.rpm = 0
@@ -387,7 +398,9 @@ class Node(object):
             item = json.loads(msg.data)
         except ValueError:
             return
-        if isinstance(item, dict):
+        if isinstance(item, dict) and 'report' in item:
+            self.reports.request(self.rec.site, item.get('report') or None, item.get('req'))
+        elif isinstance(item, dict):
             self.trail.request(item)
 
     def _cb_cmd(self, msg):
@@ -419,6 +432,12 @@ class Node(object):
 
     def _publish_trail(self, kind, payload):
         self.trail_pubs[kind].publish(String(json.dumps(payload, separators=(',', ':'))))
+        # the idle list goes out after a run is stored (and at start): reports due
+        if kind == 'runs' and payload.get('active') is None and payload.get('site'):
+            self.reports.backfill(payload['site'])
+
+    def _publish_report(self, rep):
+        self.trail_pubs['report'].publish(String(json.dumps(rep, separators=(',', ':'))))
 
     def _log(self, text):
         rospy.logwarn_throttle(60.0, 'map_world_recorder: ' + text)
@@ -515,6 +534,7 @@ class Node(object):
     def run(self):
         rospy.on_shutdown(self.rec.close)
         rospy.on_shutdown(self.trail.close)
+        rospy.on_shutdown(self.reports.close)
         while not rospy.is_shutdown():
             now = time.time()
             self.rec.poll(now)

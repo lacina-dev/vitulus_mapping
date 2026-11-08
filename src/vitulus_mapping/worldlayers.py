@@ -639,7 +639,7 @@ def _query_slope(site, res, points, polygon):
 def layer_query(site, layer, points=None, polygon=None, slope_res=0.5, run=None):
     """Read a recorded layer without ROS. Read-only, never raises.
 
-    layer    coverage | gnss | slope | mow_load
+    layer    coverage | gnss | slope | mow_load | mow_report
     points   [[x, y], ...] map frame -> "result" is a list, one row per point
     polygon  [[x, y], ...] map frame -> "result" is one stats dict
 
@@ -648,9 +648,19 @@ def layer_query(site, layer, points=None, polygon=None, slope_res=0.5, run=None)
     last_mowed None = never recorded at that cell. Fix classes as in the module
     docstring.
     mow_load: where the blade worked hard, newest run or `run`, see mowtrail.query;
-    without points and polygon the whole run, "heavy" lists the hardest spots.
+    without points and polygon the whole run, "heavy" lists the hardest spots,
+    "report_path" the zone report of the run when it is written.
+    mow_report: the zone report of the run (newest finished or `run`), see
+    mowreport; points and polygon are not used.
     """
     out = {"ok": False, "reason": "", "site": site, "layer": layer, "result": None}
+    if layer == "mow_report":
+        from . import mowreport          # it imports this module
+        rep = mowreport.load(site, run)
+        out.update(ok=bool(rep.get("ok")) or rep.get("reason") == "no run",
+                   reason="" if rep.get("ok") else str(rep.get("reason") or ""),
+                   result=rep if rep.get("ok") else None)
+        return out
     if (points is None) == (polygon is None) and not (layer == "mow_load" and points is None):
         out["reason"] = "give points or polygon"
         return out
@@ -665,6 +675,11 @@ def layer_query(site, layer, points=None, polygon=None, slope_res=0.5, run=None)
         elif layer == "mow_load":
             from . import mowtrail           # it imports this module
             out["result"] = mowtrail.query(site, pts, ring, run)
+            res = out["result"]
+            if isinstance(res, dict) and res.get("run"):
+                from . import mowreport
+                path = mowreport.report_path(site, res["run"])
+                res["report_path"] = path if os.path.exists(path) else None
         elif layer in ("coverage", "gnss"):
             datum = read_datum(site)
             if datum is None:

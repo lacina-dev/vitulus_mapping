@@ -257,3 +257,67 @@ raw in its own frame, NONE when older than 1 s. Parameters `~mow_trail/<key>` of
 lidar_dyaw odom_x odom_y odom_yaw yaw owner track gps_xte_m lidar_xte_m gps_along_m gps_across_m lidar_along_m
 lidar_across_m head_err_deg` (metres, degrees; along/across in the robot frame against the fused pose). Reading:
 pose near the plan and GPS far = the localization lied; pose far from the plan = steering, the controller.
+
+### 11.1 Zone report of a run (2026-11-08)
+
+`vitulus_mapping/mowreport.py`, no rospy. After a run is stored `map_world_recorder` (the idle list of runs goes out)
+queues `mowreport.backfill`: missing or stale `<site>/mow_load/<run>.report.json`, written atomically one run after
+another with `backfill_pause_s` (1 s) between; reports of runs retention removed are deleted. All report work of the
+node goes through `mowreport.Worker`: one thread, a queue of at most 8 jobs where a job for the same run (or the same
+site's backfill) takes a new request along, each job a child process `python3 -m vitulus_mapping.mowreport` at
+nice 19, so nothing competes with the node for its GIL.
+
+Valid while `sig` matches: sha1 of version, datum, the zones of the program (rings and holes), the obstacle edits and
+nogo/noblade rules, `deck_m`, the npz (mtime, size) and the runs of the same program it could continue (ids, npz).
+
+Zone of a row = zone of the last `ctx` event before it AND within `deck_m` of that zone's polygon; everything else
+(dock, way out and home, a transfer through another zone, rows after the last ctx) is `outside`, and its events
+(gps_jump, fix_down, off_path) belong to no zone, so no advice comes from it. A run without ctx uses its program's
+zones by point in polygon. Zones of one name are one multipolygon. Holes: the further rings of a zones.geojson
+feature are subtracted when the bundle has them; the editor writes only outer rings today, so a zone has no holes
+unless a file brings them (nothing is inferred). Coordinates in the map frame of the current datum.
+
+Progress: `ctx` = `zone|path|paths|chunk` of `[EXE] START`, path 1-based per zone. A path is done when a later ctx
+names another path, the last one when the run `succeeded`. `resumed` = the first ctx is past path 1 of the first
+program zone. A resumed run continues the newest earlier run of the same program that ended at most `chain_h`
+(48 h) before it started and whose last ctx is at or before this run's first (program order: zone, path); chained
+again while that one was resumed too (`chain_max` 4). Coverage and paths done are then the union of the chain
+(`continues`). `complete` = this run succeeded and finished every path of every program zone; `complete_union` the
+same over the chain.
+
+`{"ok","v":2,"sig","site","run","program","start","end","stop_reason","active","rows","zones_from","datum","cfg",
+"paths_first":[zone,path]|null,"paths_last":[zone,path]|null,"paths_total":{zone:n},"resumed","continues":[run],
+"complete","complete_union",
+"total":{summarize + coverage_frac (over all zones of the program), mowable_m2, covered_m2, gap_m2, load_p50,
+         load_p90, overload_blocked_frac},
+"zones":[{"zone","known","visited","paths_first","paths_last","paths_total","paths_done","complete_run","complete",
+  "time_s","time_mow_s","cut_m","length_m","stops",
+  "load":{"rows","p50","p90","max","mean","overload_blocked_frac","overload_rows","blocked_rows"},
+  "coverage":{"grid_m","zone_m2","mowable_m2","excluded_m2","covered_m2","frac","missed_m2","gap_m2","gaps_total",
+              "gaps":[{"x","y","cx","cy","area_m2","width_m"}]} | null,
+  "heavy_limit","heavy":[{"x","y","area_m2","rows","max_load","mean_load","overload_rows","peak_x","peak_y","t"}],
+  "loc":{"xte_p95_cm","xte_max_cm","lidar_p95_cm","jump_p95_cm","rtk_frac","gps_jumps","gps_jump_at","fix_losses",
+         "off_path_n","off_path":[{"x","y","t","text"}],"worst":[x,y,cm]}}],
+"outside":{rows not in a zone},
+"advice":[{"kind":"unfinished|resow_gaps|heavy_area|gnss_check|path_tracking","zone","where":[x,y]|null,"why",
+           "value"}]}`
+
+Zones of the program the robot never reached are listed with `visited: false` and coverage 0 (or what the chain
+cut there). Cut = rows `cutting`, or `overload` with a real load (an `overload` from a firmware ERR has none and is
+not cutting). Coverage: cut segments up to `max_seg_m` (0.4 m, a longer step is a pose jump) every grid/2, buffered
+by `deck_m`/2 (EDT) on a 5 cm grid (10 cm over 3000 m2), against the zone minus obstacle edits, nogo and noblade
+rules. Gaps = uncovered after an opening of 10 cm (thinner strips are the edge), >= 0.5 m2; `x,y` the point deepest
+inside. Load percentiles are weighted by path length. Heavy = cut rows >= max(0.30, zone p90) on 0.5 m cells,
+8-connected.
+
+Advice: `unfinished` (first) when paths are left, `value` = paths left, `remaining:[{zone,visited,paths|null,
+paths_total}]`, `where` the middle of the first zone left. `resow_gaps` only for a `complete` zone with gaps
+>= 0.5 m2. `heavy_area`: cluster max load >= 0.5 or an overload. `gnss_check`: RTK < 95 %, lidar p95 > 30 cm,
+jump p95 > 20 cm or a gps_jump; `metric`/`value` = the first of these that fired, `where` its place. `path_tracking`:
+xte p95 > 12 cm or >= 3 off_path.
+
+Read: `worldlayers.layer_query(site, "mow_report", run=None)` (`result` = the report, None = no run), the `mow_load`
+whole-run result carries `report_path`; request `{"req","report": run|""}` on `/map_objects/mow_trail/request` ->
+latched `/map_objects/mow_trail/report` with its `req` (and `reqs`, all merged requests; `reason: "busy"` when the
+queue is full). CLI `python3 -m vitulus_mapping.mowreport [run] [--site S] [--json] [--save] [--all] [--deck M]
+[--pause S]`, after `catkin build` also `rosrun vitulus_mapping mow_report`.

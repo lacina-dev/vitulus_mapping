@@ -1,0 +1,9 @@
+#!/usr/bin/env python3
+"""Zone report of a mow run: rosrun vitulus_mapping mow_report [run] [--site S]
+[--json] [--save] [--all]. No ROS needed, see vitulus_mapping.mowreport."""
+import sys
+
+from vitulus_mapping import mowreport
+
+if __name__ == '__main__':
+    sys.exit(mowreport.main())
