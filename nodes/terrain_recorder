@@ -139,7 +139,7 @@ class Node(object):
 
     def _publish_state(self, force=False, blocking=True):
         now = rospy.get_time()
-        if not force and now - self.state_t < 2.0:
+        if not force and now - self.state_t < 1.9:          # 1 Hz timer: every 2 s, not 3
             return
         self.state_t = now
         if self.lock.acquire(blocking):

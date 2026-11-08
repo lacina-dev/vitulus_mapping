@@ -91,7 +91,7 @@ import time
 import numpy as np
 
 __all__ = ["RES", "TILE", "FORMAT_VERSION", "DEFAULTS", "TILE_DTYPES", "Window",
-           "Tile", "TerrainStore", "huber_mean", "hist_mode", "dir_spread", "pack_keys", "unpack_keys",
+           "Tile", "TerrainStore", "huber_mean", "huber_plane", "hist_mode", "dir_spread", "pack_keys", "unpack_keys",
            "REASON_STEP", "REASON_SLOPE", "REASON_OBSTACLE", "REASON_EXEMPT",
            "F_CONFIRMED", "F_OBST_LAST", "F_EXEMPT", "F_CAND", "F_TENTATIVE"]
 
@@ -130,6 +130,13 @@ DEFAULTS = {
     "align_hist_bin": 0.02,      # m: first offset of a session = mode of the residual histogram, then Huber
     "robot_ground_radius": 0.30, # m: no overlap at the start -> stored height around the robot (the dock)
     "align_huber": 0.02,         # m
+    "align_tilt": False,         # register by a plane a + b u + c v (offset + tilt) instead of the offset only.
+                                 # Off by default: against a known terrain (sim, mowing strips) the plane bent
+                                 # the map (RMS 1.5 -> 2.3..6.4 cm, low-frequency bend up to 22 cm on 24x12 m);
+                                 # the consistency between passes improves anyway, so it is no proof. Enable
+                                 # only after a check against an independent reference. No horizontal shift.
+    "align_max_tilt_deg": 1.5,   # the tilt correction is capped: noise cannot tip the map
+    "align_tilt_min_extent": 1.0,  # m: the overlap must span this in both window axes, else offset only
     "ref_max_variance": 2.5e-3,  # long-term reference only when this certain (sigma 5 cm; q_day ages
                                  # a fresh cell there in ~3 months)
     "anchor_ema": 0.05,          # averaging of anchor_residual (per batch with overlap and anchor)
@@ -211,6 +218,35 @@ def huber_mean(r, delta, iters=8, start=None):
             return m_new
         m = m_new
     return m
+
+
+def huber_plane(u, v, r, delta, a0, max_grad, iters=8):
+    """Robust plane r ~ a + b (u - u0) + c (v - v0) (Huber IRLS, u0 / v0 = means), the
+    gradient (b, c) capped at max_grad. Returns (a, b, c, u0, v0) or None (degenerate)."""
+    u = np.asarray(u, np.float64)
+    v = np.asarray(v, np.float64)
+    r = np.asarray(r, np.float64)
+    u0, v0 = float(u.mean()), float(v.mean())
+    A = np.stack([np.ones(u.size), u - u0, v - v0], 1)
+    x = np.array([a0, 0.0, 0.0])
+    for _ in range(iters):
+        e = np.abs(r - A @ x)
+        w = np.where(e <= delta, 1.0, delta / np.maximum(e, 1e-12))
+        Aw = A * w[:, None]
+        M = A.T @ Aw
+        if np.linalg.cond(M) > 1e8:
+            return None
+        x_new = np.linalg.solve(M, Aw.T @ r)
+        if np.max(np.abs(x_new - x)) < 1e-5:
+            x = x_new
+            break
+        x = x_new
+    a, b, c = (float(x[0]), float(x[1]), float(x[2]))
+    g = math.hypot(b, c)
+    if g > max_grad:                          # capped: keep the direction, refit the offset
+        b, c = b * max_grad / g, c * max_grad / g
+        a = huber_mean(r - b * (u - u0) - c * (v - v0), delta, start=a)
+    return a, b, c, u0, v0
 
 
 def hist_mode(r, bin_w, max_bins=20000):
@@ -564,11 +600,12 @@ _VISIT_FIELDS = ("h", "var", "t", "cost", "reason", "slope", "step", "rough", "p
 class TerrainStore(object):
     """Tiles of one site + open visits + alignment state."""
 
-    def __init__(self, root, datum, params=None, anchor=None, mowed=None):
+    def __init__(self, root, datum, params=None, anchor=None, mowed=None, readonly=False):
         """root: terrain dir (created on save); datum: dict utm_e, utm_n, yaw_rad
         (geo.from_datum_yaml); anchor(e, n) -> ground z (map frame) or NaN, optional;
         mowed(e, n) -> last-mowed unix s (0 never), optional."""
         self.root = root
+        self.readonly = bool(readonly)  # a reader (the export): never moves, writes or creates anything
         self.p = dict(DEFAULTS)
         if params:
             unknown = set(params) - set(DEFAULTS)
@@ -589,6 +626,7 @@ class TerrainStore(object):
         self.ov = {k: np.zeros(0, np.float64) for k in _VISIT_FIELDS}
         self.stats = collections.Counter()
         self.broken = []
+        self.visit_log = None           # optional callable(keys, visit heights) at every visit closing (metrics)
         self.last_batch = {}
         self.epoch = None
         self.pending = []
@@ -625,6 +663,10 @@ class TerrainStore(object):
             self._move_broken(path, "index: %s" % e)
 
     def _move_broken(self, path, why):
+        if self.readonly:                # a reader only skips the file (the recorder moves it aside)
+            self.broken.append({"file": os.path.basename(path), "why": str(why), "moved": False})
+            self.stats["broken"] += 1
+            return
         bdir = os.path.join(self.root, "broken")
         os.makedirs(bdir, exist_ok=True)
         dst = os.path.join(bdir, "%s.%d" % (os.path.basename(path), int(time.time() * 1000)))
@@ -668,6 +710,8 @@ class TerrainStore(object):
         return t
 
     def save_tile(self, t):
+        if self.readonly:
+            raise RuntimeError("read-only terrain store")
         if self.index.get("z_ref") is None:
             fin = np.isfinite(t.h)
             self.index["z_ref"] = float(np.round(np.median(t.h[fin]))) if np.any(fin) else 0.0
@@ -685,6 +729,8 @@ class TerrainStore(object):
         self.stats["tiles_saved"] += 1
 
     def save_index(self):
+        if self.readonly:
+            raise RuntimeError("read-only terrain store")
         os.makedirs(self.root, exist_ok=True)
         data = json.dumps(self.index, indent=1, sort_keys=True).encode()
         _atomic_write(self._index_path(), lambda f: f.write(data))
@@ -940,6 +986,7 @@ class TerrainStore(object):
         ok = np.isfinite(ref)
         info["overlap"] = int(ok.sum())
         offset = None
+        tilt = None                              # (b, c, u0, v0) of the fitted plane
         if ok.sum() >= p["align_min_cells"]:
             r = h[ok] - ref[ok]
             if self.z_offset is None:
@@ -948,6 +995,20 @@ class TerrainStore(object):
                 start = -self.z_offset
             offset = -huber_mean(r, p["align_huber"], start=start)
             info["offset_src"] = "overlap"
+            # the tilt only against closed visits (earlier passes): against the open visits of this
+            # pass (corrected by the previous plane) the tilt would random-walk from batch to batch
+            lt = use_lt & ok
+            if p["align_tilt"] and np.count_nonzero(lt) >= p["align_min_cells"]:
+                wu = (win.x0 + (ix[valid] + 0.5) * win.res)[lt]
+                wv = (win.y0 + (iy[valid] + 0.5) * win.res)[lt]
+                if np.ptp(wu) >= p["align_tilt_min_extent"] and np.ptp(wv) >= p["align_tilt_min_extent"]:
+                    fit = huber_plane(wu, wv, h[lt] - ref[lt], p["align_huber"], -offset,
+                                      math.tan(math.radians(p["align_max_tilt_deg"])))
+                    if fit is not None:
+                        a, b_, c_, u0, v0 = fit
+                        offset = -a
+                        tilt = (b_, c_, u0, v0)
+                        info["tilt_deg"] = round(math.degrees(math.atan(math.hypot(b_, c_))), 3)
         rz = None
         if robot is not None and len(robot) >= 3 and robot[2] is not None:
             rz = float(robot[2])
@@ -985,6 +1046,11 @@ class TerrainStore(object):
             self.stats["offset_jumps"] += 1
         self.z_offset = offset
         info["offset"] = offset
+        corr = np.full(h.size, offset)           # per valid cell: offset, or the plane at the cell
+        if tilt is not None:
+            b_, c_, u0, v0 = tilt
+            corr -= b_ * ((win.x0 + (ix[valid] + 0.5) * win.res) - u0) + \
+                c_ * ((win.y0 + (iy[valid] + 0.5) * win.res) - v0)
 
         # ---- open visits: overwrite with the fresh cells
         sector = 0
@@ -994,7 +1060,7 @@ class TerrainStore(object):
         fk = covered[fresh]
         fsel = fresh[valid]                     # fresh among the valid cells
         vals = {
-            "h": h[fsel] + offset,
+            "h": h[fsel] + corr[fsel],
             "var": var[fresh] + p["align_sigma"] ** 2,
             "t": np.full(fk.size, float(stamp)),
             "cost": win.cost[iy[fresh], ix[fresh]].astype(np.float64),
@@ -1075,6 +1141,8 @@ class TerrainStore(object):
         return self._close(np.ones(self.ov_keys.size, bool))
 
     def _commit(self, keys, vals):
+        if self.visit_log is not None:
+            self.visit_log(keys, vals["h"])
         mowed_all = None
         if self.mowed is not None:
             gx, gy = unpack_keys(keys)

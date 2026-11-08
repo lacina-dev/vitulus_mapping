@@ -285,7 +285,21 @@ def _old_versions(out_dir, prefix, keep):
     return out
 
 
-def export_mosaic(store, out_dir, site, sessions=None, r=None, extra=None):
+def _read_counter(path):
+    try:
+        with open(path) as f:
+            return int(f.read().strip() or 0)
+    except (IOError, OSError, ValueError):
+        return 0
+
+
+def counter_path(out_dir):
+    """The export version counter beside terrain_mosaic/ (it survives delete_map, which removes the
+    export and moves terrain/ aside: a version number is never used twice)."""
+    return os.path.join(os.path.dirname(os.path.abspath(out_dir)), "terrain_export.version")
+
+
+def export_mosaic(store, out_dir, site, sessions=None, r=None, extra=None, counter=None):
     """Write the mosaic files of the store to out_dir. Images get versioned names
     (teren_<site>_v<N>_<layer>.png, written first), then teren_<site>.json is replaced
     atomically (it names the images of version N), then images older than N - 1 are
@@ -300,6 +314,8 @@ def export_mosaic(store, out_dir, site, sessions=None, r=None, extra=None):
             version = int(json.load(f).get("version", 0))
     except (IOError, OSError, ValueError, TypeError, AttributeError):
         pass
+    counter = counter_path(out_dir) if counter is None else counter
+    version = max(version, _read_counter(counter))
     r = raster_map(store) if r is None else r
     if r is None:
         if os.path.exists(jpath):
@@ -332,6 +348,7 @@ def export_mosaic(store, out_dir, site, sessions=None, r=None, extra=None):
     if extra:
         meta.update(extra)
     _atomic(jpath, json.dumps(meta, ensure_ascii=False, indent=1).encode("utf-8"))
+    _atomic(counter, str(v).encode())
     for p in _old_versions(out_dir, prefix, keep=(v, v - 1)):
         try:
             os.remove(p)
@@ -344,7 +361,7 @@ def export_from_disk(terrain_dir, datum, out_dir, site, sessions=None):
     """The whole export from the stored tiles only (a separate, niced process: no lock
     of the recorder, no shared memory). Returns a summary dict."""
     t0 = time.process_time()
-    store = tl.TerrainStore(terrain_dir, datum, params={"max_loaded_tiles": 100000})
+    store = tl.TerrainStore(terrain_dir, datum, params={"max_loaded_tiles": 100000}, readonly=True)
     r = raster_map(store)
     cands = nogo_candidates(r)
     meta = export_mosaic(store, out_dir, site, sessions=sessions, r=r,

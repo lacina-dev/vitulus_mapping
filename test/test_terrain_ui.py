@@ -208,6 +208,7 @@ class Control(Base):
         # a token given for m1 does not replace the map with another mosaic
         os.makedirs(os.path.join(self.sdir, "terrain_import", "m9"))
         shutil.copy(os.path.join(mdir, "teren_m1.json"), os.path.join(self.sdir, "terrain_import", "m9", "teren_m9.json"))
+        shutil.copy(os.path.join(mdir, "teren_m1_layers.npz"), os.path.join(self.sdir, "terrain_import", "m9"))
         bad = self.cmd(c, cmd="import", source="mosaic", name="m9", mode="replace",
                        confirm=r["result"]["confirm_token"])
         self.assertEqual(bad["error"], "bad_token")
@@ -295,6 +296,88 @@ class Export(Base):
         self.assertEqual(c.state(T0)["nogo_candidates"], [])
 
 
+class Guards(Base):
+    def mosaic(self, name, datum=None):
+        mdir = os.path.join(self.sdir, "terrain_import", name)
+        os.makedirs(mdir)
+        h, w = 20, 20
+        np.savez_compressed(os.path.join(mdir, "teren_%s_layers.npz" % name), elevation=np.zeros((h, w), np.float32),
+                            elevation_std=np.full((h, w), 0.01, np.float32), cost=np.zeros((h, w), np.float32),
+                            reason=np.ones((h, w), np.uint8), slope_deg=np.zeros((h, w), np.float32),
+                            step=np.zeros((h, w), np.float32), roughness=np.zeros((h, w), np.float32))
+        with open(os.path.join(mdir, "teren_%s.json" % name), "w") as f:
+            json.dump({"frame": "map", "yaw": 0.0, "resolution": 0.05, "width": w, "height": h, "origin_x": 0.0,
+                       "origin_y": 0.0, "files": {"layers": "teren_%s_layers.npz" % name}}, f)
+        if datum is not None:
+            with open(os.path.join(mdir, "datum.yaml"), "w") as f:
+                yaml.safe_dump(datum, f)
+
+    def test_utm_zone_and_small_datum_delta(self):
+        c = self.core()
+        self.mosaic("z34", dict(DATUM, utm_zone=34))
+        r = self.cmd(c, cmd="import", source="mosaic", name="z34", mode="merge")
+        self.assertTrue(r["error"].startswith("utm_zone_mismatch"), r)
+        self.mosaic("near", dict(DATUM, utm_e=E0 + 0.3, yaw_rad=0.01))      # 0.3 m, 0.57 deg: accepted
+        r = self.cmd(c, cmd="import", source="mosaic", name="near", mode="merge")
+        self.assertTrue(r["ok"], r)
+        self.assertEqual(r["result"]["datum_delta"]["dE"], 0.3)
+        self.mosaic("turned", dict(DATUM, yaw_rad=0.03))                     # 1.7 deg: refused
+        r = self.cmd(c, cmd="import", source="mosaic", name="turned", mode="replace")
+        self.assertTrue(r["error"].startswith("datum_differs"), r)          # already at the token step
+
+    def test_export_reads_only(self):
+        c = self.core()
+        self.fill(c)
+        tdir = os.path.join(self.sdir, "terrain")
+        tile = sorted(f for f in os.listdir(tdir) if f.startswith("t_"))[0]
+        with open(os.path.join(tdir, tile), "wb") as f:
+            f.write(b"broken")
+        before = sorted(os.listdir(tdir))
+        res = c.export_now()
+        self.assertTrue(res["ok"], res)
+        self.assertEqual(sorted(os.listdir(tdir)), before)                  # nothing moved, no broken/
+        self.assertFalse(os.path.exists(os.path.join(tdir, "broken")))
+
+    def sleeper(self, c, age=0.0):
+        import subprocess
+        out = tempfile.TemporaryFile(mode="w+")
+        p = subprocess.Popen(["sleep", "30"], stdout=out)
+        c.export_proc = (p, out, "interval", __import__("time").time() - age)
+        return p
+
+    def test_export_timeout(self):
+        c = tf.RecorderCore({"flush_s": 0.0, "settings_file": self.settings, "export_timeout_s": 5.0},
+                            store_params={"accept_delay": 0.0}, sites_root=self.root)
+        c.poll(T0, force=True)
+        p = self.sleeper(c, age=10.0)
+        c.export_tick(T0)
+        self.assertIsNotNone(p.poll())                                      # killed
+        self.assertEqual((c.export_info["ok"], c.export_info["error"]), (False, "timeout"))
+
+    def test_import_replace_kills_a_running_export(self):
+        c = self.core()
+        self.fill(c)
+        self.mosaic("m3")
+        p = self.sleeper(c)
+        r = self.cmd(c, cmd="import", source="mosaic", name="m3", mode="replace")
+        r = self.cmd(c, cmd="import", source="mosaic", name="m3", mode="replace", confirm=r["result"]["confirm_token"])
+        self.assertTrue(r["ok"], r)
+        self.assertIsNotNone(p.poll())
+        self.assertIsNone(c.export_proc)
+
+    def test_versions_never_repeat_after_delete(self):
+        c = self.core()
+        self.fill(c)
+        c.export_now()
+        c.export_now()
+        tok = self.cmd(c, cmd="delete_map")["result"]["confirm_token"]
+        self.cmd(c, cmd="delete_map", confirm=tok)
+        self.fill(c)
+        self.assertEqual(c.export_now()["version"], 3)                      # not 1 again
+        with open(os.path.join(self.sdir, "terrain_export.version")) as f:
+            self.assertEqual(f.read().strip(), "3")
+
+
 class ExportVersions(Base):
     def test_versioned_files_and_cleanup_after_the_json(self):
         c = self.core()
@@ -362,7 +445,10 @@ class ExportVersions(Base):
         with open(os.path.join(mdir, "datum.yaml"), "w") as f:
             yaml.safe_dump(dict(DATUM, utm_e=E0 + 5.0), f)
         r = self.cmd(c, cmd="import", source="mosaic", name="m2", mode="merge")
+        self.assertTrue(r["error"].startswith("datum_differs: dE 5.00 m"), r)      # > 0.5 m: refused (F3)
+        r = self.cmd(c, cmd="import", source="mosaic", name="m2", mode="merge", force=True)
         self.assertEqual((r["ok"], r["result"]["datum"]), (True, "mosaic"))
+        self.assertEqual(r["result"]["datum_delta"], {"dE": 5.0, "dN": 0.0, "dyaw_deg": 0.0})
         self.assertTrue(np.isfinite(c.store.sample_utm(E0 + 5.5, N0 + 0.5)["h"][0]))
         self.assertFalse(np.isfinite(c.store.sample_utm(E0 + 0.5, N0 + 0.5)["h"][0]))
 

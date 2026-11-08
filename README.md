@@ -110,9 +110,15 @@ headings — and even then only listed as `nogo_candidates`, never written anywh
   Smooth corrections pulled into odom (`/odometry/odom` vs `/odometry/ekf_wheel_odom` over 1 s, > 3 cm / 0.5°) are
   only counted by default (`corr_enforce: false`); switched on they set a freshness boundary (event + 3 s) and
   batches without a comparison of both odometries are dropped (fails closed).
-* Export for the UI (`<site>/terrain_mosaic/`, versioned image names, JSON written last): a child process at
-  `nice 19` from the stored tiles, at most every `export_s` (600 s) while the map changes, at the end of a program
-  and on `rebuild_export` / `import` / `delete_map`; `terrain_backup/` keeps the newest `backup_keep` (5).
+* Export for the UI (`<site>/terrain_mosaic/`, versioned image names, JSON written last, version counter
+  `<site>/terrain_export.version` never reused): a child process at `nice 19` reading the stored tiles read-only
+  (a broken tile is skipped, nothing is moved), killed after `export_timeout_s` (300 s), at most every `export_s`
+  (600 s) while the map changes, at the end of a program and on `rebuild_export` / `import` / `delete_map`;
+  `terrain_backup/` keeps the newest `backup_keep` (5). A mosaic import checks the UTM zone and the distance of the
+  mosaic's `datum.yaml` from the site datum (> 0.5 m / 1° only with `force`).
+* Height registration of a window: Huber offset over the overlap, or with `align_tilt` a robust plane (offset +
+  tilt, capped at `align_max_tilt_deg`) fitted only against closed visits of earlier passes (`test/terrain_align_compare.sh`
+  compares both on bags with the consistency metric of the T10 accuracy work).
   Sessions: rising edge of `/mower_smach/busy` or 30 min without fusion (a respawn is no new session).
 * Interfaces: `/terrain_recorder/state` (latched JSON for the UI), `/terrain_recorder/cmd` →
   `/terrain_recorder/cmd_result` (enable, disable, pause, resume, delete_map with a confirmation token and a

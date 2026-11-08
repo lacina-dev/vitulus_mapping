@@ -77,6 +77,10 @@ DEFAULTS = {
                                  # (falling edge of /mower_smach/busy) and on rebuild_export / import / delete
     "export_nice": 19,
     "backup_keep": 5,            # terrain_backup/: the newest N are kept
+    "export_timeout_s": 300.0,   # an export child running longer is killed (state.export error "timeout")
+    "import_max_datum_m": 0.5,   # a mosaic datum further from the site datum needs "force": true
+    "import_max_datum_deg": 1.0,
+    "test_cmd_delay_s": 0.0,     # TESTS ONLY: long commands sleep this long (non-blocking state check)
     "token_s": 60.0,             # confirmation token lifetime (delete_map, import replace)
 }
 
@@ -832,13 +836,25 @@ class RecorderCore(object):
             self.export_info.update(ok=False, error="spawn: %s" % e, running=False)
         self.export_req = None
 
+    def _test_delay(self):
+        if self.cfg["test_cmd_delay_s"] > 0:
+            time.sleep(float(self.cfg["test_cmd_delay_s"]))
+
     def _collect_export(self, wait=False):
         if self.export_proc is None:
             return None
         proc, out, reason, t0 = self.export_proc
         if wait:
-            proc.wait()
+            try:
+                proc.wait(timeout=self.cfg["export_timeout_s"])
+            except Exception:                            # noqa: BLE001  subprocess.TimeoutExpired
+                pass
         if proc.poll() is None:
+            if time.time() - t0 > self.cfg["export_timeout_s"]:
+                self._kill_export()
+                self.export_info.update(ok=False, error="timeout", running=False, reason=reason)
+                self.stats["export_timeouts"] += 1
+                self.log("error", "export killed after %.0f s" % self.cfg["export_timeout_s"])
             return None
         self.export_proc = None
         out.seek(0)
@@ -1018,6 +1034,7 @@ class RecorderCore(object):
                         "site": self.site, "area_m2": round(known * tl.RES ** 2, 1), "tiles": tiles}
             if not self._check_token("delete_map", c.get("confirm"), now):
                 raise _CmdError("bad_token")
+            self._test_delay()
             self._stop_store_work()
             self._kill_export()
             name = self._backup()
@@ -1044,21 +1061,36 @@ class RecorderCore(object):
             mode = c.get("mode", "merge")
             if mode not in ("merge", "replace"):
                 raise _CmdError("bad_mode")
-            if mode == "replace":
-                if "confirm" not in c:
-                    return {"confirm_token": self._token("import", item["name"], now),
-                            "expires_s": self.cfg["token_s"], "site": self.site}
-                if not self._check_token("import", c.get("confirm"), now, extra=item["name"]):
-                    raise _CmdError("bad_token")
             mdir = os.path.join(self.site_dir(), item["path"])
             try:
                 meta, layers, t = terrainexport.load_mosaic_dir(mdir)
             except (ValueError, IOError, OSError, KeyError) as e:
                 raise _CmdError("bad_mosaic: %s" % e)
             mdatum, _mt = read_datum(mdir)      # the site datum the mosaic was made in, when shipped along
+            delta = None
+            if mdatum is not None:
+                zs, zm = self.datum.get("utm_zone"), mdatum.get("utm_zone")
+                if zs is not None and zm is not None and int(zs) != int(zm):
+                    raise _CmdError("utm_zone_mismatch: site %s, mosaic %s" % (zs, zm))
+                de = mdatum["utm_e"] - self.datum["utm_e"]
+                dn = mdatum["utm_n"] - self.datum["utm_n"]
+                dyaw = math.degrees(_wrap(mdatum.get("yaw_rad", 0.0) - self.datum.get("yaw_rad", 0.0)))
+                delta = {"dE": round(de, 3), "dN": round(dn, 3), "dyaw_deg": round(dyaw, 3)}
+                if (math.hypot(de, dn) > self.cfg["import_max_datum_m"] or
+                        abs(dyaw) > self.cfg["import_max_datum_deg"]) and not c.get("force"):
+                    raise _CmdError("datum_differs: dE %.2f m, dN %.2f m, dyaw %.2f deg (force to import)"
+                                    % (de, dn, dyaw))
+            if mode == "replace":
+                if "confirm" not in c:
+                    return {"confirm_token": self._token("import", item["name"], now),
+                            "expires_s": self.cfg["token_s"], "site": self.site, "datum_delta": delta}
+                if not self._check_token("import", c.get("confirm"), now, extra=item["name"]):
+                    raise _CmdError("bad_token")
+            self._test_delay()
             self._stop_store_work()
             backup = None
             if mode == "replace":
+                self._kill_export()               # the export must not read the files being moved
                 backup = self._backup()
                 self._fresh_store()
             n, off = self.store.import_map_grid((float(meta["origin_x"]), float(meta["origin_y"])),
@@ -1067,7 +1099,7 @@ class RecorderCore(object):
             self.request_export("import")
             self.log("info", "imported %s (%s): %d cells" % (item["name"], mode, n))
             return {"imported_cells": n, "height_offset_m": round(off, 4), "backup": backup,
-                    "datum": "mosaic" if mdatum else "site"}
+                    "datum": "mosaic" if mdatum else "site", "datum_delta": delta}
         raise _CmdError("unknown_cmd")
 
     def state(self, now, load=None):

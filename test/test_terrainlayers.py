@@ -72,6 +72,45 @@ class Base(unittest.TestCase):
         return st.sample_utm(e, n)
 
 
+class Plane(unittest.TestCase):
+    def test_plane_recovered_and_capped(self):
+        rng = np.random.RandomState(2)
+        u = rng.uniform(-3, 3, 4000)
+        v = rng.uniform(-3, 3, 4000)
+        r = 0.05 + 0.01 * u - 0.005 * v + rng.normal(0, 0.003, u.size)
+        r[:300] += 0.3                                        # outliers (grass, an edge)
+        a, b, c, u0, v0 = tl.huber_plane(u, v, r, 0.02, 0.0, math.tan(math.radians(2.0)))
+        self.assertAlmostEqual(a + b * (0 - u0) + c * (0 - v0), 0.05, delta=0.002)
+        self.assertAlmostEqual(b, 0.01, delta=0.0005)
+        self.assertAlmostEqual(c, -0.005, delta=0.0005)
+        # a 3 deg tilt is capped at 1 deg, direction kept
+        r2 = 0.02 + math.tan(math.radians(3.0)) * u
+        a, b, c, u0, v0 = tl.huber_plane(u, v, r2, 0.02, 0.0, math.tan(math.radians(1.0)))
+        self.assertAlmostEqual(math.degrees(math.atan(math.hypot(b, c))), 1.0, places=3)
+        self.assertAlmostEqual(c, 0.0, places=6)
+
+    def test_window_tilt_corrected(self):
+        """A window tilted 1 deg against the stored map is laid onto it (offset only would leave
+        +-5 cm at the window edges)."""
+        root = tempfile.mkdtemp(prefix="t30pl_")
+        try:
+            for tilt_on, tol in ((True, 0.004), (False, 0.03)):
+                st = tl.TerrainStore(os.path.join(root, str(tilt_on)), DATUM,
+                                     params={"accept_delay": 0.0, "align_tilt": tilt_on})
+                st.fuse(flat_window(-3, -3, 0.0, t=T0), P0, T0)
+                st.close_all()
+                w = flat_window(-3, -3, 0.0, t=T0 + 60)
+                xs = -3 + (np.arange(120) + 0.5) * 0.05
+                w.elevation[:] = (math.tan(math.radians(1.0)) * xs)[None, :].astype(np.float32)
+                st.fuse(w, P0, T0 + 60)
+                if tilt_on:
+                    self.assertAlmostEqual(st.last_batch["tilt_deg"], 1.0, delta=0.05)
+                k, h = st.open_visit_heights()
+                self.assertLess(float(np.max(np.abs(h))), tol + (0 if tilt_on else 0.03))
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
+
+
 class Keys(unittest.TestCase):
     def test_pack_unpack_and_tile_groups(self):
         gx = np.array([255, 256, 10000000, 3], np.int64)
@@ -356,12 +395,15 @@ class Sim(object):
     terrain), the store gets (x, y, yaw). tilt_deg: a pitch error of the camera /
     odometry (heights wrong by tan(tilt) x distance ahead of the robot)."""
 
-    def __init__(self, seed, odom, drift_step=0.003, noise=0.003, tilt_deg=0.0):
+    def __init__(self, seed, odom, drift_step=0.003, noise=0.003, tilt_deg=0.0, tilt_noise_deg=0.0):
         self.rng = np.random.RandomState(seed)
         self.odom = odom
         self.drift_step = drift_step
         self.noise = noise
         self.tilt = math.tan(math.radians(tilt_deg))
+        self.tilt_noise = math.tan(math.radians(tilt_noise_deg))   # pitch and roll error (stationary sigma)
+        self.tilt_ar = 0.95                   # correlated from cloud to cloud (AR(1)): a slowly wandering tilt
+        self.tilt_err = np.zeros(2)
         self.L = 1000                         # local map 50 x 50 m in odom
         self.ox = -25.0
         self.h = np.full((self.L, self.L), np.nan)
@@ -397,7 +439,12 @@ class Sim(object):
         x, y, z, yaw = self.odom
         c, s = math.cos(yaw), math.sin(yaw)
         e, n = map_to_utm(x + c * cx - s * cy, y + s * cx + c * cy)
-        meas = true_z(e, n) - z + self.drift + self.tilt * ahead + \
+        side = -dx * math.sin(ho) + dy * math.cos(ho)
+        if self.tilt_noise:
+            k = self.tilt_ar
+            self.tilt_err = k * self.tilt_err + math.sqrt(1 - k * k) * self.rng.normal(0, self.tilt_noise, 2)
+        gp, gr = self.tilt_err
+        meas = true_z(e, n) - z + self.drift + (self.tilt + gp) * ahead + gr * side + \
             self.rng.normal(0, self.noise, e.shape)
         sl = (slice(j0, j0 + 120), slice(i0, i0 + 120))
         hw, tw = self.h[sl], self.t[sl]
@@ -489,6 +536,21 @@ class Drift(Base):
         self.assertLess(rms3, 0.02, "after restart rms %.4f" % rms3)
         after = st.sample_utm(*map_to_utm(5.0, 3.0))["h"][0]
         self.assertAlmostEqual(after, before, delta=0.03)
+
+    def test_plane_registration_with_tilt_noise(self):
+        """Clouds tilted by a slowly wandering 0.7 deg (pitch and roll; sigma as measured by T10):
+        report offset-only vs plane registration (the decision is made on the real bags)."""
+        out = {}
+        for tilt_on in (False, True):
+            st = self.store(os.path.join(self.dir, "t%d" % tilt_on), align_tilt=tilt_on)
+            sim = Sim(11, (0.3, 0.2, 0.0, -0.4), drift_step=0.002, tilt_noise_deg=0.7)
+            self.drive(st, sim, mow_rows(0.0, 10.0, 0.0, 6.0, 0.6, 0.25), T0)
+            err, cov = self.errors(st, 0.5, 10.0, 0.5, 6.0)
+            out[tilt_on] = (self.rms0(err), float(np.percentile(np.abs(err - np.median(err)), 95)))
+        print("\n  tilt noise 0.7 deg: offset rms %.4f p95 %.4f | plane rms %.4f p95 %.4f"
+              % (out[False][0], out[False][1], out[True][0], out[True][1]))
+        self.assertLess(out[True][0], 0.03)
+        self.assertLess(out[False][0], 0.03)
 
     def test_systematic_tilt(self):
         """0.5 deg pitch error: heights wrong by up to 2.4 cm at 2.8 m ahead, the rows
