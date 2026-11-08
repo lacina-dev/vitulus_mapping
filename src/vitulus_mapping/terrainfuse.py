@@ -17,9 +17,13 @@ ROS master (test/test_terrainfuse.py).
 """
 
 import collections
+import glob
 import json
 import math
 import os
+import secrets
+import shutil
+import tempfile
 import time
 
 import numpy as np
@@ -27,12 +31,13 @@ import yaml
 
 from . import bundle
 from . import geo
+from . import terrainexport
 from . import terrainlayers as tl
 
 __all__ = ["FUSE_VERSION", "LAYERS", "decode_gridmap", "build_gridmap", "QualityGate",
            "RecorderCore", "DEFAULTS"]
 
-FUSE_VERSION = 1
+FUSE_VERSION = 2          # meta index 12 since 2; version 1 (C1) is still accepted
 
 # data layers of the message, besides fuse_meta (t30-kontrakt.md)
 LAYERS = ("elevation", "variance", "points", "t_fused", "cost", "reason", "slope", "step", "roughness")
@@ -43,7 +48,8 @@ DEFAULTS = {
     "max_hacc_mm": 30.0,
     "pvt_max_age": 1.5,          # s
     "loc_max_age": 3.0,          # s (loc_status is 1 Hz + edges)
-    "gate_hold_s": 1.0,          # the gate must have been open over [stamp - hold, stamp]
+    "gate_hold_s": 10.0,         # the gate must have been open over [stamp - hold, now] (a fresh RTK fix
+                                 # pulls the pose for a while)
     # messages
     "max_age": 3.0,              # s: message stamp vs now
     # subscription (the local node publishes only while somebody listens)
@@ -53,7 +59,20 @@ DEFAULTS = {
     "site_poll_s": 5.0,
     "coverage_reload_s": 60.0,
     "flush_s": 60.0,
-    "session_gap_s": 1800.0,     # no fused batch this long -> a new session
+    "session_gap_s": 1800.0,     # no fused batch this long -> a new session (besides /mower_smach/busy)
+    # smooth localisation corrections pulled into odom (set_pose): /odometry/odom vs the correction-free
+    # wheel EKF over corr_window_s, in the body frame
+    "corr_window_s": 1.0,
+    "corr_xy_m": 0.03,
+    "corr_yaw_deg": 0.5,
+    "corr_settle_s": 3.0,        # a batch with a stamp in [event - window, event + settle] is not fused
+    "corr_max_dt": 0.15,         # s: nearest samples of both odometries at least this close
+    "corr_enforce": True,        # False = only count the events (replays with another reference odometry)
+    "batch_log": "",             # CSV of every message / fused batch (diagnostics, replays); "" = off
+    # T31: control from the UI
+    "settings_file": "",         # "" = ~/.vitulus/terrain_recorder.json: {"enabled": bool} (owner's choice)
+    "export": True,              # write <site>/terrain_mosaic/ after every flush that changed the map
+    "token_s": 60.0,             # confirmation token lifetime (delete_map, import replace)
 }
 
 
@@ -97,9 +116,12 @@ def decode_gridmap(msg):
     meta = _arr(data[names.index("fuse_meta")].data)
     if meta.size < 12:
         raise ValueError("fuse_meta has %d values" % meta.size)
-    meta = meta[:12].astype(np.float64)
-    if meta[0] != FUSE_VERSION:
+    version = float(meta[0])
+    if not (math.isfinite(version) and version >= 1):
         raise ValueError("version %r" % meta[0])
+    # version 2 (P2): index 12 = time of the last epoch event relative to the stamp (NaN = none)
+    ev_rel = float(meta[12]) if version >= 2 and meta.size >= 13 else float("nan")
+    meta = meta[:12].astype(np.float64)
     arrs = {}
     for k in LAYERS:
         a = _arr(data[names.index(k)].data)
@@ -121,8 +143,10 @@ def decode_gridmap(msg):
                     reason, slope=arrs["slope"], step=arrs["step"], roughness=arrs["roughness"],
                     t_fused=stamp + arrs["t_fused"].astype(np.float64), stamp=stamp, epoch=epoch,
                     settling=settling)
+    win.epoch_t = stamp + ev_rel if math.isfinite(ev_rel) else None
     return {"win": win, "pose": pose, "stamp": stamp, "robot": robot, "epoch": epoch,
-            "settling": settling, "z_correction": float(meta[11])}
+            "settling": settling, "z_correction": float(meta[11]), "version": int(version),
+            "epoch_t": win.epoch_t}
 
 
 class _NS(object):
@@ -139,7 +163,7 @@ class _Stamp(object):
 
 
 def build_gridmap(stamp, origin, res, layers, map_from_odom, robot, epoch=0, settling=False,
-                  z_correction=0.0, classes=None):
+                  z_correction=0.0, classes=None, epoch_rel=None, version=FUSE_VERSION):
     """A /traversability/fuse message as the C1 node builds it (reference for tests).
 
     layers: arrays [iy][ix] (row 0 = lowest y) for every key of LAYERS (NaN unknown,
@@ -148,9 +172,11 @@ def build_gridmap(stamp, origin, res, layers, map_from_odom, robot, epoch=0, set
     ny, nx = np.asarray(layers["elevation"]).shape
     meta = np.full(nx * ny, np.nan, np.float32)
     mo = map_from_odom
-    meta[:12] = [FUSE_VERSION, epoch, 1.0 if settling else 0.0, 0.0 if mo is None else 1.0,
+    meta[:12] = [version, epoch, 1.0 if settling else 0.0, 0.0 if mo is None else 1.0,
                  0.0 if mo is None else mo[0], 0.0 if mo is None else mo[1], 0.0 if mo is None else mo[2],
                  robot[0], robot[1], robot[2], robot[3], z_correction]
+    if version >= 2:
+        meta[12] = np.nan if epoch_rel is None else epoch_rel
     flat = [np.ascontiguousarray(np.asarray(layers[k], np.float32)[::-1, ::-1]).reshape(-1) for k in LAYERS]
     flat.append(meta)
     names = list(LAYERS) + ["fuse_meta"]
@@ -274,6 +300,98 @@ class QualityGate(object):
 
 
 # --------------------------------------------------------------------------
+# smooth corrections
+# --------------------------------------------------------------------------
+def _wrap(a):
+    return math.atan2(math.sin(a), math.cos(a))
+
+
+def _rel(p0, p1):
+    """p1 in the body frame of p0 (x, y, yaw)."""
+    c, s = math.cos(p0[2]), math.sin(p0[2])
+    dx, dy = p1[0] - p0[0], p1[1] - p0[1]
+    return c * dx + s * dy, -s * dx + c * dy, _wrap(p1[2] - p0[2])
+
+
+class CorrectionDetector(object):
+    """Corrections pulled smoothly into odom: the motion of /odometry/odom over
+    corr_window_s (body frame) against the motion of a correction-free odometry
+    (/odometry/ekf_wheel_odom, never set_pose'd) over the same interval. More than
+    corr_xy_m / corr_yaw_deg apart = an event at that time."""
+
+    def __init__(self, cfg=None):
+        self.cfg = dict(DEFAULTS)
+        if cfg:
+            self.cfg.update(cfg)
+        self.odom = collections.deque(maxlen=400)
+        self.ref = collections.deque(maxlen=400)
+        self.events = collections.deque(maxlen=200)
+        self.last_eval = None
+        self.n_events = 0
+        self.last_diff = None
+
+    @staticmethod
+    def _at(hist, t, max_dt):
+        if not hist:
+            return None
+        best = min(hist, key=lambda h: abs(h[0] - t)) if len(hist) < 8 else None
+        if best is None:
+            # histories are in time order: binary search
+            lo, hi = 0, len(hist) - 1
+            while lo < hi:
+                mid = (lo + hi) // 2
+                if hist[mid][0] < t:
+                    lo = mid + 1
+                else:
+                    hi = mid
+            cand = [hist[i] for i in (lo - 1, lo) if 0 <= i < len(hist)]
+            best = min(cand, key=lambda h: abs(h[0] - t))
+        return best if abs(best[0] - t) <= max_dt else None
+
+    def feed_ref(self, t, x, y, yaw):
+        if self.ref and t <= self.ref[-1][0]:
+            if t < self.ref[-1][0] - 1.0:
+                self.ref.clear()
+            else:
+                return
+        self.ref.append((t, x, y, yaw))
+
+    def feed_odom(self, t, x, y, yaw):
+        """Returns True when this sample shows an event."""
+        if self.odom and t <= self.odom[-1][0]:
+            if t < self.odom[-1][0] - 1.0:
+                self.odom.clear()
+            else:
+                return False
+        self.odom.append((t, x, y, yaw))
+        if self.last_eval is not None and t - self.last_eval < 0.1:
+            return False
+        self.last_eval = t
+        c = self.cfg
+        w = c["corr_window_s"]
+        o0 = self._at(self.odom, t - w, c["corr_max_dt"])
+        r0 = self._at(self.ref, t - w, c["corr_max_dt"])
+        r1 = self._at(self.ref, t, c["corr_max_dt"])
+        if o0 is None or r0 is None or r1 is None:
+            return False
+        a = _rel(o0[1:], (x, y, yaw))
+        b = _rel(r0[1:], r1[1:])
+        dxy = math.hypot(a[0] - b[0], a[1] - b[1])
+        dyaw = abs(math.degrees(_wrap(a[2] - b[2])))
+        self.last_diff = (dxy, dyaw)
+        if dxy > c["corr_xy_m"] or dyaw > c["corr_yaw_deg"]:
+            self.events.append(t)
+            self.n_events += 1
+            return True
+        return False
+
+    def unsettled(self, stamp):
+        """A batch with this stamp lies in [event - window, event + settle] of an event."""
+        w, st = self.cfg["corr_window_s"], self.cfg["corr_settle_s"]
+        return any(e - w <= stamp <= e + st for e in self.events)
+
+
+# --------------------------------------------------------------------------
 # recorder
 # --------------------------------------------------------------------------
 def read_served_site(root):
@@ -323,6 +441,10 @@ class _Coverage(object):
         return out
 
 
+class _CmdError(Exception):
+    pass
+
+
 class RecorderCore(object):
     """Everything of terrain_recorder except ROS (see module doc)."""
 
@@ -351,6 +473,23 @@ class RecorderCore(object):
         self.fuse_ms = collections.deque(maxlen=200)
         self.decode_ms = collections.deque(maxlen=200)
         self.last_drop = None
+        self.corr = CorrectionDetector(self.cfg)
+        self.busy = None
+        self.session_pending = False
+        self.session_has_data = True    # the stored session may hold data: the first edge starts a new one
+        self._log_f = None
+        # T31
+        self.settings_path = self.cfg["settings_file"] or os.path.join(
+            os.path.expanduser("~"), ".vitulus", "terrain_recorder.json")
+        self.enabled = self._load_enabled()
+        self.paused = False
+        self.token = None               # (token, cmd, expires, extra)
+        self.last_cmd = None
+        self.export_info = {"version": None, "stamp": None, "dir": "terrain_mosaic", "ok": None, "error": None}
+        self.nogo = []
+        self.last_epoch = None
+        self.last_settling = False
+        self.last_write = None
 
     # ---- site ------------------------------------------------------------------
     def site_dir(self):
@@ -382,6 +521,9 @@ class RecorderCore(object):
                                          params=self.store_params)
             self.versions = {k: v.get("version", 0) for k, v in self.store.index["tiles"].items()}
             self.cov_t = 0.0
+            if self.session_pending:
+                self.store.new_session()
+                self.session_pending = False
             if self.store.broken:
                 self.log("warn", "broken terrain files moved aside: %s" % self.store.broken)
         elif mtime != self.datum_mtime and datum != self.datum:
@@ -417,7 +559,7 @@ class RecorderCore(object):
     def want_subscription(self, now):
         """Subscribe after the gate was open subscribe_after_s, unsubscribe after it
         was closed unsubscribe_after_s (and without a site / datum)."""
-        if self.store is None:
+        if self.store is None or not self.enabled or self.paused:
             self.subscribed = False
             return False
         if self.gate.check(now):
@@ -427,11 +569,58 @@ class RecorderCore(object):
             self.subscribed = False
         return self.subscribed
 
+    # ---- sessions and odometry -------------------------------------------------
+    def feed_busy(self, now, busy):
+        """/mower_smach/busy: a program starting (rising edge) is a new session."""
+        busy = bool(busy)
+        if busy and self.busy is False or busy and self.busy is None and self.last_fused_stamp is not None:
+            self._new_session()
+        self.busy = busy
+
+    def _new_session(self):
+        """A new session, unless the current one has no fused batch yet (a program
+        start right after a long pause is one new session, not two)."""
+        if not self.session_has_data:
+            return
+        if self.store is not None:
+            self.store.new_session()
+        else:
+            self.session_pending = True
+        self.session_has_data = False
+        self.stats["sessions"] += 1
+
+    def feed_odom(self, t, x, y, yaw):
+        """/odometry/odom sample (header time)."""
+        if self.corr.feed_odom(t, x, y, yaw):
+            self.stats["corrections"] += 1
+            if self.store is not None and self.cfg["corr_enforce"]:
+                if self.store.pending:
+                    self.stats["drop_queue_correction"] += len(self.store.pending)
+                    self.store.pending = []
+                if self.store.ov_keys.size:
+                    self.store.close_all()
+            self._blog("correction", t, t, "", "", "", "", "")
+
+    def feed_ref(self, t, x, y, yaw):
+        """Correction-free odometry sample (/odometry/ekf_wheel_odom)."""
+        self.corr.feed_ref(t, x, y, yaw)
+
     # ---- messages ------------------------------------------------------------
     def _drop(self, why):
         self.stats["drop_" + why] += 1
         self.last_drop = why
         return why
+
+    def _blog(self, kind, stamp, now, result, epoch, settling, x, y):
+        path = self.cfg["batch_log"]
+        if not path:
+            return
+        if self._log_f is None:
+            new = not os.path.exists(path)
+            self._log_f = open(path, "a")
+            if new:
+                self._log_f.write("kind,stamp,now,result,epoch,settling,map_x,map_y\n")
+        self._log_f.write("%s,%.3f,%.3f,%s,%s,%s,%s,%s\n" % (kind, stamp, now, result, epoch, settling, x, y))
 
     def feed(self, msg, now):
         """One /traversability/fuse GridMap. Returns "queued" or the drop reason."""
@@ -443,6 +632,20 @@ class RecorderCore(object):
         except ValueError as e:
             self.log("warn", "fuse message refused: %s" % e)
             return self._drop("decode")
+        res = self._feed(m, now)
+        mx = my = ""
+        if m["pose"] is not None:
+            x, y, yaw = m["pose"]
+            rx, ry = m["robot"][0], m["robot"][1]
+            mx = "%.3f" % (x + math.cos(yaw) * rx - math.sin(yaw) * ry)
+            my = "%.3f" % (y + math.sin(yaw) * rx + math.cos(yaw) * ry)
+        self._blog("msg", m["stamp"], now, res, m["epoch"], int(m["settling"]), mx, my)
+        return res
+
+    def _feed(self, m, now):
+        self.last_epoch, self.last_settling = m["epoch"], m["settling"]
+        if not self.enabled or self.paused:
+            return self._drop("off")
         if self.store is None:
             return self._drop("no_site")
         if now - m["stamp"] > self.cfg["max_age"]:
@@ -455,10 +658,14 @@ class RecorderCore(object):
                 self.stats["drop_queue_gate"] += len(self.store.pending)
                 self.store.pending = []
             return self._drop("gate")
+        if self.cfg["corr_enforce"] and self.corr.unsettled(m["stamp"]):
+            if self.store.pending:
+                self.stats["drop_queue_correction"] += len(self.store.pending)
+                self.store.pending = []
+            return self._drop("correction")
         if self.last_fused_stamp is not None and \
                 m["stamp"] - self.last_fused_stamp > self.cfg["session_gap_s"]:
-            self.store.new_session()
-            self.stats["sessions"] += 1
+            self._new_session()
         t0 = time.perf_counter()
         r = self.store.fuse(m["win"], m["pose"], m["stamp"], robot=m["robot"])
         self.fuse_ms.append((time.perf_counter() - t0) * 1000.0)
@@ -468,6 +675,8 @@ class RecorderCore(object):
             if info.get("fused"):
                 self.stats["fused"] += 1
                 self.last_fused_stamp = info["stamp"]
+                self.session_has_data = True
+                self._blog("fused", info["stamp"], now, "fused", "", "", "", "")
             elif info.get("refused"):
                 self.stats["refused_" + info["refused"]] += 1
         if not r["queued"]:
@@ -483,9 +692,12 @@ class RecorderCore(object):
         if not force and self.flush_t is not None and now - self.flush_t < self.cfg["flush_s"]:
             return []
         self.flush_t = now
+        if self._log_f is not None:
+            self._log_f.flush()
         n = self.store.save_dirty()
         if not n:
             return []
+        self.last_write = now
         changed = []
         for key, meta in self.store.index["tiles"].items():
             v = meta.get("version", 0)
@@ -494,12 +706,275 @@ class RecorderCore(object):
                 changed.append({"tx": tx, "ty": ty, "version": v})
                 self.versions[key] = v
         self.stats["flushes"] += 1
+        if changed and self.cfg["export"]:
+            self.export()
         return changed
 
     def close(self):
         """Shutdown: close the visits and write everything (queued batches are lost:
         they are younger than accept_delay)."""
         self._close_store()
+        if self._log_f is not None:
+            self._log_f.close()
+            self._log_f = None
+
+    # ---- T31: control -------------------------------------------------------------
+    def _known_cells(self):
+        """(known cells, tiles): loaded tiles counted live, the others from the index."""
+        if self.store is None:
+            return 0, 0
+        keys = set(self.store.index["tiles"].keys())
+        known = 0
+        for key, t in self.store.tiles.items():
+            name = "%d_%d" % key
+            keys.add(name)
+            known += t.known()
+        for name, meta in self.store.index["tiles"].items():
+            if tuple(int(v) for v in name.split("_")) not in self.store.tiles:
+                known += int(meta.get("known", 0))
+        return known, len(keys)
+
+    def _load_enabled(self):
+        try:
+            with open(self.settings_path) as f:
+                return bool(json.load(f).get("enabled", False))
+        except (IOError, OSError, ValueError, TypeError, AttributeError):
+            return False                 # default: off until the owner switches it on
+
+    def _save_enabled(self, value, by="ui"):
+        d = os.path.dirname(self.settings_path)
+        os.makedirs(d, exist_ok=True)
+        data = json.dumps({"enabled": bool(value), "changed_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                           "by": by}).encode()
+        fd, tmp = tempfile.mkstemp(prefix="terrain_recorder.", suffix=".tmp", dir=d)
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+        os.replace(tmp, self.settings_path)
+
+    def _stop_store_work(self):
+        """Off / paused / a long command: no queue, visits closed and written."""
+        if self.store is not None:
+            self.store.pending = []
+            self.store.close_all()
+            if self.site and os.path.isdir(self.site_dir()):
+                self.store.save_dirty()
+        self.subscribed = False
+
+    def export(self):
+        """Write <site>/terrain_mosaic/ (T31 §3) and the nogo candidates."""
+        if self.store is None or not self.site:
+            return None
+        try:
+            r = terrainexport.raster_map(self.store)
+            self.nogo = terrainexport.nogo_candidates(r)
+            meta = terrainexport.export_mosaic(self.store, os.path.join(self.site_dir(), "terrain_mosaic"),
+                                               self.site, sessions=self.store.session, r=r)
+            self.export_info.update(version=meta["version"] if meta else None, stamp=time.time(), ok=True,
+                                    error=None)
+            return meta
+        except Exception as e:                           # noqa: BLE001
+            self.export_info.update(ok=False, error=str(e))
+            self.log("error", "export: %s" % e)
+            return None
+
+    def _token(self, cmd, extra, now):
+        tok = secrets.token_hex(3)
+        self.token = (tok, cmd, now + self.cfg["token_s"], extra)
+        return tok
+
+    def _check_token(self, cmd, given, now):
+        t = self.token
+        ok = t is not None and given == t[0] and cmd == t[1] and now <= t[2]
+        if ok:
+            self.token = None
+        return ok
+
+    def _backup(self):
+        """Move <site>/terrain/ to <site>/terrain_backup/<YYYYmmdd-HHMMSS>/; returns the name."""
+        src = os.path.join(self.site_dir(), "terrain")
+        if not os.path.isdir(src):
+            return None
+        name = time.strftime("%Y%m%d-%H%M%S")
+        dst_root = os.path.join(self.site_dir(), "terrain_backup")
+        os.makedirs(dst_root, exist_ok=True)
+        dst = os.path.join(dst_root, name)
+        k = 1
+        while os.path.exists(dst):
+            dst = os.path.join(dst_root, "%s-%d" % (name, k))
+            k += 1
+        os.replace(src, dst)
+        return os.path.basename(dst)
+
+    def _fresh_store(self):
+        self.store = tl.TerrainStore(os.path.join(self.site_dir(), "terrain"), self.datum,
+                                     params=self.store_params)
+        self.versions = {}
+
+    def list_imports(self):
+        if not self.site:
+            return []
+        out = []
+        for j in sorted(glob.glob(os.path.join(self.site_dir(), "terrain_import", "*", "teren_*.json"))):
+            d = os.path.dirname(j)
+            out.append({"name": os.path.basename(d), "path": os.path.relpath(d, self.site_dir())})
+        return out
+
+    def list_backups(self):
+        if not self.site:
+            return []
+        out = []
+        for d in sorted(glob.glob(os.path.join(self.site_dir(), "terrain_backup", "*"))):
+            area = None
+            try:
+                with open(os.path.join(d, "index.json")) as f:
+                    idx = json.load(f)
+                area = round(sum(int(t.get("known", 0)) for t in idx.get("tiles", {}).values())
+                             * tl.RES ** 2, 1)
+            except (IOError, OSError, ValueError, TypeError, AttributeError):
+                pass
+            out.append({"name": os.path.basename(d), "area_m2": area})
+        return out
+
+    def command(self, data, now):
+        """One /terrain_recorder/cmd message (str or dict). Returns the answer dict
+        {"id", "cmd", "ok", "error", "result"} (also kept as last_cmd)."""
+        try:
+            c = json.loads(data) if isinstance(data, str) else dict(data)
+            if not isinstance(c, dict):
+                raise ValueError
+        except (TypeError, ValueError):
+            c = {}
+        ans = {"id": c.get("id"), "cmd": c.get("cmd"), "ok": False, "error": None, "result": {}}
+        try:
+            ans["result"] = self._command(c, now)
+            ans["ok"] = True
+        except _CmdError as e:
+            ans["error"] = str(e)
+        except Exception as e:                           # noqa: BLE001
+            ans["error"] = "internal: %s" % e
+            self.log("error", "command %s: %s" % (c.get("cmd"), e))
+        self.last_cmd = ans
+        self.stats["cmds"] += 1
+        return ans
+
+    def _command(self, c, now):
+        cmd = c.get("cmd")
+        if cmd == "enable":
+            self._save_enabled(True)
+            self.enabled = True
+            self.log("info", "enabled from the UI")
+            return {"enabled": True}
+        if cmd == "disable":
+            self._save_enabled(False)
+            self.enabled = False
+            self._stop_store_work()
+            self.log("info", "disabled from the UI")
+            return {"enabled": False}
+        if cmd in ("pause", "resume"):
+            self.paused = cmd == "pause"
+            if self.paused:
+                self._stop_store_work()
+            return {"paused": self.paused}
+        if cmd == "list":
+            return {"imports": self.list_imports(), "backups": self.list_backups()}
+        if cmd == "rebuild_export":
+            if self.store is None:
+                raise _CmdError("no_site")
+            meta = self.export()
+            return {"version": meta["version"] if meta else None}
+        if cmd == "delete_map":
+            if self.store is None:
+                raise _CmdError("no_site")
+            if "confirm" not in c:
+                known, tiles = self._known_cells()
+                return {"confirm_token": self._token("delete_map", None, now), "expires_s": self.cfg["token_s"],
+                        "site": self.site, "area_m2": round(known * tl.RES ** 2, 1), "tiles": tiles}
+            if not self._check_token("delete_map", c.get("confirm"), now):
+                raise _CmdError("bad_token")
+            self._stop_store_work()
+            name = self._backup()
+            self._fresh_store()
+            exp = os.path.join(self.site_dir(), "terrain_mosaic")
+            if os.path.isdir(exp):
+                shutil.rmtree(exp)
+            self.nogo = []
+            self.export_info.update(version=None, stamp=time.time(), ok=True, error=None)
+            self.log("warn", "terrain map of %s deleted from the UI, backup %s" % (self.site, name))
+            return {"backup": name}
+        if cmd == "import":
+            if self.store is None:
+                raise _CmdError("no_site")
+            src = c.get("source")
+            if src == "bag":
+                raise _CmdError("not_available")
+            if src != "mosaic":
+                raise _CmdError("bad_source")
+            names = {i["name"]: i for i in self.list_imports()}
+            item = names.get(c.get("name"))
+            if item is None:
+                raise _CmdError("unknown_import")
+            mode = c.get("mode", "merge")
+            if mode not in ("merge", "replace"):
+                raise _CmdError("bad_mode")
+            if mode == "replace":
+                if "confirm" not in c:
+                    return {"confirm_token": self._token("import", item["name"], now),
+                            "expires_s": self.cfg["token_s"], "site": self.site}
+                if not self._check_token("import", c.get("confirm"), now):
+                    raise _CmdError("bad_token")
+            try:
+                meta, layers, t = terrainexport.load_mosaic_dir(os.path.join(self.site_dir(), item["path"]))
+            except (ValueError, IOError, OSError, KeyError) as e:
+                raise _CmdError("bad_mosaic: %s" % e)
+            self._stop_store_work()
+            backup = None
+            if mode == "replace":
+                backup = self._backup()
+                self._fresh_store()
+            n, off = self.store.import_map_grid((float(meta["origin_x"]), float(meta["origin_y"])),
+                                                float(meta["resolution"]), layers, t)
+            self.store.save_dirty()
+            self.export()
+            self.log("info", "imported %s (%s): %d cells" % (item["name"], mode, n))
+            return {"imported_cells": n, "height_offset_m": round(off, 4), "backup": backup}
+        raise _CmdError("unknown_cmd")
+
+    def state(self, now, load=None):
+        """/terrain_recorder/state (T31 §1)."""
+        if not self.enabled:
+            mode = "off"
+        elif self.paused:
+            mode = "paused"
+        elif self.store is None:
+            mode = "no_site"
+        elif self.subscribed:
+            mode = "recording"
+        else:
+            mode = "waiting"
+        gopen = self.gate.check(now)
+        known, tiles = self._known_cells()
+        ms = sorted(self.fuse_ms)
+        drops = {k[5:]: v for k, v in self.stats.items() if k.startswith("drop_")}
+        return {
+            "v": 1, "stamp": now, "running": True, "enabled": self.enabled, "paused": self.paused, "mode": mode,
+            "site": self.site,
+            "gate": {"open": gopen, "reason": self.gate.reason, "open_for_s": round(self.gate.open_for(now), 1)},
+            "subscribed": self.subscribed,
+            "map": {"area_m2": round(known * tl.RES ** 2, 1), "tiles": tiles, "known_cells": known,
+                    "last_fused": self.last_fused_stamp,
+                    "last_fused_age_s": round(now - self.last_fused_stamp, 1) if self.last_fused_stamp else None,
+                    "last_write": self.last_write,
+                    "session": self.store.session if self.store is not None else None},
+            "localisation": {"epoch": self.last_epoch, "settling": bool(self.last_settling),
+                             "corrections": self.corr.n_events},
+            "load": dict(load or {}, fuse_ms_avg=round(sum(ms) / len(ms), 2) if ms else None,
+                         fuse_ms_p95=round(ms[int(0.95 * (len(ms) - 1))], 2) if ms else None),
+            "counts": {"msgs": self.stats.get("msgs", 0), "fused": self.stats.get("fused", 0), "dropped": drops},
+            "export": dict(self.export_info),
+            "nogo_candidates": self.nogo,
+            "imports": self.list_imports(), "backups": self.list_backups(),
+            "last_cmd": self.last_cmd,
+        }
 
     # ---- state --------------------------------------------------------------------
     def status(self, now):
@@ -509,6 +984,7 @@ class RecorderCore(object):
               "fuse_ms_avg": round(sum(ms) / len(ms), 2) if ms else None,
               "fuse_ms_p95": round(ms[int(0.95 * (len(ms) - 1))], 2) if ms else None,
               "fuse_ms_max": round(ms[-1], 2) if ms else None,
+              "corrections": self.corr.n_events, "corr_last_diff": self.corr.last_diff,
               "decode_ms_avg": round(sum(self.decode_ms) / len(self.decode_ms), 2) if self.decode_ms else None}
         if self.store is not None:
             s = self.store.summary()

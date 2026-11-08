@@ -11,6 +11,7 @@ RATE=${4:-2.0}; START=${5:-0}; DUR=${6:-0}
 JOB=$(mktemp -d "$PRIV/run.XXXXXX")
 SITES=$JOB/home/.vitulus/mapping_v3
 mkdir -p "$JOB/home/.ros" "$SITES/testsite"
+echo '{"enabled": true}' >"$JOB/home/.vitulus/terrain_recorder.json"   # the owner's switch (T31), on for the test
 export HOME=$JOB/home ROS_HOME=$JOB/home/.ros ROS_MASTER_URI=http://localhost:11892 ROS_LOG_DIR=$JOB/home/.ros/log
 source "$WS_SETUP"
 export PYTHONPATH=$HERE/src:$PYTHONPATH

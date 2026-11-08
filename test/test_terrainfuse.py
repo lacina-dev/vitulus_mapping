@@ -7,6 +7,7 @@ Made-up site and coordinates (a round UTM point), temporary site root.
 """
 
 import json
+import math
 import os
 import shutil
 import sys
@@ -72,6 +73,34 @@ class Message(unittest.TestCase):
         m2 = tf.decode_gridmap(tf.build_gridmap(T0, (0, 0), 0.05, lay, None, (0, 0, 0, 0)))
         self.assertIsNone(m2["pose"])
 
+    def test_version_2_epoch_boundary(self):
+        """Contract v2: meta[12] = last epoch event relative to the stamp; cells last
+        fused before it are neither mapped nor used for the alignment."""
+        from vitulus_mapping import terrainlayers as tl
+        lay = layers(0.0, t_rel=-1.0)
+        lay["t_fused"][:, :60] = -5.0                       # western half fused before the event
+        g = tf.build_gridmap(T0, (-3.0, -3.0), 0.05, lay, (0, 0, 0), (0, 0, 0, 0), epoch_rel=-2.0)
+        m = tf.decode_gridmap(g)
+        self.assertEqual(m["version"], 2)
+        self.assertAlmostEqual(m["epoch_t"], T0 - 2.0)
+        st = tl.TerrainStore(tempfile.mkdtemp(prefix="t30v2_"), DATUM, params={"accept_delay": 0.0})
+        try:
+            st.fuse(m["win"], m["pose"], m["stamp"], robot=m["robot"])
+            info = st.last_batch
+            self.assertGreater(info["stale_epoch_cells"], 5000)
+            st.close_all()
+            e, n = DATUM["utm_e"], DATUM["utm_n"]
+            self.assertFalse(np.isfinite(st.sample_utm(e - 1.5, n)["h"][0]))   # west: stale
+            self.assertTrue(np.isfinite(st.sample_utm(e + 1.5, n)["h"][0]))    # east: fresh
+        finally:
+            shutil.rmtree(st.root, ignore_errors=True)
+        # NaN = no event since the start; version 1 (C1) still accepted, without index 12
+        m = tf.decode_gridmap(tf.build_gridmap(T0, (0, 0), 0.05, layers(0.0), (0, 0, 0), (0, 0, 0, 0)))
+        self.assertIsNone(m["epoch_t"])
+        m = tf.decode_gridmap(tf.build_gridmap(T0, (0, 0), 0.05, layers(0.0), (0, 0, 0), (0, 0, 0, 0),
+                                               version=1))
+        self.assertEqual((m["version"], m["epoch_t"]), (1, None))
+
     def test_storage_order_of_the_contract(self):
         """grid_map stores column-major from the largest x and y: the first value of a
         layer is the cell with the largest x and y (t30-kontrakt.md)."""
@@ -86,7 +115,7 @@ class Message(unittest.TestCase):
             change(g)
             return g
         cases = [
-            bad(lambda g: g.data[g.layers.index("fuse_meta")].data.__setitem__(0, 2.0)),   # version
+            bad(lambda g: g.data[g.layers.index("fuse_meta")].data.__setitem__(0, 0.0)),   # version
             bad(lambda g: g.layers.remove("reason")),
             bad(lambda g: setattr(g.data[0], "data", g.data[0].data[:100])),
             bad(lambda g: setattr(g, "outer_start_index", 5)),
@@ -126,8 +155,15 @@ class Gate(unittest.TestCase):
             g.feed_loc(T0, st)
             self.assertEqual((g.check(T0), g.reason), (False, why))
 
-    def test_hold_interval(self):
+    def test_hold_default_10_s(self):
         g = tf.QualityGate()
+        for i in range(25):
+            self.open_gate(g, T0 + 0.5 * i)                # open since T0, now T0 + 12
+        self.assertFalse(g.ok_for(T0 + 9.0, T0 + 12.0))    # needs open since stamp - 10 s
+        self.assertTrue(g.ok_for(T0 + 10.0, T0 + 12.0))
+
+    def test_hold_interval(self):
+        g = tf.QualityGate({"gate_hold_s": 1.0})
         self.open_gate(g, T0)
         self.assertFalse(g.ok_for(T0, T0))                 # open only since T0
         self.open_gate(g, T0 + 1.5)
@@ -158,11 +194,17 @@ class Core(unittest.TestCase):
         with open(os.path.join(self.root, ".last_served"), "w") as f:
             json.dump({"site": site, "raster": "combined"}, f)
 
-    def core(self, **store):
+    def settings(self, enabled=True):
+        path = os.path.join(self.root, "terrain_recorder.json")
+        with open(path, "w") as f:
+            json.dump({"enabled": enabled}, f)
+        return path
+
+    def core(self, enabled=True, **store):
         q = {"accept_delay": 2.0}
         q.update(store)
-        c = tf.RecorderCore({"flush_s": 0.0}, store_params=q, sites_root=self.root,
-                            log=lambda lv, tx: self.logs.append((lv, tx)))
+        c = tf.RecorderCore({"flush_s": 0.0, "settings_file": self.settings(enabled)}, store_params=q,
+                            sites_root=self.root, log=lambda lv, tx: self.logs.append((lv, tx)))
         c.poll(T0, force=True)
         return c
 
@@ -189,7 +231,7 @@ class Core(unittest.TestCase):
 
     def test_record_flush_restart(self):
         c = self.core()
-        self.gate_ok(c, T0 - 5)
+        self.gate_ok(c, T0 - 15)
         res = self.drive(c, T0, 12)
         self.assertEqual(res, ["queued"] * 12)
         self.assertGreaterEqual(c.stats["fused"], 9)        # the first ~2 s wait in the queue
@@ -204,12 +246,12 @@ class Core(unittest.TestCase):
         e, n = E0 + 3.3, N0 - 7.1                        # the map origin, inside the windows
         h = c2.store.sample_utm(e, n)["h"][0]
         self.assertAlmostEqual(float(h), 0.0, delta=0.002)
-        self.assertEqual(c2.store.session, c.store.session + 1 if c.store else 2)
+        self.assertEqual(c2.store.session, 1)                 # a restart is no new session (P1)
 
     def test_drops(self):
         c = self.core()
         self.assertEqual(c.feed(object(), T0), "decode")
-        self.gate_ok(c, T0 - 5)
+        self.gate_ok(c, T0 - 15)
         self.gate_ok(c, T0)
         self.assertEqual(c.feed(msg(T0 - 10), T0), "stale")
         self.assertEqual(c.feed(msg(T0, pose=None), T0 + 0.2), "no_tf")
@@ -222,7 +264,7 @@ class Core(unittest.TestCase):
 
     def test_gate_closing_clears_the_queue(self):
         c = self.core()
-        self.gate_ok(c, T0 - 5)
+        self.gate_ok(c, T0 - 15)
         self.drive(c, T0, 2)                                # queued, not fused yet
         self.assertEqual(len(c.store.pending), 2)
         c.gate.feed_pvt(T0 + 2.2, 3, 0x01 | (1 << 6), 14)    # RTK float
@@ -232,7 +274,7 @@ class Core(unittest.TestCase):
 
     def test_epoch_change(self):
         c = self.core()
-        self.gate_ok(c, T0 - 5)
+        self.gate_ok(c, T0 - 15)
         self.drive(c, T0, 6, epoch=1)
         self.drive(c, T0 + 6, 3, epoch=2)
         self.assertEqual(c.store.stats["epoch_changes"], 1)
@@ -240,7 +282,7 @@ class Core(unittest.TestCase):
 
     def test_datum_change_and_site_switch(self):
         c = self.core()
-        self.gate_ok(c, T0 - 5)
+        self.gate_ok(c, T0 - 15)
         self.drive(c, T0, 6)
         time.sleep(0.01)
         self.write_datum(dict(DATUM, utm_e=DATUM["utm_e"] + 0.4))
@@ -259,7 +301,7 @@ class Core(unittest.TestCase):
 
     def test_removed_site_not_recreated(self):
         c = self.core()
-        self.gate_ok(c, T0 - 5)
+        self.gate_ok(c, T0 - 15)
         self.drive(c, T0, 4)
         shutil.rmtree(self.sdir)
         self.serve("")
@@ -268,14 +310,70 @@ class Core(unittest.TestCase):
 
     def test_session_gap(self):
         c = self.core(accept_delay=0.0)
-        self.gate_ok(c, T0 - 5)
+        self.gate_ok(c, T0 - 15)
         self.drive(c, T0, 3)
         s0 = c.store.session
         c.gate.feed_loc(T0 + 10, dict(LOC_OK, owner="dock"))   # in the dock for an hour
-        self.gate_t = T0 + 4000 - 5
-        self.gate_ok(c, T0 + 4000 - 5)
-        self.drive(c, T0 + 4000, 2)
+        self.gate_t = T0 + 4000 - 15
+        self.gate_ok(c, T0 + 4000 - 15)
+        c.feed_busy(T0 + 3999, True)                         # the program starts, then the first batch
+        self.drive(c, T0 + 4000, 2)                          # after the long gap: still one new session
         self.assertEqual(c.store.session, s0 + 1)
+
+    def test_sessions_from_the_mowing_program(self):
+        c = self.core()
+        s0 = c.store.session
+        c.feed_busy(T0, True)                               # respawn during a program: latched True first
+        self.assertEqual(c.store.session, s0)
+        c.feed_busy(T0 + 1, False)
+        c.feed_busy(T0 + 2, True)                           # the next program
+        self.assertEqual(c.store.session, s0 + 1)
+        c.feed_busy(T0 + 3, False)
+        c.feed_busy(T0 + 4, True)                           # nothing fused in between: same session
+        self.assertEqual(c.store.session, s0 + 1)
+        c.close()
+        self.assertEqual(self.core().store.session, s0 + 1)
+
+    def odom_pair(self, c, t0, n, slew=0.0, yaw_slew=0.0):
+        """Driving 0.3 m/s along x; /odometry/odom gets an extra slew (m/s, rad/s)."""
+        for i in range(n):
+            t = t0 + 0.05 * i
+            d = 0.3 * 0.05 * i                              # the wheel EKF: own frame, heading 0.2 rad
+            c.feed_ref(t, 10.0 + d * math.cos(0.2), 5.0 + d * math.sin(0.2), 0.2)
+            c.feed_odom(t, 0.3 * 0.05 * i, slew * 0.05 * i, yaw_slew * 0.05 * i)
+
+    def test_smooth_correction_drops_batches(self):
+        c = self.core(accept_delay=2.0)
+        self.odom_pair(c, T0 - 15, 300)                      # 15 s quiet: no event
+        self.assertEqual(c.corr.n_events, 0)
+        self.gate_ok(c, T0 - 15)
+        self.drive(c, T0, 2)
+        self.assertEqual(len(c.store.pending), 2)
+        self.odom_pair(c, T0 + 1.5, 40, slew=0.10)            # pulled 10 cm/s sideways
+        self.assertGreater(c.corr.n_events, 0)
+        self.assertEqual(c.store.pending, [])                # the queue went with it
+        self.assertEqual(c.stats["fused"], 0)
+        self.gate_ok(c, T0 + 3.3)
+        self.assertEqual(c.feed(msg(T0 + 3), T0 + 3.3), "correction")
+        # yaw slew 1 deg/s is an event too; a quiet time after the settle time is not
+        c2 = self.core()
+        self.odom_pair(c2, T0, 60, yaw_slew=math.radians(1.0))
+        self.assertGreater(c2.corr.n_events, 0)
+        self.assertFalse(c2.corr.unsettled(T0 + 3 + 3.5 + 1))
+
+    def test_batch_log(self):
+        path = os.path.join(self.root, "batches.csv")
+        c = tf.RecorderCore({"flush_s": 0.0, "batch_log": path, "settings_file": self.settings()},
+                            store_params={"accept_delay": 0.0}, sites_root=self.root)
+        c.poll(T0, force=True)
+        self.gate_ok(c, T0 - 15)
+        self.drive(c, T0, 3)
+        c.close()
+        with open(path) as f:
+            rows = f.read().splitlines()
+        self.assertEqual(rows[0], "kind,stamp,now,result,epoch,settling,map_x,map_y")
+        self.assertEqual(sum(r.startswith("msg,") for r in rows), 3)
+        self.assertEqual(sum(r.startswith("fused,") for r in rows), 3)
 
     def test_subscription_hysteresis(self):
         c = self.core()

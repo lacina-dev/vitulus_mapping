@@ -7,6 +7,7 @@ HERE=$(cd "$(dirname "$0")/.." && pwd)
 JOB=$(mktemp -d "${1:?a private dir}/run.XXXXXX")
 SITES=$JOB/home/.vitulus/mapping_v3
 mkdir -p "$JOB/home/.ros" "$SITES/testsite"
+echo '{"enabled": true}' >"$JOB/home/.vitulus/terrain_recorder.json"   # the owner's switch (T31), on for the test
 export HOME=$JOB/home ROS_HOME=$JOB/home/.ros ROS_MASTER_URI=http://localhost:11891 ROS_LOG_DIR=$JOB/home/.ros/log
 source /opt/ros/noetic/setup.bash
 export PYTHONPATH=$HERE/src:$PYTHONPATH

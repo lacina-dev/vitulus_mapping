@@ -170,6 +170,24 @@ class Fusion(Base):
 
 
 class Localisation(Base):
+    def test_accept_delay_follows_the_batch_period(self):
+        st = self.store(accept_delay=3.0)
+        for i in range(6):                                   # 0.5 Hz batches: period 2 s -> delay 3 s
+            st.fuse(flat_window(-3, -3, 0.0, t=T0 + 2 * i), P0, T0 + 2 * i)
+        self.assertAlmostEqual(st.accept_delay(), 3.0)
+        st2 = self.store(os.path.join(self.dir, "b"), accept_delay=3.0)
+        for i in range(6):                                   # 0.2 Hz: period 5 s -> delay 6 s
+            r = st2.fuse(flat_window(-3, -3, 0.0, t=T0 + 5 * i), P0, T0 + 5 * i)
+        self.assertAlmostEqual(st2.accept_delay(), 6.0)
+        self.assertEqual([i["stamp"] for i in r["processed"]], [T0 + 15])   # T0+25 - 6 s
+
+    def test_sessions_persist_without_new_tiles(self):
+        st = self.store()
+        self.assertEqual(st.session, 1)
+        st.new_session()
+        st.save_dirty()
+        self.assertEqual(self.store().session, 2)
+
     def test_accept_delay(self):
         st = self.store(accept_delay=2.0)
         r = st.fuse(flat_window(-3, -3, 0.0, t=T0), P0, T0)
@@ -226,7 +244,7 @@ class Localisation(Base):
         self.one_visit(st, -3, -3, 0.10, T0)                 # the dock area is known
         st.save_dirty()
         st2 = self.store()                                   # restart: new odom, z 1 m off
-        self.assertEqual(st2.session, st.session + 1)
+        self.assertEqual(st2.session, st.session)            # a restart is no new session
         # first window: no overlap (other place), robot standing at (0, 0) on known cells
         st2.fuse(flat_window(10.0, -3, -1.0, t=T0 + 600), P0, T0 + 600, robot=(0.0, 0.0, -1.0, 0.0))
         self.assertEqual(st2.last_batch["offset_src"], "robot_ground")

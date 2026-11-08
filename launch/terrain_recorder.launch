@@ -6,7 +6,7 @@
   <arg name="enabled" default="$(optenv VITULUS_TERRAIN_GLOBAL false)"/>
   <node if="$(eval str(arg('enabled')).strip().lower() in ('1', 'true', 'yes', 'on'))"
         pkg="vitulus_mapping" type="terrain_recorder" name="terrain_recorder"
-        output="log" respawn="true" respawn_delay="10" launch-prefix="nice -n 10">
+        output="log" respawn="true" respawn_delay="10" launch-prefix="nice -n 19">
     <rosparam command="load" file="$(find vitulus_mapping)/config/terrain_recorder.yaml"/>
   </node>
 </launch>

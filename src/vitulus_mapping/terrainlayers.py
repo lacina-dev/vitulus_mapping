@@ -28,7 +28,9 @@ Window (input, one per batch)
     and base_link (x, y, z, yaw) in the window frame, all sent by the local node.
 
 Localisation (RTK corrections go mostly into odom, not into map <- odom)
-    A batch is fused only `accept_delay` s after its stamp; a settling batch
+    A batch is fused only `accept_delay` s after its stamp (at least the median
+    period of the batches + 1 s, so a correction flagged in the next message still
+    catches it in the queue); a settling batch
     drops itself and the queue, a new epoch drops the queue, closes the visits
     and finds the offset again. A jump of map <- odom refuses the batch too.
     Every global cell is sampled at its centre in the window (global -> window:
@@ -135,7 +137,8 @@ DEFAULTS = {
     # pose
     "jump_max_m": 0.10,          # map <- odom change between batches beyond = batch refused, visits closed
     "jump_max_deg": 2.0,
-    "accept_delay": 2.0,         # s: a batch is fused only this late, and dropped when a localisation
+    "accept_delay": 3.0,         # s (>= batch period + 1 s, raised automatically): a batch is fused only this
+                                 # late, and dropped when a localisation
                                  # correction (settling / new epoch) comes before that
     "edge_margin": 0.25,         # m of the window border left out (half seen, registration edge)
     # long-term estimate
@@ -264,6 +267,7 @@ class Window(object):
         self.t_fused = None if t_fused is None else np.asarray(t_fused, np.float64)
         self.stamp = stamp
         self.epoch = int(epoch)          # localisation epoch of the local node (set_pose / heading re-anchor)
+        self.epoch_t = None              # unix s of the last epoch event (contract v2): older cells are stale
         self.settling = bool(settling)   # a localisation correction is being pulled in right now
         for a in (self.variance, self.points, self.cost, self.reason, self.slope,
                   self.step, self.roughness):
@@ -589,8 +593,13 @@ class TerrainStore(object):
         self.epoch = None
         self.pending = []
         self._load_index()
-        self.session = int(self.index.get("sessions", 0)) + 1
+        # sessions come from the mowing program (new_session), not from starting the process: a respawn
+        # in the middle of a program stays in its session
+        self.session = max(1, int(self.index.get("sessions", 1)))
         self.index["sessions"] = self.session
+        self._periods = collections.deque(maxlen=20)
+        self._index_dirty = False
+        self._last_queued = None
 
     # ---- index / tiles ---------------------------------------------------------
     def _index_path(self):
@@ -686,8 +695,9 @@ class TerrainStore(object):
             if t.dirty:
                 self.save_tile(t)
                 n += 1
-        if n or not os.path.exists(self._index_path()):
+        if n or self._index_dirty or not os.path.exists(self._index_path()):
             self.save_index()
+            self._index_dirty = False
         return n
 
     def _evict(self):
@@ -786,6 +796,7 @@ class TerrainStore(object):
         self.close_all()
         self.session += 1
         self.index["sessions"] = self.session
+        self._index_dirty = True
         return self.session
 
     # ---- the batch -------------------------------------------------------------
@@ -798,7 +809,6 @@ class TerrainStore(object):
         odom re-anchored: queued batches dropped, visits closed, the offset found
         again); win.settling: a correction is being pulled in (batch and queue
         dropped). Returns {"queued", "dropped", "processed": [infos]}."""
-        p = self.p
         self.stats["batches"] += 1
         info = {"stamp": stamp, "queued": False, "dropped": 0, "processed": []}
         if self.epoch is not None and win.epoch != self.epoch:
@@ -816,10 +826,23 @@ class TerrainStore(object):
         self.stats["dropped_epoch"] += info["dropped"]
         self.pending.append((win, tuple(pose), float(stamp), robot))
         info["queued"] = True
-        while self.pending and self.pending[0][2] <= stamp - p["accept_delay"]:
+        if self._last_queued is not None and 0.0 < stamp - self._last_queued < 30.0:
+            self._periods.append(stamp - self._last_queued)
+        self._last_queued = float(stamp)
+        delay = self.accept_delay()
+        info["delay"] = delay
+        while self.pending and self.pending[0][2] <= stamp - delay:
             w, ps, st, rb = self.pending.pop(0)
             info["processed"].append(self._process(w, ps, st, rb))
         return info
+
+    def accept_delay(self):
+        """accept_delay, at least the median batch period + 1 s (0 = no delay at all:
+        offline tools and tests)."""
+        d = float(self.p["accept_delay"])
+        if d > 0.0 and len(self._periods) >= 3:
+            d = max(d, float(np.median(self._periods)) + 1.0)
+        return d
 
     def drain(self):
         """Fuse every queued batch now (end of a bag, tests). Returns their infos."""
@@ -884,6 +907,12 @@ class TerrainStore(object):
         m = int(round(p["edge_margin"] / win.res))
         valid = np.isfinite(el) & np.isfinite(var) & (var <= p["max_variance"]) & \
             (pts >= p["min_points"]) & (ix >= m) & (ix < W - m) & (iy >= m) & (iy < H - m)
+        if getattr(win, "epoch_t", None) is not None and win.t_fused is not None:
+            # cells last fused before the epoch event lie in the old odom: neither map nor reference
+            tfe = win.t_fused[iy, ix]
+            stale_ep = ~(np.isfinite(tfe) & (tfe > win.epoch_t))
+            info["stale_epoch_cells"] = int(np.count_nonzero(valid & stale_ep))
+            valid &= ~stale_ep
         if win.t_fused is not None and self.last_stamp is not None:
             tf = win.t_fused[iy, ix]
             fresh = valid & np.isfinite(tf) & (tf > self.last_stamp)

@@ -15,20 +15,35 @@ Interfaces
                                                   local node publishes only then)
   in   /nav_tf/loc_status       std_msgs/String   owner, gps_good, heading_ok, anchors
   in   /gnss/navpvt             ublox_msgs/NavPVT only while loc_status owner is gps
-  out  ~stats                   std_msgs/String   latched JSON every stats_period
+  in   /mower_smach/busy        std_msgs/Bool     a program starting = a new session (a respawn is none)
+  in   /odometry/odom, /odometry/ekf_wheel_odom   nav_msgs/Odometry  only while /traversability/fuse is
+                                                  subscribed: smooth corrections pulled into odom
+  out  ~state                   std_msgs/String   latched JSON every 2 s and on change: the UI contract
+                                                  (~/vitulus/predavka/t31-teren-ui-kontrakt.md)
+  in   ~cmd                     std_msgs/String   JSON commands of the UI (enable / disable / pause /
+                                                  resume / delete_map / import / rebuild_export / list)
+  out  ~cmd_result              std_msgs/String   the answer to each command
+  out  ~stats                   std_msgs/String   latched JSON every stats_period (diagnostics)
   out  /terrain_recorder/updates std_msgs/String  latched JSON {"site","stamp","tiles":[{tx,ty,version}]}
                                                   after the tiles are written
 Files are written every flush_s and at shutdown (open visits closed first).
-Started by launch/terrain_recorder.launch only with VITULUS_TERRAIN_GLOBAL on.
+Started by launch/terrain_recorder.launch only with VITULUS_TERRAIN_GLOBAL on; composing the map is
+off until the owner switches it on from the UI (stored in ~/.vitulus/terrain_recorder.json).
+After every write the map is exported for the UI to <site>/terrain_mosaic/.
 """
 
 import json
+import os
 import threading
+import time
+
+import math
 
 import rospy
 from grid_map_msgs.msg import GridMap
+from nav_msgs.msg import Odometry
 from rospy.numpy_msg import numpy_msg
-from std_msgs.msg import String
+from std_msgs.msg import Bool, String
 
 from vitulus_mapping import terrainfuse
 
@@ -44,18 +59,29 @@ class Node(object):
         root = rospy.get_param('~sites_root', '') or None
         self.fuse_topic = rospy.get_param('~fuse_topic', '/traversability/fuse')
         self.gnss_topic = rospy.get_param('~gnss_topic', '/gnss/navpvt')
+        self.odom_topic = rospy.get_param('~odom_topic', '/odometry/odom')
+        self.odom_ref_topic = rospy.get_param('~odom_ref_topic', '/odometry/ekf_wheel_odom')
+        self.sub_odom = []
         self.stats_period = float(rospy.get_param('~stats_period', 5.0))
         self.budget_ms = float(rospy.get_param('~budget_fuse_ms', 60.0))
         self.lock = threading.Lock()
+        self.sub_lock = threading.Lock()
         self.core = terrainfuse.RecorderCore(cfg, store_params=store, sites_root=root,
                                              log=self._log)
         self.pub_stats = rospy.Publisher('~stats', String, queue_size=1, latch=True)
         self.pub_updates = rospy.Publisher('/terrain_recorder/updates', String, queue_size=1,
                                            latch=True)
+        self.pub_state = rospy.Publisher('~state', String, queue_size=1, latch=True)
+        self.pub_result = rospy.Publisher('~cmd_result', String, queue_size=10)
+        self.state_t = 0.0
+        self.cpu_prev = None
+        self.load = {}
         self.sub_fuse = None
         self.sub_pvt = None
         self.stats_t = 0.0
         rospy.Subscriber('/nav_tf/loc_status', String, self._cb_loc, queue_size=1)
+        rospy.Subscriber('/mower_smach/busy', Bool, self._cb_busy, queue_size=2)
+        rospy.Subscriber('~cmd', String, self._cb_cmd, queue_size=10)
         rospy.on_shutdown(self._shutdown)
         rospy.Timer(rospy.Duration(1.0), self._tick)
 
@@ -83,6 +109,54 @@ class Node(object):
         with self.lock:
             self.core.gate.feed_pvt(rospy.get_time(), msg.fixType, msg.flags, msg.hAcc)
 
+    def _cb_cmd(self, msg):
+        with self.lock:
+            ans = self.core.command(msg.data, rospy.get_time())
+        self.pub_result.publish(String(data=json.dumps(ans)))
+        self._publish_state(force=True)
+        self._apply_subscriptions()
+
+    def _measure_load(self):
+        try:
+            f = open('/proc/self/stat').read().rsplit(')', 1)[1].split()
+            cpu = (int(f[11]) + int(f[12])) / float(os.sysconf('SC_CLK_TCK'))
+            rss = int(open('/proc/self/statm').read().split()[1]) * os.sysconf('SC_PAGE_SIZE') / 1e6
+        except (IOError, OSError, IndexError, ValueError):
+            return
+        now = time.time()
+        if self.cpu_prev is not None and now > self.cpu_prev[0]:
+            self.load = {'cpu_pct': round(100.0 * (cpu - self.cpu_prev[1]) / (now - self.cpu_prev[0]), 1),
+                         'rss_mb': round(rss, 1)}
+        self.cpu_prev = (now, cpu)
+
+    def _publish_state(self, force=False):
+        now = rospy.get_time()
+        if not force and now - self.state_t < 2.0:
+            return
+        self.state_t = now
+        with self.lock:
+            st = self.core.state(now, self.load)
+        self.pub_state.publish(String(data=json.dumps(st)))
+
+    def _cb_busy(self, msg):
+        with self.lock:
+            self.core.feed_busy(rospy.get_time(), msg.data)
+
+    @staticmethod
+    def _xyyaw(msg):
+        p = msg.pose.pose.position
+        q = msg.pose.pose.orientation
+        yaw = math.atan2(2.0 * (q.w * q.z + q.x * q.y), 1.0 - 2.0 * (q.y * q.y + q.z * q.z))
+        return msg.header.stamp.to_sec(), p.x, p.y, yaw
+
+    def _cb_odom(self, msg):
+        with self.lock:
+            self.core.feed_odom(*self._xyyaw(msg))
+
+    def _cb_ref(self, msg):
+        with self.lock:
+            self.core.feed_ref(*self._xyyaw(msg))
+
     def _cb_fuse(self, msg):
         with self.lock:
             self.core.feed(msg, rospy.get_time())
@@ -92,16 +166,12 @@ class Node(object):
         now = rospy.get_time()
         with self.lock:
             self.core.poll(now)
-            want = self.core.want_subscription(now)
             changed = self.core.flush(now)
             site = self.core.site
             status = self.core.status(now) if now - self.stats_t >= self.stats_period else None
-        if want and self.sub_fuse is None:
-            self.sub_fuse = rospy.Subscriber(self.fuse_topic, numpy_msg(GridMap), self._cb_fuse,
-                                             queue_size=1, buff_size=4 * 1024 * 1024)
-        elif not want and self.sub_fuse is not None:
-            self.sub_fuse.unregister()
-            self.sub_fuse = None
+        self._apply_subscriptions()
+        self._measure_load()
+        self._publish_state(force=bool(changed))
         if changed:
             self.pub_updates.publish(String(data=json.dumps(
                 {'site': site, 'stamp': now, 'tiles': changed})))
@@ -112,6 +182,26 @@ class Node(object):
             if p95 is not None and p95 > self.budget_ms:
                 rospy.logwarn_throttle(60.0, '[terrain_recorder] fuse p95 %.1f ms over budget %.1f ms'
                                        % (p95, self.budget_ms))
+
+    def _apply_subscriptions(self):
+        with self.sub_lock:
+            self._apply_subscriptions_locked()
+
+    def _apply_subscriptions_locked(self):
+        with self.lock:
+            want = self.core.want_subscription(rospy.get_time())
+        if want and self.sub_fuse is None:
+            self.sub_fuse = rospy.Subscriber(self.fuse_topic, numpy_msg(GridMap), self._cb_fuse,
+                                             queue_size=1, buff_size=4 * 1024 * 1024)
+            if self.odom_ref_topic:
+                self.sub_odom = [rospy.Subscriber(self.odom_topic, Odometry, self._cb_odom, queue_size=50),
+                                 rospy.Subscriber(self.odom_ref_topic, Odometry, self._cb_ref, queue_size=50)]
+        elif not want and self.sub_fuse is not None:
+            self.sub_fuse.unregister()
+            self.sub_fuse = None
+            for sub in self.sub_odom:
+                sub.unregister()
+            self.sub_odom = []
 
     def _shutdown(self):
         with self.lock:

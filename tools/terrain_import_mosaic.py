@@ -20,36 +20,14 @@ import numpy as np
 import yaml
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'src'))
-from vitulus_mapping import geo, terrainlayers as tl    # noqa: E402
+from vitulus_mapping import geo, terrainexport, terrainlayers as tl    # noqa: E402
 
 
 def load_mosaic(mdir):
-    js = [p for p in glob.glob(os.path.join(mdir, "teren_*.json"))]
-    if len(js) != 1:
-        raise SystemExit("expected one teren_*.json in %s, found %d" % (mdir, len(js)))
-    meta = json.load(open(js[0]))
-    if meta.get("frame") != "map" or abs(float(meta.get("yaw", 0.0))) > 1e-9:
-        raise SystemExit("mosaic not in the map frame without rotation: %s" % meta.get("frame"))
-    lay = np.load(os.path.join(mdir, meta["files"]["layers"]))
-    h, w = int(meta["height"]), int(meta["width"])
-    flip = lambda a: np.asarray(a)[::-1]          # noqa: E731  row 0 = max y -> row 0 = min y
-    t = float(os.path.getmtime(js[0]))
-    gjs = os.path.join(mdir, "grid", "grid.json")
-    tl_path = os.path.join(mdir, "grid", "t_last.f32")
-    if os.path.exists(gjs) and os.path.exists(tl_path):
-        g = json.load(open(gjs))
-        tlast = np.fromfile(tl_path, np.float32).reshape(int(g["height"]), int(g["width"]))
-        t = flip(float(g["t_ref"]) + np.where(np.isfinite(tlast), tlast, np.nanmax(tlast)))
-    layers = {
-        "elevation": flip(lay["elevation"]), "sigma": flip(lay["elevation_std"]),
-        "cost": flip(lay["cost"]), "reason": flip(lay["reason"]),
-        "slope": np.radians(flip(lay["slope_deg"])), "step": flip(lay["step"]),
-        "roughness": flip(lay["roughness"]),
-    }
-    for k, a in layers.items():
-        if a.shape != (h, w):
-            raise SystemExit("layer %s: %s, expected %s" % (k, a.shape, (h, w)))
-    return meta, layers, t
+    try:
+        return terrainexport.load_mosaic_dir(mdir)
+    except ValueError as e:
+        raise SystemExit(str(e))
 
 
 def main():

@@ -47,7 +47,10 @@ def layers(n=120):
 
 
 rospy.init_node('check', anonymous=True)
-got = {"stats": None, "updates": None}
+got = {"stats": None, "updates": None, "state": None, "result": []}
+rospy.Subscriber('/terrain_recorder/state', String, lambda m: got.__setitem__("state", json.loads(m.data)))
+rospy.Subscriber('/terrain_recorder/cmd_result', String, lambda m: got["result"].append(json.loads(m.data)))
+pub_cmd = rospy.Publisher('/terrain_recorder/cmd', String, queue_size=5)
 rospy.Subscriber('/terrain_recorder/stats', String, lambda m: got.__setitem__("stats", json.loads(m.data)))
 rospy.Subscriber('/terrain_recorder/updates', String, lambda m: got.__setitem__("updates", json.loads(m.data)))
 pub_loc = rospy.Publisher('/nav_tf/loc_status', String, queue_size=1, latch=True)
@@ -63,7 +66,7 @@ check(not fuse_subscribed(), "no /traversability/fuse subscription while docked"
 
 # 2. good localisation: subscribes, fuses
 lay = layers()
-t_end = time.time() + 16.0
+t_end = time.time() + 26.0       # gate_hold_s 10 + accept_delay 3 before the first fusion
 x = 0.0
 last_fuse = 0.0
 while time.time() < t_end and not rospy.is_shutdown():
@@ -89,9 +92,25 @@ check((st.get("stats") or {}).get("fused", 0) >= 5, "stats: fused batches")
 up = got["updates"] or {}
 check(up.get("site") == "testsite" and len(up.get("tiles", [])) >= 1, "updates after a flush")
 check(os.path.exists(os.path.join(SITE_DIR, "terrain", "index.json")), "index.json written")
-
-# 3. shutdown writes the open visits
+sv = got["state"] or {}
+print("state:", json.dumps({k: sv.get(k) for k in ("mode", "enabled", "gate", "map", "load", "export")}))
+check(sv.get("mode") == "recording" and sv.get("v") == 1, "state: mode recording (T31)")
+check(os.path.exists(os.path.join(SITE_DIR, "terrain_mosaic", "teren_testsite.json")) and
+      os.path.exists(os.path.join(SITE_DIR, "terrain_mosaic", "teren_testsite_cost_rgba.png")),
+      "export terrain_mosaic written (T31)")
 before = json.load(open(os.path.join(SITE_DIR, "terrain", "index.json")))
+pub_cmd.publish(String(data=json.dumps({"id": "c1", "cmd": "disable"})))
+for _ in range(30):
+    if got["result"] and (got["state"] or {}).get("mode") == "off":
+        break
+    time.sleep(0.2)
+check(bool(got["result"]) and got["result"][-1].get("ok") and got["result"][-1].get("id") == "c1",
+      "cmd disable answered on cmd_result")
+check((got["state"] or {}).get("mode") == "off", "state: mode off after disable")
+time.sleep(1.5)
+check(not fuse_subscribed(), "fuse unsubscribed after disable")
+
+# 3. disable (above) and the shutdown write the open visits
 os.killpg(REC_PID, signal.SIGINT)
 for _ in range(50):
     try:
@@ -102,6 +121,6 @@ for _ in range(50):
 after = json.load(open(os.path.join(SITE_DIR, "terrain", "index.json")))
 known_b = sum(t["known"] for t in before["tiles"].values())
 known_a = sum(t["known"] for t in after["tiles"].values())
-print("known cells before / after shutdown: %d / %d" % (known_b, known_a))
-check(known_a > known_b, "shutdown closed the visits and wrote them")
+print("known cells before disable / after shutdown: %d / %d" % (known_b, known_a))
+check(known_a > known_b, "disable / shutdown closed the visits and wrote them")
 sys.exit(1 if fails else 0)

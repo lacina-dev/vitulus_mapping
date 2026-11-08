@@ -88,6 +88,35 @@ mapping_manager (permanent, started from vitulus_ui.launch)
 * `waypoints/paths/zones/edits.geojson`, `programs.yaml`, `manifest.yaml` —
   the site bundle
 * `logs/gate_*.csv` — per-scan gate decisions
+* `terrain/` — persistent terrain map (below); `terrain_backup/<time>/` — maps moved aside by the UI;
+  `terrain_import/<name>/` — offline mosaics ready to import; `terrain_mosaic/` — export for the UI
+
+## Persistent terrain map (`terrain_recorder`)
+
+Fuses the local terrain window of `traversability_local` (vitulus_traversability, `/traversability/fuse`:
+`grid_map_msgs/GridMap` + layer `fuse_meta`) into UTM tiles of the served site (12.8 m, 5 cm): visits instead
+of batches, height aligned onto the stored map (odometry z drift / jumps), changes over time (mowing, moved
+objects), terrain bans only as tentative (cost 99) until confirmed over ≥ 3 visits, ≥ 2 sessions and ≥ 2
+headings — and even then only listed as `nogo_candidates`, never written anywhere.
+
+* Code: `src/vitulus_mapping/terrainlayers.py` (store), `terrainfuse.py` (message, localisation gate,
+  smooth-correction detector, recorder logic, UI commands), `terrainexport.py` (export files, nogo candidates),
+  `nodes/terrain_recorder`, `tools/terrain_import_mosaic.py`.
+* Start: `launch/terrain_recorder.launch` (included by `vitulus_ui.launch`) starts the node only with
+  `VITULUS_TERRAIN_GLOBAL=true`; composing is then **off until switched on from the UI** (`enable`, stored in
+  `~/.vitulus/terrain_recorder.json`). `nice -n 19`.
+* Fused only while: RTK FIXED + hAcc ≤ 30 mm (`/gnss/navpvt`), `/nav_tf/loc_status` owner `gps` with heading,
+  both for the last 10 s; not settling (local node) and no smooth correction pulled into odom (`/odometry/odom`
+  vs `/odometry/ekf_wheel_odom` over 1 s, > 3 cm / 0.5°); a batch is fused 3 s (≥ period + 1 s) after its stamp.
+  Sessions: rising edge of `/mower_smach/busy` or 30 min without fusion (a respawn is no new session).
+* Interfaces: `/terrain_recorder/state` (latched JSON for the UI), `/terrain_recorder/cmd` →
+  `/terrain_recorder/cmd_result` (enable, disable, pause, resume, delete_map with a confirmation token and a
+  backup, import of a mosaic, rebuild_export, list), `/terrain_recorder/stats`, `/terrain_recorder/updates`.
+  Contracts: `t30-kontrakt.md` (input), `t31-teren-ui-kontrakt.md` (UI) in the project hand-over folder.
+* Tests: `test/test_terrainlayers.py`, `test_terrainfuse.py`, `test_terrain_ui.py` (no ROS);
+  `test/terrain_recorder_ros_check.sh` (private roscore, fake messages), `terrain_recorder_bag_check.sh` and
+  `terrain_recorder_events_check.sh` (a bag through `traversability_local` → recorder; the latter checks
+  settling, shifts against offline mosaics and confirmed bans on the track); `bench_terrainlayers.py`.
 
 ## Requirements
 
