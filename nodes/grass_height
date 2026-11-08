@@ -46,7 +46,12 @@ import os
 import threading
 import time
 
-import numpy as np
+# one BLAS thread: the small solves here gain nothing from threads, and an idle
+# multi-threaded OpenBLAS spins its workers (58 % of a core measured 2026-11-08)
+for _v in ('OPENBLAS_NUM_THREADS', 'OMP_NUM_THREADS', 'MKL_NUM_THREADS'):
+    os.environ.setdefault(_v, '1')
+
+import numpy as np  # noqa: E402
 import rospy
 from geometry_msgs.msg import Twist
 from sensor_msgs.msg import CameraInfo, Image, Imu

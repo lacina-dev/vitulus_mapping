@@ -36,6 +36,10 @@ ALTITUDE. `Track` integrates the robot's altitude from the attitude (IMU roll an
 pitch) and the horizontal motion (map pose). The carpet seen at t1 and the ground
 under the wheels at t2 are both expressed with the same attitude, so a constant
 pitch bias cancels: carpet_alt - ground_alt = x sin(p + b) + g - x sin(p + b) = g.
+Over longer tracks it does not (the blade's vibration tilts the IMU by ~1.3 deg:
+2 cm of altitude per metre): `Drift` fits the drift curve from the wheels
+coming back over cells they stamped before, and wheel ground from the previous
+lane is brought onto the current drift.
 
 CALIBRATION (nodes/grass_calib, file ~/.vitulus/grass/calib.json): concrete gives
 the camera zero (offset, pitch and roll of the plane the camera sees under a robot
@@ -73,6 +77,11 @@ SRC_NAMES = {SRC_WHEELS: "wheels", SRC_DEM: "dem"}
 # wheel contact points in base_link (vitulus4WD URDF: x +-0.125, y +-0.236)
 WHEELS_XY = ((0.0, 0.0), (0.125, 0.236), (0.125, -0.236),
              (-0.125, 0.236), (-0.125, -0.236))
+# ground under the body stamped by the wheels: the plane of the four contacts over
+# the whole footprint (axles and midline x three, wheels, half-way, centre y five),
+# so the lane between the wheel tracks is known too
+BODY_XY = tuple((bx, by) for bx in (0.125, 0.0, -0.125)
+                for by in (0.236, 0.118, 0.0, -0.118, -0.236))
 
 DEFAULTS = {
     "x_min": 0.8,              # corridor in base_link, m
@@ -104,9 +113,30 @@ DEFAULTS = {
     "imu_bias_unmeasured_deg": 1.5,  # possible IMU pitch error when calibration did not measure it
     "imu_bias_measured_deg": 0.3,
     "track_jump_m": 1.0,       # a pose step longer than this restarts the altitude
+    "track_jump_min_m": 0.15,  # ... and so does one longer than this + vmax * dt
+    "track_vmax_mps": 0.8,     # (the robot drives <= 0.5 m/s: 0.35 m per 0.25 s frame)
     "track_gap_s": 2.0,
     "drift_deg": 0.5,          # attitude error assumed for the integrated altitude (sigma per metre)
-    "ground_max": 4000,
+    "ground_max": 20000,       # wheel ground cells kept (a garden run: ~3500 cells per 200 m)
+    # DRIFT of the integrated altitude. The IMU pitch is off while driving (the
+    # spinning blade: 1.3 deg on 2026-11-08, 0.94 deg at rest), so the altitude
+    # drifts with the track (2.1 cm per metre). Where the wheels drive over a
+    # cell they stamped before, the altitude difference over the track between is
+    # that drift: a drift curve is fitted to such revisits (class Drift) and
+    # removed, and wheel ground stamped long ago (the previous lane) becomes usable.
+    "wheel_keep_m": 120.0,     # wheel ground kept this far back along the track
+    "drift_min_ds_m": 3.0,     # a revisit counts when this much track lies between
+    "drift_window_m": 120.0,   # the drift curve covers this much track back
+    "drift_knot_m": 4.0,       # ... a knot every this much track
+    "drift_max_pairs": 400,    # revisits kept for the fit (newest)
+    "drift_refit_m": 0.5,      # refit after this much track
+    "drift_refit_pairs": 30,   # ... or this many new revisits
+    "drift_smooth": 1.0,       # curvature penalty of the curve
+    "drift_min_pairs": 20,     # revisits needed for a curve
+    "drift_min_span_m": 60.0,  # ... and this much summed track between them
+    "drift_max_rate": 0.06,    # |slope| above this (3.4 deg) now = no curve (a pose fault)
+    "drift_sigma_min_m": 0.008,  # floor of the curve's uncertainty
+    "drift_use_max_m": 110.0,  # with a curve: ground stamped up to this far back is used
     "lane_step_mm": 25.0,      # strips side by side differing more = kerb or grass edge (a step)
     "strip_w": 0.07,           # lateral strips for kerbs and mown | uncut edges
     "strip_min_pts": 30,
@@ -123,6 +153,8 @@ DEFAULTS = {
     "bare_offset_mm": 20.0,    # smooth AND this close to the ground plane = bare surface
     "pivot_x": 0.125,          # front wheel contact: where a slope seen ahead starts
     "wheels_min_frac": 0.5,    # share of corridor cells with ground to call it wheels/dem
+    "wheels_partial_min_cells": 2,   # fewer known: the plane through them and the footprint
+    "wheels_partial_resid_mm": 20.0, # ... if the known cells sit on it this well
     "conf_min": 0.6,           # probability that the class is right
     "cut_default_mm": 60.0,
     "smooth_frames": 3,
@@ -493,7 +525,11 @@ class Track(object):
             t0, x0, y0 = self.last
             dx, dy = x - x0, y - y0
             step = math.hypot(dx, dy)
-            if step > self.cfg["track_jump_m"] or t - t0 > self.cfg["track_gap_s"] or t < t0:
+            # a step faster than the robot can drive is a pose jump (GNSS, relocalisation):
+            # the altitude, the wheel ground and the drift curve start again
+            jump = min(self.cfg["track_jump_m"],
+                       self.cfg["track_jump_min_m"] + self.cfg["track_vmax_mps"] * max(0.0, t - t0))
+            if step > jump or t - t0 > self.cfg["track_gap_s"] or t < t0:
                 self.reset()
             elif step > 1e-4:
                 M = np.array([[R[0, 0], R[0, 1]], [R[1, 0], R[1, 1]]])
@@ -535,6 +571,147 @@ class Track(object):
             return base * 2.0
         p = np.array([h[2] for h in self.hist])
         return max(base, float(np.std(p)) + abs(float(p[-1] - np.median(p))) * 0.5)
+
+
+def _solve_spd(M, v):
+    """Solve M x = v for a small symmetric positive definite M (Cholesky in numpy
+    element-wise operations: no LAPACK/BLAS threads for a 31 x 31 system)."""
+    n = len(v)
+    L = np.zeros_like(M)
+    for j in range(n):
+        d = M[j, j] - float((L[j, :j] * L[j, :j]).sum())
+        L[j, j] = math.sqrt(max(d, 1e-18))
+        if j + 1 < n:
+            L[j + 1:, j] = (M[j + 1:, j] - (L[j + 1:, :j] * L[j, :j]).sum(axis=1)) / L[j, j]
+    y = np.zeros(n)
+    for j in range(n):
+        y[j] = (v[j] - float((L[j, :j] * y[:j]).sum())) / L[j, j]
+    x = np.zeros(n)
+    for j in range(n - 1, -1, -1):
+        x[j] = (y[j] - float((L[j + 1:, j] * x[j + 1:]).sum())) / L[j, j]
+    return x
+
+
+class DriftFit(object):
+    """Drift curve D(s) of the integrated altitude along the track, D(s_now) = 0.
+    A value computed at track position s carries D(s); bringing a value from s_a
+    to the drift of s_b adds corr(s_a, s_b) = D(s_b) - D(s_a)."""
+
+    def __init__(self, knots, d, s_min, sigma):
+        self.knots, self.d = knots, d
+        self.s_min = s_min          # oldest track position the revisits constrain
+        self.sigma = sigma          # m, robust residual of the revisits
+        self.rate = float((d[-1] - d[-2]) / (knots[-1] - knots[-2]))   # m per m, now
+
+    def at(self, s):
+        s = np.asarray(s, float)
+        k = self.knots
+        v = np.interp(s, k, self.d)
+        # ahead of now (a cell in front of the robot): the current slope
+        return np.where(s > k[-1], self.d[-1] + self.rate * (s - k[-1]), v)
+
+    def corr(self, s_a, s_b):
+        return self.at(s_b) - self.at(s_a)
+
+
+class Drift(object):
+    """Drift of the integrated altitude from wheel revisits.
+
+    The IMU pitch is off while driving (blade vibration), so the integrated
+    altitude grows with the track, not quite linearly (2.1 cm/m on 2026-11-08 with
+    +-3 cm wander around the line over 15-45 m). Two wheel stamps of the same map
+    cell at track positions s_old and s_new differ by D(s_new) - D(s_old) (plus the
+    terrain inside the 0.2 m cell). D is a piecewise-linear curve with knots every
+    drift_knot_m over the last drift_window_m, fitted to all such revisits by
+    least squares with a curvature penalty, D(now) = 0, outliers down-weighted.
+    Causal check on 2026-11-08: |error| median 15 mm at any span 3-70 m (a single
+    rate: 30-37 mm at 15-45 m)."""
+
+    def __init__(self, cfg):
+        self.cfg = cfg
+        self.pairs = []             # (s_old, s_new, dh)
+        self._cache = (None, None, 0)   # (s, fit, pairs added since)
+
+    def reset(self):
+        self.pairs = []
+        self._cache = (None, None, 0)
+
+    def add(self, ds, dh, s_new):
+        if ds < self.cfg["drift_min_ds_m"]:
+            return
+        self.pairs.append((s_new - ds, s_new, dh))
+        lim = s_new - self.cfg["drift_window_m"]
+        cap = int(self.cfg["drift_max_pairs"])
+        if len(self.pairs) > cap + 50 or self.pairs[0][0] < lim:
+            self.pairs = [p for p in self.pairs if p[0] >= lim][-cap:]
+        s0, fit, n = self._cache
+        self._cache = (s0, fit, n + 1)
+
+    def estimate(self, s_now):
+        """DriftFit or None (too few revisits, implausible drift). Refitted when
+        the robot moved drift_refit_m or drift_refit_pairs revisits came in (a few ms
+        each);
+        in between the last fit holds (D of now is then its short extrapolation)."""
+        s0, fit, n = self._cache
+        if s0 is not None and 0.0 <= s_now - s0 < self.cfg["drift_refit_m"] and n < self.cfg["drift_refit_pairs"]:
+            return fit
+        cfg = self.cfg
+        lo = s_now - cfg["drift_window_m"]
+        P = [p for p in self.pairs if p[0] >= lo and p[1] <= s_now + 1e-6]
+        fit = None
+        if len(P) >= cfg["drift_min_pairs"]:
+            a = np.array(P)
+            if (a[:, 1] - a[:, 0]).sum() >= cfg["drift_min_span_m"]:
+                fit = self._fit(a, s_now)
+        self._cache = (s_now, fit, 0)
+        return fit
+
+    def _fit(self, a, s_now):
+        cfg = self.cfg
+        step = cfg["drift_knot_m"]
+        s0 = float(a[:, 0].min())
+        n = max(2, int(math.ceil((s_now - s0) / step)) + 1)
+        knots = s_now - step * np.arange(n)[::-1]
+
+        # Each revisit is a sparse row: D(s_new) - D(s_old), two knots each. The
+        # normal equations (n x n, n ~ 31) are summed with bincount and solved
+        # small, with no BLAS call on the ~500-row system (a multi-threaded
+        # OpenBLAS spun its threads there: 58 % of a core at 4 Hz).
+        def basis(s):
+            s = np.clip(s, knots[0], knots[-1])
+            i = np.clip(((s - knots[0]) / step).astype(np.int64), 0, n - 2)
+            f = (s - knots[i]) / step
+            return i, f
+        i_n, f_n = basis(a[:, 1])
+        i_o, f_o = basis(a[:, 0])
+        C = np.stack([i_n, i_n + 1, i_o, i_o + 1], axis=1)              # m x 4 columns
+        V = np.stack([1.0 - f_n, f_n, f_o - 1.0, -f_o], axis=1)          # m x 4 values
+        b = a[:, 2]
+        pair_idx = (C[:, :, None] * n + C[:, None, :]).ravel()
+        vv = (V[:, :, None] * V[:, None, :]).reshape(len(b), 16)
+        reg = np.zeros((n, n))
+        lam2 = cfg["drift_smooth"] ** 2
+        for j in range(n - 2):                  # curvature penalty (1, -2, 1)
+            for p_, cp in zip(range(j, j + 3), (1.0, -2.0, 1.0)):
+                for q_, cq in zip(range(j, j + 3), (1.0, -2.0, 1.0)):
+                    reg[p_, q_] += lam2 * cp * cq
+        reg[-1, -1] += 100.0                    # D(now) = 0
+        reg += 1e-9 * np.eye(n)
+        w = np.ones(len(b))
+        x = np.zeros(n)
+        mad = 0.0
+        for _ in range(3):
+            w2 = w * w
+            AtA = np.bincount(pair_idx, (vv * w2[:, None]).ravel(), n * n).reshape(n, n)
+            Atb = np.bincount(C.ravel(), (V * (w2 * b)[:, None]).ravel(), n)
+            x = _solve_spd(AtA + reg, Atb)
+            r = b - (V * x[C]).sum(axis=1)
+            mad = float(np.median(np.abs(r))) * 1.4826 + 1e-4
+            w = 1.0 / np.maximum(1.0, np.abs(r) / (2.0 * mad))
+        fit = DriftFit(knots, x, s0, max(cfg["drift_sigma_min_m"], 1.25 * mad))
+        if abs(fit.rate) > cfg["drift_max_rate"]:
+            return None
+        return fit
 
 
 # --------------------------------------------------------------------------
@@ -717,6 +894,7 @@ class GrassEngine(object):
         self.calib = calib or Calib()
         self.on_cell = on_cell or (lambda *a: None)
         self.track = Track(self.cfg)
+        self.drift = Drift(self.cfg)
         self._epoch = self.track.epoch
         # (col, row) -> (alt, t, epoch, track s) ground under the wheels
         self.ground = {}
@@ -754,6 +932,7 @@ class GrassEngine(object):
         may meet anything measured on the new one."""
         self._epoch = self.track.epoch
         self.ground.clear()
+        self.drift.reset()
         self.recent = []
 
     # ---- deferred resolution ---------------------------------------------------
@@ -843,25 +1022,45 @@ class GrassEngine(object):
         self.stats["resolved_wheels" if source == SRC_WHEELS else "resolved_dem"] += 1
 
     def _stamp_wheels(self, t, x, y, R, h):
-        pts = np.array([[wx, wy, 0.0] for wx, wy in WHEELS_XY]) @ R.T
+        pts = np.array([[wx, wy, 0.0] for wx, wy in BODY_XY]) @ R.T
         cols, rows = self._cells(pts[:, 0] + x, pts[:, 1] + y)
         ep, s_now = self.track.epoch, self.track.s
+        drift = self.drift.estimate(s_now)
+        done = set()
         for col, row, dz in zip(cols, rows, pts[:, 2]):
             key = (int(col), int(row))
+            if key in done:
+                continue                # one stamp per cell and frame (the first, front-most)
+            done.add(key)
+            old = self.ground.get(key)
+            if old is not None and old[2] == ep:
+                # the wheels are back on a cell they stamped earlier: the altitude
+                # difference over the track between is the drift
+                self.drift.add(s_now - old[3], h + dz - old[0], s_now)
             self.ground[key] = (h + dz, t, ep, s_now)
             obs = self.pending.get(key)
-            # the altitude is integrated: trust it over a few metres only
-            if (obs is not None and obs[3] == ep
-                    and s_now - obs[4] <= self.cfg["wheel_max_track_m"]):
+            # the altitude is integrated: trust it over a few metres, or as far as
+            # the drift curve reaches
+            lim = self.cfg["wheel_max_track_m"]
+            if drift and obs is not None and obs[4] >= drift.s_min:
+                lim = max(lim, self.cfg["drift_use_max_m"])
+            if obs is not None and obs[3] == ep and s_now - obs[4] <= lim:
                 raw = float(np.median(obs[1])) - (h + dz)
-                if self.cfg["z_lo"] < raw < self.cfg["z_hi"]:
-                    # An IMU pitch error cancels when the robot drove straight from the
-                    # look to the cell (levelling and integration tilt alike); what
-                    # the path wandered off the straight line carries it.
-                    cx, cy = self._centre(*key)
-                    direct = math.hypot(cx - obs[5][0], cy - obs[5][1])
-                    wander = max(0.0, s_now - obs[4] - direct) + 0.1
+                # An IMU pitch error cancels when the robot drove straight from the
+                # look to the cell (levelling and integration tilt alike); what
+                # the path wandered off the straight line carries it: removed with
+                # the drift curve when known (its uncertainty stays), else a sigma.
+                # The tops carry the drift of s_look + direct (where straight driving
+                # would have stamped the cell), the ground that of now.
+                cx, cy = self._centre(*key)
+                direct = math.hypot(cx - obs[5][0], cy - obs[5][1])
+                wander = max(0.0, s_now - obs[4] - direct) + 0.1
+                if drift and s_now - obs[4] > self.cfg["wheel_max_track_m"]:
+                    raw -= float(drift.corr(s_now, obs[4] + direct))
+                    sig = 5.0 + 1000.0 * drift.sigma
+                else:
                     sig = 5.0 + 1000.0 * wander * math.tan(math.radians(self._bias_deg()))
+                if self.cfg["z_lo"] < raw < self.cfg["z_hi"]:
                     self._resolve(key, raw * 1000.0, t, SRC_WHEELS, sig)
                 else:
                     self.pending.pop(key, None)
@@ -869,7 +1068,7 @@ class GrassEngine(object):
             self._prune_ground()
 
     def _prune_ground(self):
-        lim = self.cfg["wheel_max_track_m"]
+        lim = max(self.cfg["wheel_keep_m"], self.cfg["wheel_max_track_m"])
         s_now, ep = self.track.s, self.track.epoch
         for k in [k for k, g in self.ground.items() if g[2] != ep or s_now - g[3] > lim]:
             del self.ground[k]
@@ -877,10 +1076,15 @@ class GrassEngine(object):
             keep = sorted(self.ground.items(), key=lambda kv: kv[1][1])[-self.cfg["ground_max"] // 2:]
             self.ground = dict(keep)
 
-    def _wheel_ground(self, keys):
+    def _wheel_ground(self, keys, drift=None):
         """(altitude, track distance since stamped) of cells the wheels know in
-        this epoch within wheel_max_track_m; NaN elsewhere."""
-        ep, s_now, lim = self.track.epoch, self.track.s, self.cfg["wheel_ahead_max_m"]
+        this epoch within wheel_ahead_max_m (drift_use_max_m with a drift rate);
+        NaN elsewhere."""
+        ep, s_now = self.track.epoch, self.track.s
+        lim = self.cfg["wheel_ahead_max_m"]
+        if drift:
+            lim = min(max(lim, self.cfg["drift_use_max_m"]), s_now - drift.s_min)
+            lim = max(lim, self.cfg["wheel_ahead_max_m"])
         alt = np.full(len(keys), np.nan)
         dist = np.full(len(keys), np.nan)
         for i, k in enumerate(keys):
@@ -888,6 +1092,35 @@ class GrassEngine(object):
             if g is not None and g[2] == ep and s_now - g[3] <= lim:
                 alt[i], dist[i] = g[0], s_now - g[3]
         return alt, dist
+
+    def _partial_ground(self, gw, kn, cxy, fwd_d, pose, R, h):
+        """Ground of a corridor the wheels know only partly (the previous lane on
+        one side): a plane through the robot's own footprint (the four contacts,
+        now) and the known cells ahead, robust. Returns (ground of every cell with
+        the known ones kept, extra sigma mm) or None when the known cells do not
+        lie on one plane (terrain bends) within wheels_partial_resid_mm."""
+        cfg = self.cfg
+        yaw = pose[2]
+        lat = -(cxy[:, 0] - pose[0]) * math.sin(yaw) + (cxy[:, 1] - pose[1]) * math.cos(yaw)
+        foot = np.array([[wx, wy, 0.0] for wx, wy in BODY_XY])
+        fz = h + (foot @ R.T)[:, 2]
+        d = np.r_[foot[:, 0], fwd_d[kn]]
+        l = np.r_[foot[:, 1], lat[kn]]
+        z = np.r_[fz, gw[kn]]
+        w = np.r_[np.full(len(foot), 1.0), np.full(int(kn.sum()), 3.0)]
+        a, b, c, r = _robust_plane(d, l, z, w=w)
+        rk = r[len(foot):]
+        resid = 1000.0 * float(np.sqrt(np.median(rk ** 2)))
+        if resid > cfg["wheels_partial_resid_mm"]:
+            return None
+        plane = a + b * fwd_d + c * lat
+        g = np.where(kn, gw, plane)
+        # reach sideways beyond the known cells: a side slope change of up to
+        # drift_deg*4 (2 deg) over that distance is not seen
+        lo, hi = lat[kn].min(), lat[kn].max()
+        gap = float(np.max(np.maximum(0.0, np.maximum(lo - lat, lat - hi))))
+        extra = math.hypot(resid, 1000.0 * gap * math.tan(math.radians(4.0 * cfg["drift_deg"])))
+        return g, extra
 
     def _dem_offset(self, dem, x, y, R, h):
         """Track altitude minus DEM elevation under the robot now (so that
@@ -1043,8 +1276,12 @@ class GrassEngine(object):
                 canopy_alt.append(top)
                 off = np.nan if dem_off is None else dem_off
                 ob = self.pending.get(key)
-                if ob is None or ob[3] != self.track.epoch:
-                    if len(self.pending) < cfg["pending_max"]:
+                if (ob is None or ob[3] != self.track.epoch
+                        or self.track.s - ob[4] > cfg["wheel_max_track_m"]):
+                    # first look, or a look from a later pass (the next lane): a
+                    # fresh observation, the old pass did not get its wheels in time
+                    # and its tops sit on another drift of the altitude
+                    if ob is not None or len(self.pending) < cfg["pending_max"]:
                         self.pending[key] = [t, [top], [off], self.track.epoch, self.track.s,
                                              (pose[0], pose[1])]
                 else:
@@ -1058,7 +1295,16 @@ class GrassEngine(object):
         xc_c = an["x_c"]
         if keys:
             ca = np.array(canopy_alt)
-            gw, gdist = self._wheel_ground(keys)
+            drift = self.drift.estimate(self.track.s)
+            gw, gdist = self._wheel_ground(keys, drift)
+            cxy_all = np.array([self._centre(*k) for k in keys])
+            fwd_d = ((cxy_all[:, 0] - pose[0]) * math.cos(yaw)
+                     + (cxy_all[:, 1] - pose[1]) * math.sin(yaw))
+            if drift:
+                # the carpet of a cell d ahead carries the drift of s_now + d, its
+                # ground the drift of when it was stamped: bring the ground over
+                s_now = self.track.s
+                gw = np.where(np.isfinite(gw), gw + drift.corr(s_now - np.nan_to_num(gdist), s_now + fwd_d), np.nan)
             bad = ~((ca - gw > cfg["z_lo"]) & (ca - gw < cfg["z_hi"]))
             gw[bad] = np.nan
             frac_w = np.isfinite(gw).mean()
@@ -1068,12 +1314,31 @@ class GrassEngine(object):
                 gd[~((ca - gd > cfg["z_lo"]) & (ca - gd < cfg["z_hi"]))] = np.nan
             frac_d = np.isfinite(gd).mean() if gd is not None else 0.0
             pick = None
-            if frac_w >= cfg["wheels_min_frac"]:
-                ok = np.isfinite(gw)
+            kn = np.isfinite(gw)
+            partial = None
+            if (frac_w < cfg["wheels_min_frac"] and kn.sum() >= cfg["wheels_partial_min_cells"]
+                    and fwd_d[kn].max() >= x0 + 0.3 * (x1 - x0)):
+                partial = self._partial_ground(gw, kn, cxy_all, fwd_d, pose, R, h)
+            if frac_w >= cfg["wheels_min_frac"] or partial is not None:
+                ok = kn
                 pick, source = gw, "wheels"
                 # the integrated altitude drifts with the track between the two looks
-                sigma_g = 5.0 + 1000.0 * (float(np.median(gdist[ok])) + xc_c) * math.tan(
-                    math.radians(max(self.cfg["drift_deg"], self._bias_deg())))
+                span = float(np.median(gdist[ok] + fwd_d[ok]))
+                out["ground_track_m"] = round(span, 1)
+                if drift:
+                    out["drift_rate"] = round(drift.rate, 4)
+                    # short spans hardly drift, long ones carry the curve's error
+                    sigma_g = 5.0 + 1000.0 * min(drift.sigma, abs(span) * math.tan(
+                        math.radians(max(self.cfg["drift_deg"], self._bias_deg()))))
+                else:
+                    sigma_g = 5.0 + 1000.0 * (float(np.median(gdist[ok])) + xc_c) * math.tan(
+                        math.radians(max(self.cfg["drift_deg"], self._bias_deg())))
+                if partial is not None:
+                    # the rest of the corridor from the plane through the footprint
+                    # and the known cells; its fit and the reach sideways add up
+                    pick, extra = partial
+                    sigma_g = math.hypot(sigma_g, extra)
+                    out["ground_cells_frac"] = round(float(frac_w), 2)
             elif frac_d >= cfg["wheels_min_frac"]:
                 pick, source, sigma_g = gd, "dem", 15.0
             if pick is not None:
@@ -1086,6 +1351,22 @@ class GrassEngine(object):
                 if np.ptp(d) > 0.3:
                     k = np.polyfit(d, pick[ok], 1)
                     slope_deg = math.degrees(math.atan(k[0]))
+                    # Ground from long ago (drift curve) must follow a terrain change
+                    # the carpet shows: if the carpet tilts against the body and the
+                    # "grass" over that ground grows along the corridor by more than
+                    # the terrain-change slope, the old ground does not fit here
+                    # (2026-11-08: 4 frames of 120-155 mm into a dip, layer <= 80).
+                    # Checked where it would claim grass over the cut: a wrong low
+                    # ground there makes false tall grass (below the cut it agreed
+                    # with the layer: |error| > 2 sigma in 1-2 %)
+                    if (source == "wheels" and out.get("ground_track_m", 0.0) > cfg["wheel_ahead_max_m"]
+                            and abs(an["slope_rel_deg"]) > cfg["slope_change_deg"]
+                            and classify(self.calib.height(raw), cut) != "below_cut"):
+                        kh = np.polyfit(d, ca[ok] - pick[ok], 1)[0]
+                        if abs(math.degrees(math.atan(kh))) > cfg["slope_change_deg"]:
+                            out.update(terrain_source=source, slope_deg=round(slope_deg, 1),
+                                       reason="terrain_change")
+                            return done(out)
         if source is None:
             # Extrapolation. The terrain ahead keeps the SMOOTHED slope of the
             # track, not the body's instantaneous plane (the body rocks on tufts).
@@ -1208,10 +1489,29 @@ def latest_records(records):
     return list(keep.values())
 
 
+IMU_STEADY_MAX_DEG = 0.3      # p90-p10 of a record's IMU pitch; more = the IMU was not steady
+
+
+def imu_steady(r):
+    """A record's IMU pitch is usable: present and steady over its frames (a robot
+    standing still reads within ~0.1 deg; on 2026-11-08 one record swung +-2 deg
+    while its depth strips did not move at all: an IMU fault, not a tilt)."""
+    if r.get("imu_pitch_deg") is None:
+        return False
+    spread = r.get("imu_pitch_spread_deg")
+    return spread is None or spread <= IMU_STEADY_MAX_DEG
+
+
 def fit_calibration(records, noise_max_mm=5.0, valid_min=0.5, allow_single_direction=False):
     """records: dicts written by grass_calib record (label, true_mm, x, plane,
     strips, frames). Returns (Calib, report dict). Raises ValueError when
     concrete is missing."""
+    warnings = []
+    for r in records:
+        if r.get("imu_pitch_deg") is not None and not imu_steady(r):
+            warnings.append("IMU pitch unsteady during %s (spread %.1f deg, robot still?): the "
+                            "record is left out (no scale, no IMU offset): record it again"
+                            % (r.get("_file") or r["label"], r["imu_pitch_spread_deg"]))
     beton = [r for r in records if r["label"] == "beton"]
     if not beton:
         raise ValueError("no beton record: concrete gives the camera zero")
@@ -1243,18 +1543,16 @@ def fit_calibration(records, noise_max_mm=5.0, valid_min=0.5, allow_single_direc
     noise = [s["noise_mm"] for r in beton for s in r["strips"]
              if s.get("noise_mm") is not None and 0.75 <= s["x"] <= 1.65]
 
-    warnings = []
     # IMU: body attitude on the concrete = reference. A lawn record stood on
     # another attitude: the level ground there appears at z = x tan(dpitch).
-    pb = [r["imu_pitch_deg"] for r in beton if r.get("imu_pitch_deg") is not None]
+    pb = [r["imu_pitch_deg"] for r in beton if imu_steady(r)]
     p_ref = float(np.median(pb)) if pb else None
     # IMU pitch offset against the body: concrete both ways (yaw 180 deg apart),
     # the slope of the concrete cancels in the mean
     pairs = []
     for i, r1 in enumerate(beton):
         for r2 in beton[i + 1:]:
-            if None in (r1.get("yaw_deg"), r2.get("yaw_deg"), r1.get("imu_pitch_deg"),
-                        r2.get("imu_pitch_deg")):
+            if None in (r1.get("yaw_deg"), r2.get("yaw_deg")) or not (imu_steady(r1) and imu_steady(r2)):
                 continue
             dy = abs((r1["yaw_deg"] - r2["yaw_deg"] + 180.0) % 360.0 - 180.0)
             if dy > 150.0:
@@ -1280,9 +1578,11 @@ def fit_calibration(records, noise_max_mm=5.0, valid_min=0.5, allow_single_direc
         s = r.get("sample") or {}
         if s.get("p90_mm") is None:
             continue
+        if r.get("imu_pitch_deg") is not None and not imu_steady(r):
+            continue                 # the robot or the IMU moved: no sample for the scale
         raw = s["p90_mm"] - plane(s["x"])
         dp = 0.0
-        if p_ref is not None and r.get("imu_pitch_deg") is not None:
+        if p_ref is not None and imu_steady(r):
             dp = r["imu_pitch_deg"] - p_ref
             raw -= s["x"] * math.tan(math.radians(dp)) * 1000.0
         pts.append((r["label"], float(r["true_mm"]), raw, r["x"], r.get("rough_mm"), dp))

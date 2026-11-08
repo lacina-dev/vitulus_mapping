@@ -37,7 +37,9 @@ program neběží), vzorek leží **přímo před robotem**. Každý záznam trv
    směru). Seznam: `grass_calib list`; smazat štítek: `grass_calib clear
    --label posekano`. Starší sadu vybereš `fit --session 20261108`, všechny
    záznamy `fit --all`.
-6. **Výpočet.** `grass_calib fit`. Vypíše nulu kamery (offset, sklon), chybu
+6. **Výpočet.** `grass_calib fit`. Záznam, při kterém IMU neukazovalo stálý
+   sklon (rozptyl přes 0,3°, robot se hýbal nebo IMU zlobí), se vyřadí (nedává
+   měřítko ani offset IMU); `record` i `fit` to vypíšou (VAROVÁNÍ: nahraj znovu). Vypíše nulu kamery (offset, sklon), chybu
    sklonu IMU, měřítko (`true = k * raw`, beton je bod 0,0, žádný další
    posun), průměrnou odchylku každého štítku a chyby na každém vzorku (sklon
    robota proti betonu podle IMU je u každého vzorku opravený) a doporučenou
@@ -89,7 +91,9 @@ respawn:=false`, aby si uzel při startu stacku převzal jeho launch.
   (`wheels` | `dem` | `extrapolated` | `surface`), `slope_deg` (sklon terénu
   vpřed, + do kopce), `confidence` (pravděpodobnost, že třída sedí),
   `uncertainty_mm`, `reason` (`terrain_change`, `low_confidence`, `no_data`,
-  `uncalibrated`). Na hraně posekané a neposekané trávy navíc `lane_edge`,
+  `uncalibrated`). Se zemí z kol navíc `ground_track_m` (kolik stopy zpět
+  kola zem razítkovala), `drift_rate` (sklon křivky driftu, m/m) a při
+  částečném pokrytí `ground_cells_frac`. Na hraně posekané a neposekané trávy navíc `lane_edge`,
   `lanes_mm` (výška každého pruhu), `max_lane_mm`, `min_lane_mm`,
   `min_lane_class`; `height_mm` a `class` jsou pak vysokého pruhu.
 - Vrstva mapy `grass`: `/map_objects/layer/grass` (stejný formát jako coverage/
@@ -119,16 +123,23 @@ Kamera vidí jen vrch porostu („koberec“), nikdy zem pod ním. Proto:
    svahu), se zahodí; zahodí se tak i buňka rozpůlená hranou posekané trávy,
    hranu nesou buňky vedle. Při ukončení uzlu se nejdřív rozliší čekající
    buňky (DEM), pak se uloží mřížka.
-   Kola rozhodují jen buňky viděné nejvýš 4 m stopy zpět (integrovaná výška
-   ujíždí); odchylka sklonu IMU se odečte podle kalibrace. Chyba sklonu se
+   Kola rozhodují buňky viděné nejvýš 4 m stopy zpět (integrovaná výška
+   ujíždí), se známou křivkou driftu (viz níž) až 110 m; odchylka sklonu IMU
+   se odečte podle kalibrace. Buňka, kterou kamera uvidí znovu z dalšího
+   pruhu (víc než 4 m stopy od prvního pohledu), začne pozorování znovu. Chyba sklonu se
    ruší, když robot jel od pohledu k buňce rovně; nejistota buňky roste s tím,
    o kolik cesta uhnula z přímky (zatáčky, otočky), a buňka, jejíž třídu
    nejistota neunese, se do vrstvy nezapíše. Jedna epocha =
    jedna souvislá výška: skok pózy nebo mezera začne novou a staré buňky kol
    se zahodí.
-2. **Okamžitý odhad.** Zem v koridoru = buňky, které kola znají nejvýš 3 m
-   stopy zpět (nejistota roste s touto vzdáleností), jinak DEM, jinak terén
-   protažený dopředu. Protahuje se **vyhlazený** sklon stopy (medián za
+2. **Okamžitý odhad.** Zem v koridoru = buňky, které kola znají (bez křivky
+   driftu nejvýš 3 m stopy zpět, s ní až 110 m — typicky stopa předchozího
+   pruhu), jinak DEM, jinak terén protažený dopředu. Když kola znají aspoň
+   polovinu buněk koridoru, bere se medián přes ně; když jen část (aspoň 2
+   buňky, i v předních 70 % koridoru), proloží se rovina stopou robota (čtyři
+   kontakty teď) a známými buňkami a zbytek koridoru se čte z ní — jen když
+   známé buňky na rovině leží do 20 mm; nejistota roste s tím, jak daleko do
+   strany od známých buněk rovina sahá (`ground_cells_frac` ve výstupu). Protahuje se **vyhlazený** sklon stopy (medián za
    poslední 1 m a nejvýš 3 s), ne okamžitá rovina kol, takže kývání těla na
    drnech se nepočítá jako tráva. Když ale koberec i nejnižší pruh leží s
    okamžitou rovinou těla (do 3°) a sedí s ní líp než s mediánem, tělo už je
@@ -161,6 +172,69 @@ Kamera vidí jen vrch porostu („koberec“), nikdy zem pod ním. Proto:
      (± 20 mm) je holý povrch (`surface`). O trávě rozhoduje výška nad zemí,
      drsnost jen podpůrně: hustá rovnoměrná tráva vysoko nad zemí je tráva.
 
+## Drift výšky z kol (2026-11-08)
+
+Výška robota se integruje ze sklonu IMU a pohybu. Za jízdy s nožem IMU ukazuje
+sklon o 1,3° jinak než v klidu (vibrace nože; v klidu kalibrace 0,94°), takže
+integrovaná výška ujíždí ~2,1 cm na metr stopy (test 8. 11.: 4,7 m za 228 m,
+s nožem 2,3 %, bez nože 0,8 %). Na blízko se chyba ruší (koberec i zem jsou
+vyjádřeny stejným sklonem), ale zem ze stopy předchozího pruhu (10–60 m stopy
+zpět) byla nepoužitelná, a proto byl okamžitý odhad z 95 % extrapolace.
+
+Kola teď razítkují celou stopu robota (3 × 5 bodů: nápravy a střed, kola,
+půl cesty, osa) do buněk 0,2 m a drží je 120 m stopy. Když kola přejedou buňku,
+kterou už razítkovala (≥ 3 m stopy dřív), rozdíl výšek je drift mezi těmi dvěma
+místy stopy. Z těchto návratů se prokládá **křivka driftu** D(s) (po částech
+lineární, uzel každé 4 m za posledních 120 m stopy, nejmenší čtverce s penalizací
+zakřivení, odlehlé hodnoty potlačené, D(teď) = 0) a zem z dřívějška se převede
+na drift chvíle, kdy se kamera dívá. Kauzální ověření na záznamu 8. 11.: chyba
+převodu medián 15 mm na jakékoli vzdálenosti 3–70 m (jeden lineární sklon dával
+30–37 mm na 15–45 m). Nejistota země = rozptyl návratů (≥ 8 mm). Křivka platí
+až po 20 návratech se součtem 60 m stopy; nová epocha ji zahodí i se zemí z kol.
+Nová epocha = mezera nad 2 s, spánek, nebo **skok pózy**: krok delší než
+0,15 m + 0,8 m/s × čas mezi snímky (při 4 Hz 0,35 m; robot jezdí do 0,5 m/s),
+nejvýš 1 m. Dřív se skok pod 1 m nepoznal a zem z kol se porovnávala přes něj
+(simulace skoku 0,5–0,9 m: falešné `>+4cm` s jistotou ~1). Výpočet je malá
+soustava normálních rovnic (31 × 31, Choleského rozklad v numpy, bez BLAS):
+při 4 Hz 2 % jádra jako dřív (soustava ~500 × 31 přes `lstsq` budila
+vícevláknový OpenBLAS: 58 % jádra); uzel navíc nastaví `OPENBLAS_NUM_THREADS`,
+`OMP_NUM_THREADS`, `MKL_NUM_THREADS` na 1. Křivka se počítá nejvýš jednou za
+0,5 m stopy nebo 30 návratů.
+
+Zem z dávna (přes křivku, víc než 3 m stopy) musí sedět na změnu terénu: když
+se koberec proti tělu sklání víc než 2,5° a „tráva“ nad touto zemí by byla nad
+výškou sečení a podél koridoru roste strměji než 2,5°, stará zem sem nepatří →
+`unknown`, `terrain_change` (8. 11.: 4 snímky 120–155 mm při sjezdu do dolíku,
+vrstva tam ≤ 80 mm).
+
+Přehrání 2. běhu 8. 11. (bag `terrain_mow_2026-11-08_15-50-05`, 2 860 snímků
+hloubky, kalibrace z robota, DEM z robota), koridor v zóně při sečení
+(1 428 snímků):
+
+| | před | po |
+|---|---|---|
+| `unknown` | 52,8 % (terrain_change 416, low_confidence 328) | **24,8 %** (201 / 143) |
+| zdroj země | extrapolace 95 %, kola 1 % | kola 62 %, extrapolace 35 % |
+| `>+4cm` | 17 (kola 1) | 9 (kola 1; ostatní DEM a extrapolace) |
+| výška p25/50/75 | 27 / 46 / 57 mm | 20 / 37 / 55 mm |
+| chyba proti vrstvě (buňky přejeté koly hned) | extrapolace +9 mm (IQR 32) | kola −2 mm (IQR 35), mimo 2σ 2 % |
+
+V záznamu je jeden skutečný skok pózy (snímek 1292: 0,39 m za 0,27 s), od něj
+se zem z kol staví znovu: před skokem 20,8 % `unknown`, po něm 27,3 %. Bez
+detekce skoku vycházelo 18,3 %, ale za cenu porovnání země přes skok.
+
+Vrstva: stejné buňky beze změny (medián rozdílu 0 mm), o 14 % buněk víc.
+Přehrání ukládaného záznamu `/grass/ahead` z robota sedí se starým kódem
+(46 % unknown / medián 46 mm na robotu proti 53 % / 46 mm v přehrání).
+
+**Výška proti pravítku.** Starý medián 46 mm byl nadsazený extrapolací (dolík
+se započte, kopeček ne) a výběrem (rozhodnuté snímky končí u ~80 mm, zbytek
+`unknown`). Proti zemi z kol má trávník zóny vrch porostu ~35 mm nad rovinou
+kol; stejná metoda na stojícím robotu v místě kalibrace dává 56 mm (pravítko
+72 mm). Za jízdy ani s nožem se nic neztrácí (stojící robot v zóně 46 mm,
+jedoucí 45 mm, obojí extrapolací). Zóna tedy měla kratší trávu než místo
+kalibrace; posun mm proti pravítku je věc kalibrace (níže).
+
 ## Parametry
 
 `config/grass_height.yaml` (koridor x 0,8–1,6 m, |y| < 0,35 m, `rate_hz`,
@@ -168,6 +242,13 @@ Kamera vidí jen vrch porostu („koberec“), nikdy zem pod ním. Proto:
 koridor z `grass_calib fit` má přednost před konfigurací.
 
 ## Ověřeno
+
+- Návraty kol a křivka driftu: nelineární drift (2,1 cm/m + vlna) zpětně
+  ze šumových návratů, pruhy tam a zpět po zvlněném terénu (sklon do 6°) s
+  chybou IMU 1,3°: v dalších pruzích < 20 % `unknown`, výška 46 ± 8 mm, žádná
+  falešná třída, neposekaná tráva vedle posekaných pruhů zůstane `>+4cm`,
+  skok pózy 0,5 / 0,7 / 0,9 m podél pruhu → nová epocha, žádná falešná třída
+  (`test/test_grass.py`, třída `Drift`).
 
 - Syntetické snímky (rovina, schod betonu, svah s trávou, vysoká tráva, okraj
   posekaného pruhu, jízda přes rampu) a scénáře nezávislé kontroly (skok pózy
@@ -209,6 +290,15 @@ ladění na syntetických scénářích už má malý přínos.
   8–10 cm se hlásí výška tráva + schod, třída tak může vyjít o stupeň výš
   (`+2-4cm` → `>+4cm`). Vědomý důsledek kritéria spodku (D41: neladit na
   syntetice, ověřit na datech).
+- **Kalibrace 8. 11. nesedí na přímku.** Posekaná tráva (pravítko 72 mm,
+  kamera 57 mm nad rovinou kol) a vysoká (120 mm, kamera 117 mm, s opravou
+  sklonu 136 mm) nejdou jedním měřítkem přes nulu betonu: `fit` (bez záznamu
+  s nestálým IMU) dává 0,979 (posekaná −15 mm, vysoká +13 mm, VAROVÁNÍ). Pravděpodobně kola stojí na
+  drnu nad nulou pravítka (posun, který model bez posunu nepřipouští) a
+  pravítko u vysoké trávy čte níž než kamera. Změřit znovu v zóně, kde se
+  seče; o posunu na trávníku rozhodnout (testy kalibrace ho zatím zakazují).
+- **DEM starší jízdy** dává v trávníku proti zemi z kol o +26 mm vyšší trávu
+  s nejistotou jen 15 mm (DEM z 1. 11., `trajectory_dem` od té doby nepsal).
 - **Svislé plochy vedle stopy** (zeď, plot, bok bedny) se mohou vyhodnotit
   jako hrana neposekané trávy (`>+4cm`): body na svislé ploše mají spodek u
   země a hrubý vrch a za plochou nejsou pruhy. Výstup `/grass/ahead` zatím

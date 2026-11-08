@@ -319,6 +319,22 @@ class Calibration(unittest.TestCase):
         cal, rep = grass.fit_calibration(recs, allow_single_direction=True)
         self.assertAlmostEqual(cal.scale, 1.25, delta=0.01)
 
+    def test_unsteady_imu_record_is_left_out(self):
+        # 2026-11-08: the IMU swung +-2 deg during a record while the depth did
+        # not move (median 0.02 vs 0.92 deg): its "tilt" added 25 mm to the sample
+        plane = lambda x, y: 0.0  # noqa: E731
+        recs = [self.record("beton", 0.0, 1.0, plane, pitch=0.9, yaw=0.0),
+                self.record("beton", 0.0, 1.0, plane, pitch=0.9, yaw=180.0),
+                self.record("posekano", 40.0, 1.0, plane, 32.0, pitch=0.9),
+                self.record("vysoka", 120.0, 1.0, plane, 96.0, pitch=0.0)]
+        recs[3]["imu_pitch_spread_deg"] = 2.2
+        cal, rep = grass.fit_calibration(recs)
+        self.assertAlmostEqual(cal.scale, 1.25, delta=0.01)
+        self.assertTrue([w for w in rep["warnings"] if "unsteady" in w], rep["warnings"])
+        recs[3]["imu_pitch_spread_deg"] = 0.1          # steady: the tilt is corrected
+        cal2, _ = grass.fit_calibration(recs)
+        self.assertNotAlmostEqual(cal2.scale, 1.25, delta=0.02)
+
     def test_imu_offset_from_concrete_both_ways(self):
         # concrete sloping 1 deg, IMU 0.4 deg off: 1.4 one way, -0.6 the other
         plane = lambda x, y: 0.0  # noqa: E731
@@ -791,6 +807,150 @@ class Review3(unittest.TestCase):
                 wrong += 1
         self.assertLessEqual(wrong, 2)
 
+
+def world_carpet(pose, ground, grass_mm, R, z_robot, n=6000, lo=0.3):
+    """Body-frame points of the corridor over a WORLD terrain (ground(X, Y)), the
+    robot at pose with true attitude R and altitude z_robot."""
+    x = RNG.uniform(0.6, 1.8, n)
+    y = RNG.uniform(-0.4, 0.4, n)
+    c, s_ = math.cos(pose[2]), math.sin(pose[2])
+    X, Y = pose[0] + c * x - s_ * y, pose[1] + s_ * x + c * y
+    g = grass_mm(X, Y) if callable(grass_mm) else grass_mm
+    Z = ground(X, Y) + g / 1000.0 * RNG.uniform(lo, 1.0, n)
+    W = np.c_[X - pose[0], Y - pose[1], Z - z_robot]
+    return W @ R          # R^T applied row-wise: world -> body
+
+
+def mow_lanes(ground, grass_mm, bias_deg, lanes=8, length=6.0, gap=0.3, cut_mm=60.0, cells=None,
+              jump=None):
+    """Back-and-forth mowing lanes over a world terrain, IMU pitch off by
+    bias_deg (blade vibration); jump = (lane, dx, dy): from the start of that lane
+    the REPORTED pose is off by dx, dy (a GNSS jump). Returns the outputs per lane."""
+    e = grass.GrassEngine(calib=calibrated(), on_cell=(lambda *a: cells.append(a)) if cells is not None else None)
+    t, outs = 0.0, []
+    def frame(X, Y, yaw, k):
+        fx, fy = math.cos(yaw), math.sin(yaw)
+        zf = ground(np.array([X + 0.125 * fx]), np.array([Y + 0.125 * fy]))[0]
+        zr = ground(np.array([X - 0.125 * fx]), np.array([Y - 0.125 * fy]))[0]
+        pitch = -math.atan2(zf - zr, 0.25)
+        R = grass.rot_rpy(0.0, pitch, yaw)
+        P = world_carpet((X, Y, yaw), ground, grass_mm, R, 0.5 * (zf + zr))
+        px, py = (X + jump[1], Y + jump[2]) if jump and k >= jump[0] else (X, Y)
+        return e.frame(t, P, (px, py, yaw), (0.0, pitch + math.radians(bias_deg)), cut_mm=cut_mm)
+
+    for k in range(lanes):
+        yaw = 0.0 if k % 2 == 0 else math.pi
+        lane = []
+        if k:
+            # over to the next lane at driving speed (no pose jump)
+            X0 = length if k % 2 == 1 else 0.0
+            for j in range(1, int(gap / 0.075) + 1):
+                frame(X0, (k - 1) * gap + j * gap / (int(gap / 0.075) + 1), math.pi / 2, k - 1)
+                t += 0.25
+        for i in range(int(length / 0.075)):
+            d = i * 0.075
+            X = d if k % 2 == 0 else length - d
+            lane.append(frame(X, k * gap, yaw, k))
+            t += 0.25
+        outs.append(lane)
+    return e, outs
+
+
+class Drift(unittest.TestCase):
+    """Drift of the integrated altitude removed from wheel revisits (2026-11-08:
+    1.3 deg IMU pitch error with the blade on, 52 % unknown on an undulating lawn)."""
+
+    def test_curve_follows_a_nonlinear_drift(self):
+        cfg = dict(grass.DEFAULTS)
+        dr = grass.Drift(cfg)
+        D = lambda s: 0.021 * s + 0.03 * np.sin(s / 9.0)   # noqa: E731
+        rng = np.random.default_rng(3)
+        s_now = 100.0
+        for s_new in np.arange(10.0, s_now, 0.4):
+            for ds in (6.0, 13.0, 27.0):
+                if s_new - ds > 0:
+                    dr.add(ds, D(s_new) - D(s_new - ds) + rng.normal(0, 0.01), s_new)
+        fit = dr.estimate(s_now)
+        self.assertIsNotNone(fit)
+        for s_old in (60.0, 75.0, 90.0, 97.0):
+            want = D(s_now + 1.2) - D(s_old)
+            self.assertAlmostEqual(float(fit.corr(s_old, s_now + 1.2)), want, delta=0.012)
+        self.assertAlmostEqual(fit.rate, 0.021 + 0.03 / 9.0 * math.cos(s_now / 9.0), delta=0.004)
+        self.assertLess(fit.sigma, 0.02)
+
+    def test_no_curve_without_revisits(self):
+        dr = grass.Drift(dict(grass.DEFAULTS))
+        for s in range(10):
+            dr.add(5.0, 0.1, 10.0 + s)
+        self.assertIsNone(dr.estimate(20.0))           # too few
+        dr.add(1.0, 0.0, 21.0)                          # too short a revisit: ignored
+        self.assertEqual(len(dr.pairs), 10)
+
+    def test_lanes_on_rolling_ground_with_pitch_bias(self):
+        # rolling lawn (slopes up to ~6 deg: terrain changes for the extrapolation),
+        # 50 mm grass, IMU 1.3 deg off: the later lanes take the ground from the
+        # wheels of the earlier ones, drift removed; heights right, no false class
+        ground = lambda X, Y: 0.12 * np.sin(0.9 * X) + 0.02 * Y   # noqa: E731
+        cells = []
+        e, outs = mow_lanes(ground, 50.0, 1.3, cells=cells)
+        later = [o for lane in outs[3:] for o in lane]
+        unknown = np.mean([o["class"] == "unknown" for o in later])
+        wheels = [o for o in later if o["terrain_source"] == "wheels"]
+        self.assertLess(unknown, 0.2, unknown)
+        self.assertGreater(len(wheels), 0.5 * len(later))
+        h = np.array([o["height_mm"] for o in wheels if o["height_mm"] is not None])
+        # carpet p90 of 0.3..1.0 * 50 mm = 46.5 mm
+        self.assertAlmostEqual(float(np.median(h)), 46, delta=8)
+        self.assertEqual({o["class"] for o in later} - {"unknown"}, {"below_cut"})
+        # the curve found the drift: -tan(1.3 deg) per metre driven
+        self.assertAlmostEqual(e.drift.estimate(e.track.s).rate, -math.tan(math.radians(1.3)), delta=0.004)
+        # the map cells (deferred, the next lane's wheels too) measure the grass
+        hc = np.array([c[2] for c in cells])
+        self.assertAlmostEqual(float(np.median(hc)), 46, delta=8)
+        self.assertLess(np.mean(np.abs(hc - 46) > 25), 0.05)
+
+    def test_first_lane_stays_honest(self):
+        # nothing driven yet: on rolling ground the extrapolation says unknown at
+        # the slope changes, never tall grass
+        ground = lambda X, Y: 0.12 * np.sin(0.9 * X)   # noqa: E731
+        _e, outs = mow_lanes(ground, 50.0, 1.3, lanes=1)
+        first = outs[0]
+        self.assertNotIn("wheels", [o["terrain_source"] for o in first[:20]])
+        self.assertIn("terrain_change", [o["reason"] for o in first])
+        self.assertEqual({o["class"] for o in first} - {"unknown"}, {"below_cut"})
+
+    def test_tall_grass_beside_the_mown_lanes_is_still_tall(self):
+        # the drift correction must not flatten a real difference: uncut 130 mm
+        # grass from Y > 0.75 on is read from the wheel ground of the earlier
+        # lanes as tall (or unknown), never as mown
+        ground = lambda X, Y: 0.12 * np.sin(0.9 * X)   # noqa: E731
+        grass_mm = lambda X, Y: np.where(Y > 0.75, 130.0, 40.0)   # noqa: E731
+        _e, outs = mow_lanes(ground, grass_mm, 1.3, lanes=5)
+        lane = [o for o in outs[4] if o["terrain_source"] == "wheels"]   # Y = 1.2: all tall
+        self.assertGreater(len(lane), 20)
+        self.assertGreater(np.mean([o["class"] == ">+4cm" for o in lane]), 0.8)
+        self.assertNotIn("below_cut", [o["class"] for o in lane])
+
+    def test_pose_jump_starts_over(self):
+        # a GNSS jump of 0.5-0.9 m along the lane (under the old 1 m limit) must
+        # not compare ground across it: no false class, the curve starts again
+        ground = lambda X, Y: 0.12 * np.sin(0.9 * X) + 0.02 * Y   # noqa: E731
+        for amt in (0.5, 0.7, 0.9):
+            e, outs = mow_lanes(ground, 50.0, 1.3, lanes=8, jump=(4, amt, 0.0))
+            got = {o["class"] for lane in outs for o in lane} - {"unknown"}
+            self.assertEqual(got, {"below_cut"}, amt)
+            self.assertGreaterEqual(e.track.epoch, 1, amt)
+        e, _o = mow_lanes(ground, 50.0, 1.3, lanes=3)
+        self.assertEqual(e.track.epoch, 0)          # driving itself is never a jump
+
+    def test_partly_known_corridor_uses_the_plane(self):
+        # lane 2 (Y = 0.3) sees the wheel tracks of lane 1 on one side only
+        ground = lambda X, Y: 0.12 * np.sin(0.9 * X) + 0.04 * Y   # noqa: E731
+        _e, outs = mow_lanes(ground, 50.0, 1.3, lanes=4, gap=0.45)
+        part = [o for lane in outs[1:] for o in lane if o.get("ground_cells_frac") is not None]
+        self.assertTrue(part)
+        h = [o["height_mm"] for o in part if o["height_mm"] is not None]
+        self.assertAlmostEqual(float(np.median(h)), 46, delta=10)
 
 if __name__ == '__main__':
     unittest.main()

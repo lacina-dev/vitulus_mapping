@@ -13,6 +13,9 @@ cell: 0.2              # map cell of the deferred resolution and of the layer
 pending_ttl_s: 120.0   # a seen cell waits this long for the wheels, then DEM or dropped
 wheel_max_track_m: 4.0 # wheels resolve cells seen at most this far back along the track
 wheel_ahead_max_m: 3.0 # /grass/ahead uses wheel ground at most this far back
+                       # (both: without a drift curve; with one up to drift_use_max_m)
+wheel_keep_m: 120.0    # wheel ground kept this far back (revisits -> drift curve)
+drift_use_max_m: 110.0 # with a drift curve: wheel ground stamped up to this far back
 slope_change_deg: 2.5  # carpet AND its lowest lane tilted against the expected ground = terrain change
 lane_step_mm: 25.0     # lanes side by side differing more = kerb (smooth) or mown|uncut edge (rough)
 conf_min: 0.6          # probability the class is right, below = unknown

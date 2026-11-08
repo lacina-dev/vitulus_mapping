@@ -193,6 +193,7 @@ def cmd_record(args):
            "sample": sample, "strips": strips,
            "imu_roll_deg": round(float(np.degrees(np.nanmedian(rp[:, 0]))), 2) if np.isfinite(rp).any() else None,
            "imu_pitch_deg": round(float(np.degrees(np.nanmedian(rp[:, 1]))), 2) if np.isfinite(rp).any() else None,
+           "imu_pitch_spread_deg": pitch_spread(rp),
            "yaw_deg": yaw, "note": args.note or ""}
     os.makedirs(args.dir, exist_ok=True)
     stem = os.path.join(args.dir, "%s_x%.1f_%s" % (args.label, args.x, time.strftime("%Y%m%d_%H%M%S")))
@@ -201,6 +202,9 @@ def cmd_record(args):
     np.savez_compressed(stem + ".npz", depth=np.array(depths), K=K, R_bc=R, t_bc=t,
                         rp=rp, meta=json.dumps(rec))
     print("saved %s.json (+ .npz with %d raw frames)" % (stem, len(depths)))
+    if rec["imu_pitch_spread_deg"] is not None and rec["imu_pitch_spread_deg"] > grass.IMU_STEADY_MAX_DEG:
+        print("WARNING: the IMU pitch was not steady (spread %.1f deg): record again with the "
+              "robot still; fit will not correct this record's tilt" % rec["imu_pitch_spread_deg"])
     if sample:
         print("sample x=%.2f: p90 %.1f mm, median %.1f mm, noise %.1f mm, roughness %s mm, %d points"
               % (args.x, sample["p90_mm"], sample["median_mm"], sample["noise_mm"], rough,
@@ -213,6 +217,13 @@ def cmd_record(args):
                 s["x"], s["median_mm"], s["p90_mm"], s["noise_mm"], s["sigma_mm"], s["valid"]))
 
 
+def pitch_spread(rp):
+    """p90-p10 of the per-frame IMU pitch (deg): a steady IMU reads ~0.1."""
+    p = np.asarray(rp, float).reshape(-1, 2)[:, 1]
+    p = p[np.isfinite(p)]
+    return round(float(np.degrees(np.percentile(p, 90) - np.percentile(p, 10))), 2) if len(p) else None
+
+
 def load_records(d, latest=True, session=None):
     recs = []
     for p in sorted(glob.glob(os.path.join(d, "*.json"))):
@@ -220,6 +231,13 @@ def load_records(d, latest=True, session=None):
             with open(p) as f:
                 r = json.load(f)
             r["_file"] = os.path.basename(p)
+            if "imu_pitch_spread_deg" not in r and os.path.exists(p[:-5] + ".npz"):
+                # records from before 2026-11-08 evening: the spread from the raw frames
+                try:
+                    with np.load(p[:-5] + ".npz") as z:
+                        r["imu_pitch_spread_deg"] = pitch_spread(z["rp"])
+                except (IOError, OSError, KeyError, ValueError):
+                    pass
             recs.append(r)
         except (IOError, ValueError):
             continue
