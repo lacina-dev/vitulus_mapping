@@ -243,7 +243,20 @@ rozložený do 1–20 snímků, boční 0,4 m, hrbolatý s oblouky 0,6 m): 0 fal
 tříd ve všech 39 variantách a bez posunu žádná epocha navíc (master: 3–27
 falešných `>+4cm` u rozložených posunů).
 Neplatí to obecně: kde koridor nemá buňky z dřívějška (první průjezd, okraj),
-chrání jen kola a extrapolace sama. Kontrola kol ve 4σ místo 3σ by měla na
+chrání jen kola a extrapolace sama. **Začátek běhu je nehlídaný:** dokud
+kontrola kol nemá 150 návratů a 20 m stopy (zhruba první 3 pruhy, ~19 m), vůbec
+neběží, a koberec se teprve učí (prvních 15 porovnaných snímků nerozhoduje;
+navíc si pamatuje první průjezd, takže když se póza posune už v něm, porovnává
+posunuté s posunutým). Zem z kol ze dřívějška se přitom už používá. Posun pózy
+v pruzích 1–3 (např. RTK float → fix) tak v simulaci (`k_adv4.py early`:
+zvlněný a hrbolatý terén, posun 0,5 m za 5 snímků a 0,9 m za 10 snímků
+v pruhu 1, 2 nebo 3) dává 4–41 falešných `>+4cm` na variantu, a když po
+nezachyceném prvním posunu přijde druhý (`double`: pruh 3 + pruh 5 / 6 / 8),
+17–63. Ověřené zavření (zem z kol nejvýš `below_cut`, dokud kontrola kol není
+zralá) by vzalo skutečnou vysokou trávu v prvních pruzích (`k_r3.py`: hrana
+neposekané trávy 138 z 240 snímků místo 240, sečení 130 mm 123 z 480 místo
+156), proto zatím ne; vyhodnotí se na nahrávkách, jestli posuny na začátku
+běhu vůbec nastávají (T28 odstranil skoky výšky odometrie z GNSS). Kontrola kol ve 4σ místo 3σ by měla na
 2. běhu větší rezervu (nejvyšší poměr medián/mez 0,71 místo 0,95), ale na
 hrbolatém terénu s oblouky by propustila 14–19 falešných tříd. Falešná epocha
 není zadarmo: zahodí zem z kol a dokud kola nemají novou křivku, odpovídá DEM
