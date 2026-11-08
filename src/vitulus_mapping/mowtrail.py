@@ -57,19 +57,53 @@ ROW on disk, raw. Unknown = NONE, unless noted.
   30 jump_cm        GPS step against wheels over 1 s
   31 cno_dd         0.1 dB-Hz, mean C/N0 of used SV  32 prres_cm  RMS pseudorange residual
   33 jam            MON-HW jamInd 0..255
-Older files have 20 or 26 columns: they load with NONE in the rest. A row of the
+  -- positions, see POSITIONS below; cm and 0.1 deg in the map frame unless noted
+  34 path_x, 35 path_y  the fused pose projected on the active path, NONE without a
+                    path or farther than path_max_m       36 path_yaw  tangent there
+  37 xte_cm         pose against the path, + = robot LEFT of it
+  38 gps_x, 39 gps_y  base_link by GNSS: antenna - R(yaw) lever, time aligned; only a
+                    3D / GNSS+DR fix with hAcc <= gps_max_hacc_m (1.0 m)
+  40 gps_head       robot yaw from the two antennas, NONE when older than 0.4 s
+  41 head_acc       its accuracy
+  42 lidar_x, 43 lidar_y  pose + the signed scan correction, gated as lidar_cm
+  44 lidar_dyaw     signed
+  45 odom_x, 46 odom_y, 47 odom_yaw  raw wheel odometry, ODOM frame
+  48 yaw            fused yaw
+  49 owner          OWNERS index, who drives map->odom (/nav_tf/loc_status)
+  50 track          TRACK_STATES index, /gloc/track_status state
+Older files have 20, 26 or 34 columns: they load with NONE in the rest. A row of the
 open run may be short too, the driver of a restart can be the old version.
 
 ON THE WIRE a message carries only what the map colours by (WIRE columns, flat,
-stride 18, downsampled) and the map-worthy events; a tap asks for the raw row.
+stride 26, downsampled) and the map-worthy events; a tap asks for the raw row.
+
+POSITIONS. Where the robot should be and where each source says it is, so a row
+tells which source lied. The plan is the path move_base_flex/exe_path got: each
+mowing chunk (~200 points, 3 cm apart), detours and transits. PathTracker
+projects the pose on it in a window of arc length around the last projection, so
+it never jumps to the neighbouring stripe 0.29 m away. Read a row as:
+pose near the plan, GPS far = the localization lied; pose far from the plan =
+steering, the controller. The projection holds within path_max_m (2 m) of the
+projected point, past an end of the path too; |XTE| >= off_path_m (0.25 m) makes
+an off_path event at the row. GPS is base_link from navpvt (UTM zone of the datum,
+the lever of the antenna from TF base_link->gnss), moved by how far the pose went
+between the fix and now, so GPS latency does not read as an error. The fix is
+dated arrival - gps_latency_s (0.1 s): the NUC clock is not synced to GPS time.
+GPS against the path counts in the summary on RTK fixed rows only. GPS heading is
+/gnss_heading/navheading: yaw + 90 deg - datum yaw (the moving-base pair;
+/gnss/navheading does not follow a turn). The heading error (wire 25, summary
+head_*) is left out where the fused yaw turns faster than head_max_rate
+(0.3 rad/s) or the rate is unknown: the antennas lag in a turn.
 
 GPS HONESTY. hAcc is what the receiver thinks of itself: 14 mm almost always, r = 0.03
 against the lidar below. Two checks that do not ask the receiver:
   lidar_cm  gloc_server aligns every scan to the map even while GPS owns the pose
             and does not apply it: state gps_owns, corr_m is how far the scan wants
             the pose to move. 17 Oct bag, moving: median 9 cm, p90 36, p99 59.
-            Median of the last second, rms <= 0.2 m only. It measures against the
-            map, so a bad map reads as a bad GPS.
+            Also corr_too_big while gps_good: the scan wants the pose far from
+            the GPS, the case this is for. Median of the last second, rms <= 0.2 m
+            only. It measures against the map, so a bad map reads as a bad GPS.
+            lidar_x/y/dyaw: the same, as the signed vector corr_dx, corr_dy.
   jump_cm   the GPS step over 1 s against the wheel step in the same second, as
             vectors. Wheels cannot jump. Same bag, RTK fix, moving: median 3.8 cm,
             p90 12, p99 31. Skipped while the robot turns (the antenna swings).
@@ -97,6 +131,7 @@ import math
 import os
 import re
 import tempfile
+import threading
 import time
 
 import numpy as np
@@ -105,18 +140,25 @@ from . import bundle
 from . import geo
 from . import worldlayers
 
-__all__ = ["TrailRecorder", "STATES", "EVENTS", "BRK", "NONE", "STRIDE", "WIRE_STRIDE", "DEFAULTS",
+__all__ = ["TrailRecorder", "PathTracker", "STATES", "EVENTS", "OWNERS", "TRACK_STATES", "BRK",
+           "NONE", "STRIDE", "WIRE_STRIDE", "DEFAULTS",
            "parse_isense", "parse_log", "sane_rpm", "compute_load", "classify", "decimate",
-           "summarize", "list_runs", "read_run", "query"]
+           "gps_base_link", "heading_in_map", "summarize", "list_runs", "read_run", "query"]
 
-FORMAT_VERSION = 3
-OLD_STRIDES = (20, 26)
-STRIDE = 34
+FORMAT_VERSION = 4
+OLD_STRIDES = (20, 26, 34)
+STRIDE = 51
 (X, Y, LOAD, AMPS, RPM, TEMP, STATE, T, SPEED, CMD, HEIGHT, SETPOINT, ROLL, PITCH, FIX, HACC,
  BATT_V, BATT_PCT, POWER, WHEEL, NUM_SV, PDOP, RTCM_RATE, RTCM_AGE, RTCM_USED,
- RTCM_CRC, WHEEL_MAX, LIDAR, LIDAR_RMS, LIDAR_YAW, JUMP, CNO, PRRES, JAM) = range(STRIDE)
+ RTCM_CRC, WHEEL_MAX, LIDAR, LIDAR_RMS, LIDAR_YAW, JUMP, CNO, PRRES, JAM,
+ PATH_X, PATH_Y, PATH_YAW, XTE, GPS_X, GPS_Y, GPS_HEAD, HEAD_ACC, LIDAR_X, LIDAR_Y,
+ LIDAR_DYAW, ODOM_X, ODOM_Y, ODOM_YAW, YAW, OWNER, TRACK) = range(STRIDE)
+# map-frame point pairs and yaws: what a datum change moves (odometry is not map)
+_POINTS = ((X, Y), (PATH_X, PATH_Y), (GPS_X, GPS_Y), (LIDAR_X, LIDAR_Y))
+_YAWS = (PATH_YAW, GPS_HEAD, YAW)
 # x y load amps rpm temp state t speed slope fix dip hacc age rate wheel lidar jump
-WIRE_STRIDE = 18
+# xte path_x path_y gps_x gps_y lidar_x lidar_y head_err
+WIRE_STRIDE = 26
 BRK = 16
 NONE = -9999
 STATES = ("cutting", "spinup", "transit", "blocked", "overload", "hot", "rule", "hold",
@@ -128,7 +170,15 @@ RULE_STALE_S = 5.0              # the guard repeats at 1 Hz
 # worst first: the map keeps the worst when icons crowd
 EVENTS = ("blocked", "link_lost", "hot", "overload", "rule", "temp", "recovery", "backup", "detour",
           "stall", "no_progress", "rewindow", "hold", "rtcm_gap", "fix_down", "fix_up",
-          "gps_jump")
+          "gps_jump", "off_path")       # new kinds go last: the wire carries the index
+# /nav_tf/loc_status owner: navi_transform _current_owner, its _map_pose_priority
+OWNERS = ("gps", "dock", "dr", "relock", "tracker", "rtabmap", "legacy", "other")
+# /gloc/track_status state, gloc_server (reject reasons of _track_align included)
+TRACK_STATES = ("gps_owns", "ok", "aligned", "settling", "standstill", "engage_delay",
+                "rtabmap_owns", "poor_match", "degenerate", "corr_too_big", "recover_slew",
+                "map_stale_overlap", "map_stale_prior", "relock", "relock_probe", "relock_failed",
+                "no_scan", "no_tf", "few_rays", "no_map", "few_points_in_map", "singular", "other")
+TRACK_STALE_S = 3.0             # the tracker says something about every scan, ~6 Hz
 CONTEXT = ("ctx", "owner", "program")
 STOP_KINDS = ("blocked", "link_lost", "hot", "overload", "rule", "recovery", "backup", "stall",
               "no_progress")
@@ -188,6 +238,18 @@ DEFAULTS = {
     "jump_period_s": 1.0,
     "jump_turn_rad": 0.25,      # more turn than this in the window: the antenna swung
     "jump_event_m": 0.5,        # RTK fix reached 0.42 m at most in the 17 Oct bag
+    "path_max_m": 2.0,          # farther from the path than this: not on it, no projection
+    "path_back_m": 0.5,         # projection window around the last one, arc length
+    "path_ahead_m": 2.5,
+    "path_lost_m": 1.0,         # nearest in the window farther than this: search all
+    "off_path_m": 0.25,         # event from here on
+    "gps_stale_s": 1.5,
+    "gps_max_hacc_m": 1.0,      # worse fix: no GPS position (fixType 3D or GNSS+DR too)
+    "gps_latency_s": 0.10,      # fix epoch to arrival; the pose for the alignment is taken then
+    "head_stale_s": 0.4,        # the heading must be of this moment, it is compared to the yaw
+    "head_max_acc_deg": 30.0,   # worse is no heading (the receiver sends 1000 rad^2 then)
+    "head_max_rate": 0.3,       # rad/s: turning faster, the two antennas lag, no heading error
+    "odom_stale_s": 1.0,
 }
 
 
@@ -296,6 +358,115 @@ class GpsCheck(object):
         return self.value if self.value is not None and now - self.t <= 3.0 * self.period_s else None
 
 
+class PathTracker(object):
+    """The pose projected on the active path. Searches a window of arc length
+    [s_last - back_m, s_last + ahead_m]: mowing stripes lie 0.29 m apart and the
+    nearest segment overall may be the next stripe. No last projection, or nothing
+    within lost_m in the window: the whole path.
+
+    Threads: set_path/end come from subscriber callbacks, project from the loop.
+    The path is one tuple (goal_id, seg) swapped whole; s_last is stored with the
+    path it belongs to, so a projection on an old path never steers a new one."""
+
+    def __init__(self, back_m=0.5, ahead_m=2.5, lost_m=1.0):
+        self.back_m = back_m
+        self.ahead_m = ahead_m
+        self.lost_m = lost_m
+        self._path = (None, None)      # (goal_id, seg [n, 6]: x0, y0, ux, uy, length, s0)
+        self._s = (None, None)         # (the _path it was measured on, arc length)
+        self._lock = threading.Lock()  # set_path against end: compare and swap
+
+    @property
+    def goal_id(self):
+        return self._path[0]
+
+    @property
+    def seg(self):
+        return self._path[1]
+
+    @property
+    def s_last(self):
+        path, s_last = self._s
+        return s_last if path is self._path else None
+
+    def set_path(self, goal_id, points):
+        """A new path replaces the old one. Zero-length segments are skipped."""
+        seg = None
+        pts = np.asarray(points, float).reshape(-1, 2)
+        if len(pts) >= 2:
+            d = np.diff(pts, axis=0)
+            length = np.hypot(d[:, 0], d[:, 1])
+            ok = length > 1e-6
+            if ok.any():
+                start, d, length = pts[:-1][ok], d[ok], length[ok]
+                s0 = np.concatenate(([0.0], np.cumsum(length)[:-1]))
+                seg = np.column_stack((start, d / length[:, None], length, s0))
+        with self._lock:
+            self._path = (goal_id, seg)
+
+    def end(self, goal_id):
+        """The goal is over. The result of an older goal leaves a newer path alone."""
+        with self._lock:
+            if goal_id == self._path[0]:
+                self._path = (None, None)
+                return True
+        return False
+
+    def _nearest(self, seg, x, y):
+        t = np.clip((x - seg[:, 0]) * seg[:, 2] + (y - seg[:, 1]) * seg[:, 3], 0.0, seg[:, 4])
+        px, py = seg[:, 0] + t * seg[:, 2], seg[:, 1] + t * seg[:, 3]
+        dist = np.hypot(x - px, y - py)
+        i = int(np.argmin(dist))
+        return i, float(dist[i]), float(t[i]), float(px[i]), float(py[i])
+
+    def project(self, x, y):
+        """(px, py, path_yaw, xte, dist), xte + = (x, y) LEFT of the path, dist to
+        the projected point (past an end it is more than |xte|); None without one."""
+        path = self._path
+        seg = path[1]
+        if seg is None:
+            return None
+        got = None
+        s_path, s_last = self._s
+        if s_path is path and s_last is not None:
+            lo, hi = s_last - self.back_m, s_last + self.ahead_m
+            inwin = (seg[:, 5] + seg[:, 4] >= lo) & (seg[:, 5] <= hi)
+            if inwin.any():
+                idx = np.flatnonzero(inwin)
+                got = self._nearest(seg[idx], x, y)
+                got = (int(idx[got[0]]),) + got[1:]
+                if got[1] > self.lost_m:
+                    got = None
+        if got is None:
+            got = self._nearest(seg, x, y)
+        i, dist, t, px, py = got
+        ux, uy = seg[i, 2], seg[i, 3]
+        if self._path is path:
+            self._s = (path, float(seg[i, 5] + t))
+        return px, py, math.atan2(uy, ux), ux * (y - py) - uy * (x - px), dist
+
+
+def gps_base_link(ant_x, ant_y, lever, pose_now, pose_then=None):
+    """base_link in map by GNSS. ant = antenna in map at the fix, lever = (x, y) of
+    the antenna in base_link, pose_then = the pose at the fix time (None: unknown).
+    The answer is moved by how far the pose went since the fix: GPS latency is no
+    error of the GPS, gps(t) - pose(t) is what is compared."""
+    yaw = (pose_then or pose_now)[2]
+    c, s = math.cos(yaw), math.sin(yaw)
+    bx = ant_x - (c * lever[0] - s * lever[1])
+    by = ant_y - (s * lever[0] + c * lever[1])
+    if pose_then is not None:
+        bx += pose_now[0] - pose_then[0]
+        by += pose_now[1] - pose_then[1]
+    return bx, by
+
+
+def heading_in_map(qx, qy, qz, qw, cov_yaw, datum_yaw):
+    """/gnss_heading/navheading as (robot yaw in map, accuracy) in radians."""
+    yaw = geo.quat_to_yaw(qx, qy, qz, qw) + math.pi / 2.0 - datum_yaw
+    return geo.wrap_pi(yaw), math.sqrt(max(0.0, cov_yaw))
+
+
 def sane_rpm(value):
     """abs(rpm), None for a garbage sample."""
     try:
@@ -349,9 +520,14 @@ def decimate(rows, limit):
     """Fewer rows for a message: (rows, factor). Keeps what the eye looks for:
     every break and state change, every temperature jump, and in each bin the
     highest load and the highest temperature."""
+    idx, k = _decimate_idx(rows, limit)
+    return rows[idx], k
+
+
+def _decimate_idx(rows, limit):
     n = len(rows)
     if n <= limit:
-        return rows, 1
+        return np.arange(n), 1
     k = max(2, int(math.ceil(n / (limit * 0.45))))
     bins = np.arange(n) // k
     keep = [np.array([0, n - 1])]
@@ -374,14 +550,61 @@ def decimate(rows, limit):
         room = max(2, limit - len(hard))
         rest = rest[np.linspace(0, len(rest) - 1, min(room, len(rest))).astype(np.int64)]
         idx = np.unique(np.concatenate((hard, rest)))
-    return rows[idx], k
+    return idx, k
+
+
+def wire_cut(rows, limit, max_rate=DEFAULTS["head_max_rate"]):
+    """(flat wire, factor) of a whole run: the turn rate comes from the full rows."""
+    idx, k = _decimate_idx(rows, limit)
+    return wire(rows[idx], _turning(rows, max_rate)[idx]), k
 
 
 def _known(column):
     return column[column != NONE]
 
 
-def summarize(rows, events=()):
+def _across(rows, cx, cy):
+    """cm, signed: point (cx, cy) across the path tangent, + = left. NONE where
+    either is unknown."""
+    ok = ((rows[:, cx] != NONE) & (rows[:, cy] != NONE) & (rows[:, PATH_X] != NONE)
+          & (rows[:, PATH_YAW] != NONE))
+    yaw = np.radians(rows[:, PATH_YAW] / 10.0)
+    val = (np.cos(yaw) * (rows[:, cy] - rows[:, PATH_Y].astype(float))
+           - np.sin(yaw) * (rows[:, cx] - rows[:, PATH_X].astype(float)))
+    return np.where(ok, np.rint(val), NONE).astype(np.int32)
+
+
+def _turning(rows, max_rate=DEFAULTS["head_max_rate"], prev=None):
+    """bool per row: turning faster than max_rate rad/s by the fused yaw since the row
+    before (prev = the row before the first). Unknown rate (first row, a line break,
+    no yaw) counts as turning: no heading error is better than a wrong one."""
+    n = len(rows)
+    if not n:
+        return np.zeros(0, bool)
+    before = np.empty((n, STRIDE), np.int64)
+    before[1:] = rows[:-1]
+    before[0] = prev if prev is not None else NONE
+    yaw, yaw0 = rows[:, YAW].astype(np.int64), before[:, YAW]
+    dt = (rows[:, T] - before[:, T]) / 10.0
+    known = (yaw != NONE) & (yaw0 != NONE) & (dt > 0) & (rows[:, STATE] < BRK)
+    if prev is None:
+        known[0] = False
+    dyaw = np.radians(((yaw - yaw0 + 1800) % 3600 - 1800) / 10.0)
+    rate = np.abs(dyaw) / np.where(dt > 0, dt, 1.0)
+    return ~known | (rate > max_rate)
+
+
+def _head_err(rows, turning=None):
+    """0.1 deg, signed: wrap(YAW - GPS_HEAD), NONE where either is unknown or
+    where the robot turns (turning mask, None = not checked)."""
+    ok = (rows[:, YAW] != NONE) & (rows[:, GPS_HEAD] != NONE)
+    if turning is not None:
+        ok &= ~turning
+    err = (rows[:, YAW].astype(np.int64) - rows[:, GPS_HEAD] + 1800) % 3600 - 1800
+    return np.where(ok, err, NONE).astype(np.int32)
+
+
+def summarize(rows, events=(), max_rate=DEFAULTS["head_max_rate"]):
     """Totals of a run. Load statistics over the cut rows only: spin-up inrush is
     normal and transit has no load. Time goes to the state of the row it ends in;
     a gap over a minute is not time at work."""
@@ -392,9 +615,19 @@ def summarize(rows, events=()):
            "rtcm_rate": None, "rtcm_age_max": None, "wheel_mean": None, "wheel_peak": None,
            "fix_losses": sum(1 for e in events if e[3] == "fix_down"),
            "gps_jumps": sum(1 for e in events if e[3] == "gps_jump"),
-           "lidar_med": None, "lidar_p95": None, "jump_med": None, "jump_p95": None}
+           "lidar_med": None, "lidar_p95": None, "jump_med": None, "jump_p95": None,
+           "xte_med": None, "xte_p95": None, "gps_xte_med": None, "gps_xte_p95": None,
+           "head_med": None, "head_p95": None}
     if not len(rows):
         return out
+    gps_xte = np.where(rows[:, FIX] == 4, _across(rows, GPS_X, GPS_Y), NONE)
+    head = _head_err(rows, _turning(rows, max_rate))
+    for name, vals in (("xte", np.abs(_known(rows[:, XTE]))),
+                       ("gps_xte", np.abs(gps_xte[gps_xte != NONE])),
+                       ("head", np.abs(head[head != NONE]))):
+        if len(vals):
+            out[name + "_med"] = int(np.median(vals))
+            out[name + "_p95"] = int(np.percentile(vals, 95))
     state = rows[:, STATE] & (BRK - 1)
     cutting = (state == CUTTING) | (state == OVERLOAD)
     if len(rows) > 1:
@@ -441,8 +674,9 @@ def summarize(rows, events=()):
     return out
 
 
-def wire(rows):
-    """The columns the map colours by, flat."""
+def wire(rows, turning=None):
+    """The columns the map colours by, flat. turning: _turning of these rows, None =
+    worked out from them alone (the first row then has no heading error)."""
     out = np.empty((len(rows), WIRE_STRIDE), np.int32)
     out[:, :8] = rows[:, :8]
     out[:, 8] = rows[:, SPEED]
@@ -460,6 +694,11 @@ def wire(rows):
     out[:, 15] = rows[:, WHEEL]
     out[:, 16] = rows[:, LIDAR]
     out[:, 17] = rows[:, JUMP]
+    out[:, 18] = rows[:, XTE]
+    out[:, 19:21] = rows[:, PATH_X:PATH_Y + 1]
+    out[:, 21:23] = rows[:, GPS_X:GPS_Y + 1]
+    out[:, 23:25] = rows[:, LIDAR_X:LIDAR_Y + 1]
+    out[:, 25] = _head_err(rows, _turning(rows) if turning is None else turning)
     return out.ravel().tolist()
 
 
@@ -484,12 +723,18 @@ def _rebase(rows, stored, datum):
     if math.hypot(de, dn) < 0.02 and abs(dyaw) < 0.0005:
         return rows
     c0, s0 = math.cos(stored["yaw_rad"]), math.sin(stored["yaw_rad"])
-    x, y = rows[:, X] / 100.0, rows[:, Y] / 100.0
-    ex, ny = c0 * x - s0 * y - de, s0 * x + c0 * y - dn
     c1, s1 = math.cos(datum["yaw_rad"]), math.sin(datum["yaw_rad"])
     out = rows.copy()
-    out[:, X] = np.rint((c1 * ex + s1 * ny) * 100.0).astype(np.int32)
-    out[:, Y] = np.rint((-s1 * ex + c1 * ny) * 100.0).astype(np.int32)
+    for cx, cy in _POINTS:
+        ok = (rows[:, cx] != NONE) & (rows[:, cy] != NONE)
+        x, y = rows[:, cx] / 100.0, rows[:, cy] / 100.0
+        ex, ny = c0 * x - s0 * y - de, s0 * x + c0 * y - dn
+        out[:, cx] = np.where(ok, np.rint((c1 * ex + s1 * ny) * 100.0), rows[:, cx]).astype(np.int32)
+        out[:, cy] = np.where(ok, np.rint((-s1 * ex + c1 * ny) * 100.0), rows[:, cy]).astype(np.int32)
+    turn = int(round(math.degrees(stored["yaw_rad"] - datum["yaw_rad"]) * 10.0))
+    for col in _YAWS:
+        yaw = (rows[:, col].astype(np.int64) + turn + 1800) % 3600 - 1800
+        out[:, col] = np.where(rows[:, col] != NONE, yaw, rows[:, col]).astype(np.int32)
     return out
 
 
@@ -577,7 +822,7 @@ def _read_npz(path):
 def _entry(meta, rows, events, end):
     item = {"id": meta["run"], "program": meta.get("program") or "", "start": meta["start"],
             "end": end, "stop_reason": meta.get("stop_reason") or ""}
-    item.update(summarize(rows, events))
+    item.update(summarize(rows, events))  # default head_max_rate: the index has no cfg
     return item
 
 
@@ -638,7 +883,7 @@ def _scaled(value, factor, digits=2):
 
 
 def _row_dict(row, start):
-    return {"x": round(row[X] / 100.0, 2), "y": round(row[Y] / 100.0, 2),
+    out = {"x": round(row[X] / 100.0, 2), "y": round(row[Y] / 100.0, 2),
             "load": _scaled(row[LOAD], 100.0), "amps": _scaled(row[AMPS], 1000.0, 3),
             "rpm": _scaled(row[RPM], 1.0, 0), "setpoint": _scaled(row[SETPOINT], 1.0, 0),
             "temp": _scaled(row[TEMP], 10.0, 1), "state": STATES[int(row[STATE]) & (BRK - 1)],
@@ -656,6 +901,38 @@ def _row_dict(row, start):
             "lidar_yaw": _scaled(row[LIDAR_YAW], 10.0, 1), "jump_m": _scaled(row[JUMP], 100.0),
             "cno": _scaled(row[CNO], 10.0, 1), "prres": _scaled(row[PRRES], 100.0),
             "jam": _scaled(row[JAM], 1.0, 0)}
+    out.update(_positions(row))
+    return out
+
+
+def _index_name(names, value):
+    return names[int(value)] if value != NONE and 0 <= int(value) < len(names) else ""
+
+
+def _positions(row):
+    """The position columns of one row, metres and degrees, with what they say
+    against the path (across its tangent, + = left) and against the fused pose
+    (in the robot frame: along = forward, across = left)."""
+    m = lambda col: _scaled(row[col], 100.0)                        # noqa: E731
+    deg = lambda col: _scaled(row[col], 10.0, 1)                    # noqa: E731
+    out = {"path_x": m(PATH_X), "path_y": m(PATH_Y), "path_yaw": deg(PATH_YAW), "xte_m": m(XTE),
+           "gps_x": m(GPS_X), "gps_y": m(GPS_Y), "gps_head": deg(GPS_HEAD), "head_acc": deg(HEAD_ACC),
+           "lidar_x": m(LIDAR_X), "lidar_y": m(LIDAR_Y), "lidar_dyaw": deg(LIDAR_DYAW),
+           "odom_x": m(ODOM_X), "odom_y": m(ODOM_Y), "odom_yaw": deg(ODOM_YAW), "yaw": deg(YAW),
+           "owner": _index_name(OWNERS, row[OWNER]), "track": _index_name(TRACK_STATES, row[TRACK])}
+    one = np.asarray(row, np.int32).reshape(1, -1)
+    for name, cx, cy in (("gps", GPS_X, GPS_Y), ("lidar", LIDAR_X, LIDAR_Y)):
+        across = int(_across(one, cx, cy)[0])
+        out[name + "_xte_m"] = None if across == NONE else round(across / 100.0, 2)
+        out[name + "_along_m"] = out[name + "_across_m"] = None
+        if row[cx] != NONE and row[cy] != NONE and row[YAW] != NONE:
+            yaw = math.radians(row[YAW] / 10.0)
+            dx, dy = (row[cx] - row[X]) / 100.0, (row[cy] - row[Y]) / 100.0
+            out[name + "_along_m"] = round(math.cos(yaw) * dx + math.sin(yaw) * dy, 2)
+            out[name + "_across_m"] = round(-math.sin(yaw) * dx + math.cos(yaw) * dy, 2)
+    err = int(_head_err(one)[0])
+    out["head_err_deg"] = None if err == NONE else round(err / 10.0, 1)
+    return out
 
 
 def context_at(events, t_ds):
@@ -681,7 +958,9 @@ def detail(meta, rows, events, t_ds):
     """The raw row nearest a moment, with its context, for the tap card."""
     i = int(np.argmin(np.abs(rows[:, T] - int(t_ds))))
     out = _row_dict(rows[i], meta.get("start"))
+    owner = out["owner"]
     out.update(context_at(events, int(rows[i, T])))
+    out["owner"] = owner or out["owner"]
     out["program"] = out["program"] or meta.get("program") or ""
     near = [e for e in events if e[3] in EVENTS and abs(e[0] - int(rows[i, T])) <= 50]
     out["events"] = [{"kind": e[3], "text": e[4]} for e in near[:4]]
@@ -836,7 +1115,15 @@ class TrailRecorder(object):
         self.gnss = None               # (h_acc_mm, fix_class, num_sv, pdop_c), same
         self.rtcm = RtcmMeter()
         self.wheel_max = None          # the hardest wheel, Nm, set by the node each tick
-        self.lidar = []                # (t, corr_m, rms, yaw_deg) while GPS owns the pose
+        self.lidar = []                # (t, corr_m, rms, yaw_deg, dx, dy, dyaw_deg) while GPS owns
+        self.track = None              # (state, time), every tracker message
+        self.path = PathTracker(self.cfg["path_back_m"], self.cfg["path_ahead_m"],
+                                self.cfg["path_lost_m"])
+        self._frames_said = set()
+        self._off_path = False
+        self.gps = None                # (x, y, time) base_link in map by GNSS
+        self.heading = None            # (yaw, accuracy rad, time) in map
+        self.odom = None               # (x, y, yaw, time) raw odometry, feed_odom
         self.check = GpsCheck(self.cfg["jump_period_s"], self.cfg["jump_turn_rad"])
         self.sat = None                # (mean cno, rms residual m), time
         self.sat_t = 0.0
@@ -892,12 +1179,23 @@ class TrailRecorder(object):
 
     def feed_tracker(self, now, msg):
         """/gloc/track_status while a run is open. Only a match that was not
-        applied while GPS owns the pose says something about the GPS."""
-        if (msg.get("state") == "gps_owns" and msg.get("corr_m") is not None
+        applied while GPS owns the pose (or a too big one while GPS is good) says
+        something about the GPS. The signed
+        vector (corr_dx, corr_dy, corr_dyaw_deg) is absent from an older gloc."""
+        self.track = (msg.get("state"), now)
+        # corr_too_big while GPS is good: the scan wants the pose far from the GPS,
+        # exactly the case the column is for
+        state = msg.get("state")
+        if ((state == "gps_owns" or (state == "corr_too_big" and msg.get("gps_good") is True))
+                and msg.get("corr_m") is not None
                 and (msg.get("rms") or 9.0) <= self.cfg["lidar_max_rms"]):
             self.lidar = [e for e in self.lidar if now - e[0] <= self.cfg["lidar_window_s"]]
+            vec = (None, None, None)
+            if msg.get("corr_dx") is not None and msg.get("corr_dy") is not None:
+                vec = (float(msg["corr_dx"]), float(msg["corr_dy"]),
+                       float(msg.get("corr_dyaw_deg") or 0.0))
             self.lidar.append((now, float(msg["corr_m"]), float(msg["rms"]),
-                               float(msg.get("corr_yaw_deg") or 0.0)))
+                               float(msg.get("corr_yaw_deg") or 0.0)) + vec)
 
     def _read_lidar(self, now):
         """(corr_m, rms, yaw) median of the last moments, None without a match."""
@@ -905,6 +1203,49 @@ class TrailRecorder(object):
         if not keep:
             return None
         return tuple(float(np.median([e[i] for e in keep])) for i in (1, 2, 3))
+
+    def _read_lidar_vec(self, now):
+        """(dx, dy, dyaw_deg) median of the last moments, None without a vector."""
+        keep = [e for e in self.lidar if now - e[0] <= self.cfg["lidar_window_s"] and e[4] is not None]
+        if not keep:
+            return None
+        return tuple(float(np.median([e[i] for e in keep])) for i in (4, 5, 6))
+
+    def feed_path(self, now, goal_id, frame, points):
+        """A path move_base_flex/exe_path got: [(x, y)...]. Map frame only."""
+        if (frame or "").lstrip("/") != "map":
+            if frame not in self._frames_said:
+                self._frames_said.add(frame)
+                self.log("mow_load: path in frame %r, not map: ignored" % (frame,))
+            self.path.end(self.path.goal_id)
+            return
+        self.path.set_path(goal_id, points)
+
+    def feed_path_end(self, goal_id):
+        """exe_path result: only the goal it belongs to ends."""
+        self.path.end(goal_id)
+
+    def gps_usable(self, fix_type, hacc_mm, lat, lon):
+        """A navpvt worth a position: fixType 3 (3D) or 4 (GNSS+DR), hAcc within
+        gps_max_hacc_m, not the 0/0 of a receiver without a solution."""
+        return (fix_type in (3, 4) and hacc_mm is not None
+                and hacc_mm <= self.cfg["gps_max_hacc_m"] * 1000.0 and (lat != 0.0 or lon != 0.0))
+
+    def fix_time(self, arrival):
+        """When the fix was valid, on the NUC clock: arrival - gps_latency_s."""
+        return arrival - self.cfg["gps_latency_s"]
+
+    def feed_gps(self, now, x, y):
+        """base_link in map by GNSS, gps_base_link already applied, gps_usable checked."""
+        self.gps = (x, y, now)
+
+    def feed_odom(self, now, x, y, yaw):
+        """Raw wheel odometry, now = when it arrived."""
+        self.odom = (x, y, yaw, now)
+
+    def feed_heading(self, now, yaw, acc):
+        """heading_in_map of /gnss_heading/navheading."""
+        self.heading = (yaw, acc, now)
 
     def feed_check(self, now, east, north, ox, oy, odom_yaw, pose_yaw):
         """One GPS position with the odometry of that moment, in the loop."""
@@ -971,9 +1312,9 @@ class TrailRecorder(object):
         if text and text.startswith("Detour"):
             self.event(now, "detour", text[:120])
 
-    def event(self, now, kind, text=""):
-        """One point event at the robot, any thread. Repeats within event_gap_s
-        are one event, context is never dropped."""
+    def event(self, now, kind, text="", at=None):
+        """One point event at the robot (at = (x, y), else the last row), any thread.
+        Repeats within event_gap_s are one event, context is never dropped."""
         run = self.run
         last = self._last
         if run is None or len(run.events) >= self.cfg["max_events"]:
@@ -982,7 +1323,7 @@ class TrailRecorder(object):
             if now - run.last_event.get(kind, -1e9) < self.cfg["event_gap_s"]:
                 return
             run.last_event[kind] = now
-        x, y = (last["x"], last["y"]) if last else (0.0, 0.0)
+        x, y = at if at is not None else ((last["x"], last["y"]) if last else (0.0, 0.0))
         run.events.append([int(round((now - run.meta["start"]) * 10.0)), int(round(x * 100.0)),
                            int(round(y * 100.0)), kind, text])
 
@@ -1108,6 +1449,7 @@ class TrailRecorder(object):
         self._fix_said = self._fix_new = None
         self.check = GpsCheck(self.cfg["jump_period_s"], self.cfg["jump_turn_rad"])
         self.lidar = []
+        self._off_path = False
         if self.program:
             self.event(now, "program", self.program)
         if self.owner:
@@ -1245,6 +1587,8 @@ class TrailRecorder(object):
         else:
             x, y, yaw = pose
             stationary = self._stationary(now, x, y, yaw)
+        # every tick, not per row: the window follows the robot
+        proj = self._project(now, x, y) if pose is not None else None
         status = self._fresh_status(now)
         running = status == "RUN"
         rpm = self.rpm if status is not None else None
@@ -1330,10 +1674,53 @@ class TrailRecorder(object):
                  NONE if lidar is None else int(round(lidar[1] * 1000.0)),
                  NONE if lidar is None else int(round(lidar[2] * 10.0)),
                  NONE if jump is None else min(int(round(jump * 100.0)), 99999),
-                 cno, prres, jam))
+                 cno, prres, jam) + self._positions(now, x, y, yaw, pose is not None, proj))
         self._last = {"x": x, "y": y, "yaw": yaw, "t": now, "load": load_pct, "state": state,
                       "temp": temp}
         self.temp_peak = self.temp     # the next row starts from the current reading
+
+    def _project(self, now, x, y):
+        """(px, py, path_yaw, xte) or None, and the off_path edge."""
+        got = self.path.project(x, y)
+        if got is not None and got[4] > self.cfg["path_max_m"]:
+            got = None              # past an end of the path too: not on it
+        off = got is not None and abs(got[3]) >= self.cfg["off_path_m"]
+        if off and not self._off_path:
+            self.event(now, "off_path", "%+.2f m" % got[3], at=(x, y))
+        self._off_path = off
+        return got
+
+    def _positions(self, now, x, y, yaw, posed, proj):
+        """Columns PATH_X..TRACK of a row."""
+        c = self.cfg
+        cm = lambda v: int(round(v * 100.0))                        # noqa: E731
+        dd = lambda rad: _deci(math.degrees(geo.wrap_pi(rad)))      # noqa: E731
+        path = (NONE,) * 4
+        if proj is not None:
+            path = (cm(proj[0]), cm(proj[1]), dd(proj[2]), cm(proj[3]))
+        gps = (NONE, NONE)
+        if self.gps is not None and now - self.gps[2] <= c["gps_stale_s"]:
+            gps = (cm(self.gps[0]), cm(self.gps[1]))
+        head = acc = NONE
+        if self.heading is not None and now - self.heading[2] <= c["head_stale_s"]:
+            acc = min(_deci(math.degrees(self.heading[1])), 99999)
+            if acc <= c["head_max_acc_deg"] * 10.0:
+                head = dd(self.heading[0])
+        lidar = (NONE,) * 3
+        vec = self._read_lidar_vec(now) if posed else None
+        if vec is not None:
+            lidar = (cm(x + vec[0]), cm(y + vec[1]), _deci(vec[2]))
+        odom = (NONE,) * 3
+        if self.odom is not None and now - self.odom[3] <= c["odom_stale_s"]:
+            odom = (cm(self.odom[0]), cm(self.odom[1]), dd(self.odom[2]))
+        owner = NONE
+        if self.owner:
+            owner = OWNERS.index(self.owner) if self.owner in OWNERS else len(OWNERS) - 1
+        track = NONE
+        if self.track is not None and now - self.track[1] <= TRACK_STALE_S:
+            state = self.track[0]
+            track = TRACK_STATES.index(state) if state in TRACK_STATES else len(TRACK_STATES) - 1
+        return path + gps + (head, acc) + lidar + odom + (dd(yaw), owner, track)
 
     # ---- output --------------------------------------------------------------
     def _publish_runs(self):
@@ -1346,15 +1733,21 @@ class TrailRecorder(object):
                               "limits": self._limits()})
 
     def _send_snapshot(self, run, now, active=True):
-        rows, ds = decimate(run.view(), int(self.cfg["max_snapshot_rows"]))
+        flat, ds = wire_cut(run.view(), int(self.cfg["max_snapshot_rows"]), self.cfg["head_max_rate"])
         run.snapped = run.n
         self._last_snapshot = now
         self.publish("snapshot", {"site": self.site, "run": run.id, "active": active,
                                   "program": run.meta.get("program") or "",
                                   "start": run.meta["start"], "stamp": round(now, 1),
-                                  "n": run.n, "ds": ds, "stride": WIRE_STRIDE, "r": wire(rows),
+                                  "n": run.n, "ds": ds, "stride": WIRE_STRIDE, "r": flat,
                                   "e": wire_events(run.events, int(self.cfg["max_msg_events"])),
                                   "ne": len(run.events), "limits": self._limits()})
+
+    def _wire_fresh(self, run, end):
+        """Rows sent..end; the row before gives the first one its turn rate."""
+        rows = run.rows[run.sent:end]
+        prev = run.rows[run.sent - 1] if run.sent else None
+        return wire(rows, _turning(rows, self.cfg["head_max_rate"], prev))
 
     def request(self, payload):
         """/map_objects/mow_trail/request, any thread. Done in the loop."""
@@ -1398,10 +1791,10 @@ class TrailRecorder(object):
                                   "reason": "no such run"})
             return
         meta, rows, events = got
-        cut, ds = decimate(rows, int(self.cfg["max_snapshot_rows"]))
+        flat, ds = wire_cut(rows, int(self.cfg["max_snapshot_rows"]), self.cfg["head_max_rate"])
         self.publish("past", dict(_entry(meta, rows, events, meta.get("end")), **{
             "req": req, "ok": True, "run": meta["run"], "site": self.site, "n": len(rows),
-            "ds": ds, "stride": WIRE_STRIDE, "r": wire(cut),
+            "ds": ds, "stride": WIRE_STRIDE, "r": flat,
             "e": wire_events(events, int(self.cfg["max_msg_events"])), "limits": self._limits()}))
 
     def maintain(self, now):
@@ -1422,7 +1815,7 @@ class TrailRecorder(object):
             run.events_sent = len(run.events)
             self.publish("trail", {"site": self.site, "run": run.id, "from": run.sent, "n": end,
                                    "stride": WIRE_STRIDE, "start": run.meta["start"],
-                                   "r": wire(run.rows[run.sent:end]),
+                                   "r": self._wire_fresh(run, end),
                                    "e": wire_events(fresh, int(self.cfg["max_msg_events"]))})
             run.sent = end
         if now >= self._next_flush:

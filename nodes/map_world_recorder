@@ -18,11 +18,14 @@ the ROS adapter.
 Mow load trail (vitulus_mapping.mowtrail, contract section 11):
   in   /mower/stall, /mower_smach/busy, /mower_smach/active_program,
        /mower_smach/stop_reason, /mower_smach/status, /map_rules/state,
-       /pm/power_status, /nav_tf/loc_status, /map_objects/mow_trail/request
-       while awake: /gnss/navpvt, /gnss/rxmrtcm (5.5 msg/s, counted, not parsed)
+       /pm/power_status, /nav_tf/loc_status, /map_objects/mow_trail/request,
+       /move_base_flex/exe_path/goal + /result (the plan, one message a chunk)
+       while awake: /gnss/navpvt, /gnss/rxmrtcm (5.5 msg/s, counted, not parsed),
+       TF (base_link->gnss once: the lever of the antenna)
        only during a run: /rosout_agg (the smach's event lines), /gloc/track_status,
-       /gnss/navsat (0.25 Hz), /gnss/monhw; /bno085/imu, /base/*_wheel_state and
-       /mobile_base_controller/odom as raw bytes, parsed once per tick, not per message
+       /gnss/navsat (0.25 Hz), /gnss/monhw; /bno085/imu, /base/*_wheel_state,
+       /mobile_base_controller/odom and /gnss_heading/navheading as raw bytes,
+       parsed once per tick, not per message
   out  /map_objects/mow_trail           append JSON, about 1 Hz while running
        /map_objects/mow_trail/snapshot  latched, the current or last run
        /map_objects/mow_trail/past      latched, the answer to a request
@@ -49,6 +52,7 @@ import time
 
 import rospy
 from geometry_msgs.msg import Twist
+from mbf_msgs.msg import ExePathActionGoal, ExePathActionResult
 from nav_msgs.msg import OccupancyGrid, Odometry
 from rosgraph_msgs.msg import Log
 from rospy.numpy_msg import numpy_msg
@@ -58,7 +62,7 @@ from ublox_msgs.msg import MonHW, NavPVT, NavSAT, RxmRTCM
 from vitulus_msgs.msg import Moteus_controller_state, Mower
 from vitulus_ups.msg import power_status
 
-from vitulus_mapping import bundle, mowtrail, suggestions, worldlayers
+from vitulus_mapping import bundle, geo, mowtrail, suggestions, worldlayers
 
 try:
     from vitulus_mapping import objects as map_objects
@@ -146,10 +150,16 @@ class Node(object):
         self.imu_raw = None
         self.last_pose = None
         self.odom_raw = None
+        self.odom_t = 0.0
         self.check_pair = None         # (time, lat, lon, odometry bytes) of the last GPS message
         self.wheel_raw = {}            # wheel -> (bytes, time)
         self.pvt = None
         self.pvt_t = 0.0
+        self.fix = None                # (lat, lon, fix time) of the last navpvt, while awake
+        self.fix_used = None
+        self.head_raw = None           # (bytes, time) of /gnss_heading/navheading
+        self.head_used = None
+        self.lever = None              # antenna in base_link, from TF once
 
         self.tf_buf = None
         self.tf_listener = None
@@ -180,6 +190,11 @@ class Node(object):
         rospy.Subscriber('/pm/power_status', power_status, self._cb_power, queue_size=1)
         rospy.Subscriber('/nav_tf/loc_status', String, self._cb_loc, queue_size=1)
         rospy.Subscriber('/map_objects/mow_trail/request', String, self._cb_request, queue_size=4)
+        # the plan: a goal per mowing chunk, detour or transit; low rate, always on
+        rospy.Subscriber('/move_base_flex/exe_path/goal', ExePathActionGoal, self._cb_path,
+                         queue_size=2)
+        rospy.Subscriber('/move_base_flex/exe_path/result', ExePathActionResult,
+                         lambda m: self.trail.feed_path_end(m.status.goal_id.id), queue_size=4)
 
     # ---- callbacks -----------------------------------------------------------
     def _cb_mower(self, msg):
@@ -207,6 +222,16 @@ class Node(object):
 
     def _cb_odom_raw(self, msg):
         self.odom_raw = msg._buff
+        self.odom_t = time.time()
+
+    def _cb_head_raw(self, msg):
+        self.head_raw = (msg._buff, time.time())
+
+    def _cb_path(self, msg):
+        path = msg.goal.path
+        frame = path.header.frame_id or (path.poses[0].header.frame_id if path.poses else '')
+        self.trail.feed_path(time.time(), msg.goal_id.id, frame,
+                             [(p.pose.position.x, p.pose.position.y) for p in path.poses])
 
     def _cb_tracker(self, msg):
         try:
@@ -235,9 +260,9 @@ class Node(object):
             for sub in self.run_subs:
                 sub.unregister()
             self.run_subs = []
-            self.imu_raw = self.odom_raw = self.check_pair = None
+            self.imu_raw = self.odom_raw = self.check_pair = self.head_raw = None
             self.wheel_raw = {}
-            self.trail.attitude = self.trail.wheel = self.trail.wheel_max = None
+            self.trail.attitude = self.trail.wheel = self.trail.wheel_max = self.trail.odom = None
             return
         self.run_subs = [
             rospy.Subscriber('/rosout_agg', Log, self._cb_log, queue_size=8),
@@ -247,7 +272,9 @@ class Node(object):
             rospy.Subscriber('/gloc/track_status', String, self._cb_tracker, queue_size=2),
             rospy.Subscriber('/gnss/navsat', NavSAT, self._cb_sat, queue_size=1),
             rospy.Subscriber('/gnss/monhw', MonHW,
-                             lambda m: self.trail.feed_jam(time.time(), m.jamInd), queue_size=1)]
+                             lambda m: self.trail.feed_jam(time.time(), m.jamInd), queue_size=1),
+            rospy.Subscriber('/gnss_heading/navheading', rospy.AnyMsg, self._cb_head_raw,
+                             queue_size=1)]
         for wheel in WHEELS:
             self.run_subs.append(rospy.Subscriber(
                 '/base/%s_wheel_state' % wheel, rospy.AnyMsg, self._cb_wheel_raw,
@@ -275,7 +302,60 @@ class Node(object):
                     pass
         self.trail.wheel = total * 4.0 / seen if seen else None
         self.trail.wheel_max = top if seen else None
+        raw = self.odom_raw
+        if raw is not None:
+            try:
+                odom = Odometry().deserialize(raw).pose.pose
+                q = odom.orientation
+                self.trail.feed_odom(self.odom_t, odom.position.x, odom.position.y,
+                                     geo.quat_to_yaw(q.x, q.y, q.z, q.w))
+            except Exception:                              # noqa: BLE001
+                self.trail.odom = None
+        self._feed_heading()
         self._feed_check(now)
+
+    def _feed_heading(self):
+        got = self.head_raw
+        datum = self.trail.datum
+        if got is None or got is self.head_used or datum is None:
+            return
+        self.head_used = got
+        try:
+            msg = Imu().deserialize(got[0])
+        except Exception:                                  # noqa: BLE001
+            return
+        q = msg.orientation
+        yaw, acc = mowtrail.heading_in_map(q.x, q.y, q.z, q.w, msg.orientation_covariance[8],
+                                           datum['yaw_rad'])
+        self.trail.feed_heading(got[1], yaw, acc)
+
+    def _pose_at(self, stamp):
+        """(x, y, yaw) of base_link in map at a past moment, None outside the buffer."""
+        try:
+            tr = self.tf_buf.lookup_transform('map', 'base_link', rospy.Time.from_sec(stamp))
+        except Exception:                                  # noqa: BLE001
+            return None
+        t, q = tr.transform.translation, tr.transform.rotation
+        return t.x, t.y, geo.quat_to_yaw(q.x, q.y, q.z, q.w)
+
+    def _feed_gps(self, pose):
+        """base_link by GNSS, once per navpvt, during a run."""
+        fix = self.fix
+        datum = self.trail.datum
+        if fix is None or fix is self.fix_used or datum is None or self.tf_buf is None:
+            return
+        self.fix_used = fix
+        if self.lever is None:
+            try:
+                tr = self.tf_buf.lookup_transform('base_link', 'gnss', rospy.Time(0))
+                self.lever = (tr.transform.translation.x, tr.transform.translation.y)
+            except Exception:                              # noqa: BLE001
+                self._log('no TF base_link->gnss, no GPS position')
+                return
+        e, n, _zone = geo.ll_to_utm(fix[0], fix[1], datum.get('utm_zone'))
+        ax, ay = geo.utm_to_map(e, n, datum)
+        x, y = mowtrail.gps_base_link(ax, ay, self.lever, pose, self._pose_at(fix[2]))
+        self.trail.feed_gps(fix[3], x, y)
 
     def _feed_check(self, now):
         pair, self.check_pair = self.check_pair, None
@@ -322,6 +402,13 @@ class Node(object):
         self.check_pair = (time.time(), msg.lat * 1e-7, msg.lon * 1e-7,
                            self.odom_raw)
         self.pvt_t = time.time()
+        # the fix is dated by its arrival less gps_latency_s, not by its UTC: the NUC
+        # clock is not synced (NTP off; 8 Nov the receiver's UTC read 0.07-0.09 s
+        # AFTER the arrival). A fix not worth a position is not kept.
+        lat, lon = msg.lat * 1e-7, msg.lon * 1e-7
+        self.fix = None
+        if self.trail.gps_usable(msg.fixType, msg.hAcc, lat, lon):
+            self.fix = (lat, lon, self.trail.fix_time(self.pvt_t), self.pvt_t)
 
     def _cb_rtcm(self, msg):
         # flags bit 0 crc failed, bits 1-2 2 = used, as gnss_status reads them
@@ -355,7 +442,7 @@ class Node(object):
         self.sub_gnss.unregister()
         self.sub_rtcm.unregister()
         self.tf_listener = self.tf_buf = self.sub_gnss = self.sub_rtcm = None
-        self.pvt = None
+        self.pvt = self.fix = None
         rospy.loginfo('map_world_recorder: asleep')
 
     def _pose(self):
@@ -453,6 +540,8 @@ class Node(object):
             self.last_pose = pose
             if self.run_subs:
                 self._parse_run_signals(now)
+                if pose is not None:
+                    self._feed_gps(pose)
             self.trail.step(now, pose)
             self.trail.maintain(now)
             time.sleep(0.2 if awake else 1.0)

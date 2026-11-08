@@ -65,6 +65,7 @@ __all__ = [
     "map_to_utm", "utm_to_map",
     "map_yaw_to_utm", "utm_yaw_to_map",
     "wrap_pi", "datum_delta",
+    "utm_zone_of", "utm_central_meridian", "ll_to_utm",
 ]
 
 
@@ -198,6 +199,46 @@ def datum_delta(a, b):
     else:
         dalt = None
     return (de, dn, dalt, dyaw)
+
+
+# --------------------------------------------------------------------------
+# WGS84 -> UTM, a copy of vitulus_navi/nodes/navi_transform ll_to_utm (USGS
+# series, the one robot_localization's navsat_conversions uses). Keep in step.
+# --------------------------------------------------------------------------
+_UTM_A, _UTM_E2, _UTM_K0 = 6378137.0, 0.00669438, 0.9996
+
+
+def utm_zone_of(lon):
+    return int((lon + 180.0) / 6.0) + 1
+
+
+def utm_central_meridian(zone):
+    return (zone - 1) * 6 - 180 + 3
+
+
+def ll_to_utm(lat, lon, zone=None):
+    """lat/lon [deg] -> (easting, northing, zone); a given zone forces it."""
+    a, ecc2, k0 = _UTM_A, _UTM_E2, _UTM_K0
+    if zone is None:
+        zone = utm_zone_of(lon)
+    latr, lonr = math.radians(lat), math.radians(lon)
+    lon0r = math.radians(utm_central_meridian(zone))
+    ecc2p = ecc2 / (1 - ecc2)
+    N = a / math.sqrt(1 - ecc2 * math.sin(latr) ** 2)
+    T = math.tan(latr) ** 2
+    C = ecc2p * math.cos(latr) ** 2
+    A = math.cos(latr) * (lonr - lon0r)
+    M = a * ((1 - ecc2 / 4 - 3 * ecc2 ** 2 / 64 - 5 * ecc2 ** 3 / 256) * latr
+             - (3 * ecc2 / 8 + 3 * ecc2 ** 2 / 32 + 45 * ecc2 ** 3 / 1024) * math.sin(2 * latr)
+             + (15 * ecc2 ** 2 / 256 + 45 * ecc2 ** 3 / 1024) * math.sin(4 * latr)
+             - (35 * ecc2 ** 3 / 3072) * math.sin(6 * latr))
+    e = k0 * N * (A + (1 - T + C) * A ** 3 / 6
+                  + (5 - 18 * T + T * T + 72 * C - 58 * ecc2p) * A ** 5 / 120) + 500000.0
+    n = k0 * (M + N * math.tan(latr) * (A * A / 2 + (5 - T + 9 * C + 4 * C * C) * A ** 4 / 24
+                                         + (61 - 58 * T + T * T + 600 * C - 330 * ecc2p) * A ** 6 / 720))
+    if lat < 0:
+        n += 10000000.0
+    return e, n, zone
 
 
 def _canon(datum):

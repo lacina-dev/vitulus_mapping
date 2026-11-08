@@ -512,7 +512,8 @@ class Messages(Base):
     def test_snapshot_size_bound(self):
         rows = np.zeros((400000, mt.STRIDE), np.int32) - 1234
         cut, _ = mt.decimate(rows, 12000)
-        self.assertLess(len(json.dumps(mt.wire(cut))), 800000)
+        # 26 wire columns since the positions (18 before: 800 kB)
+        self.assertLess(len(json.dumps(mt.wire(cut))), 1200000)
 
     def test_past_run_and_unknown(self):
         rec = self.recorder()
@@ -789,6 +790,403 @@ class Honesty(Base):
             self.assertEqual(int(rows[0, mt.LIDAR]), mt.NONE)
             wired = mt.wire(rows)
             self.assertEqual((wired[15], wired[16]), (710, mt.NONE))    # torque was there before
+
+
+def stripes(n=2, length=6.0, gap=0.29, step=0.03):
+    """A boustrophedon chunk: stripe 0 along +x at y=0, stripe 1 back at y=gap..."""
+    pts = []
+    for k in range(n):
+        xs = np.arange(0.0, length + 1e-9, step)
+        if k % 2:
+            xs = xs[::-1]
+        pts.extend((float(x), k * gap) for x in xs)
+    return pts
+
+
+class Path(unittest.TestCase):
+    def test_window_keeps_the_stripe(self):
+        tr = mt.PathTracker()
+        tr.set_path('g', stripes())
+        got = tr.project(0.5, 0.0)
+        self.assertAlmostEqual(got[1], 0.0)
+        # drift toward the next stripe, 0.29 m away: nearer to it than to its own
+        for i in range(1, 21):
+            got = tr.project(0.5 + i * 0.05, 0.01 * i)
+        self.assertAlmostEqual(got[1], 0.0)
+        self.assertAlmostEqual(got[3], 0.20, places=6)
+        self.assertAlmostEqual(got[2], 0.0)
+        # without the window the same point lands on the neighbour
+        fresh = mt.PathTracker()
+        fresh.set_path('g', stripes())
+        self.assertAlmostEqual(fresh.project(1.5, 0.20)[1], 0.29)
+
+    def test_xte_sign_left_is_plus(self):
+        tr = mt.PathTracker()
+        tr.set_path('g', [(0.0, 0.0), (5.0, 0.0)])
+        self.assertAlmostEqual(tr.project(1.0, -0.1)[3], -0.1)
+        tr.set_path('g', [(0.0, 0.0), (0.0, 5.0)])           # heading +y: left is -x
+        got = tr.project(-0.1, 1.0)
+        self.assertAlmostEqual(got[3], 0.1)
+        self.assertAlmostEqual(got[2], math.pi / 2)
+
+    def test_old_result_keeps_the_new_path(self):
+        tr = mt.PathTracker()
+        tr.set_path('g1', [(0.0, 0.0), (5.0, 0.0)])
+        tr.set_path('g2', [(0.0, 1.0), (5.0, 1.0)])
+        self.assertFalse(tr.end('g1'))
+        self.assertAlmostEqual(tr.project(1.0, 0.0)[1], 1.0)
+        self.assertTrue(tr.end('g2'))
+        self.assertIsNone(tr.project(1.0, 0.0))
+
+    def test_zero_length_segments(self):
+        tr = mt.PathTracker()
+        tr.set_path('g', [(0.0, 0.0), (0.0, 0.0), (1.0, 0.0), (1.0, 0.0), (2.0, 0.0)])
+        self.assertEqual(len(tr.seg), 2)
+        self.assertAlmostEqual(tr.project(1.5, 0.1)[3], 0.1)
+        tr.set_path('g', [(1.0, 1.0), (1.0, 1.0)])
+        self.assertIsNone(tr.project(1.0, 1.0))
+
+    def test_lost_searches_all(self):
+        tr = mt.PathTracker()
+        tr.set_path('g', [(float(x), 0.0) for x in range(21)])
+        tr.project(0.5, 0.0)
+        got = tr.project(15.0, 0.1)                           # far past the window
+        self.assertAlmostEqual(got[0], 15.0)
+        self.assertAlmostEqual(tr.s_last, 15.0)
+
+
+class Geometry(unittest.TestCase):
+    def test_lever_and_alignment(self):
+        lever = (-0.16, 0.21)
+        # robot at (1, 2) facing +y: the antenna is at x + 0.21 * -1 ... rotated lever
+        yaw = math.pi / 2
+        ant = (1.0 - 0.21, 2.0 - 0.16)
+        bx, by = mt.gps_base_link(ant[0], ant[1], lever, (1.0, 2.0, yaw))
+        self.assertAlmostEqual(bx, 1.0)
+        self.assertAlmostEqual(by, 2.0)
+        # the fix is 0.2 s old and the pose went 0.06 m since: no error appears
+        bx, by = mt.gps_base_link(ant[0], ant[1], lever, (1.0, 2.06, yaw), (1.0, 2.0, yaw))
+        self.assertAlmostEqual(by, 2.06)
+
+    def test_heading(self):
+        q = (0.0, 0.0, math.sin(-math.pi / 4), math.cos(-math.pi / 4))     # yaw -90 deg
+        yaw, acc = mt.heading_in_map(*q, cov_yaw=0.0004, datum_yaw=0.1)
+        self.assertAlmostEqual(yaw, -0.1)
+        self.assertAlmostEqual(acc, 0.02)
+
+
+class Positions(Base):
+    def run_on_path(self, offsets, path=None, **feed):
+        rec = self.recorder()
+        rec.feed_busy(True)
+        rec.feed_path(self.t, 'g1', 'map', path or [(x * 0.03, 0.0) for x in range(400)])
+        for i, off in enumerate(offsets):
+            for key, value in feed.items():
+                getattr(rec, key)(self.t + 0.5, *value)
+            self.tick(rec, (i * 0.15, off, 0.0))
+        return rec
+
+    def test_xte_in_the_row_and_the_event(self):
+        rec = self.run_on_path([0.0] * 5 + [0.05, 0.3, 0.32, 0.3, 0.0, 0.3, 0.0])
+        rows = self.rows(rec)
+        self.assertEqual(int(rows[0, mt.PATH_Y]), 0)
+        self.assertEqual(int(rows[6, mt.XTE]), 30)
+        self.assertEqual(int(rows[6, mt.PATH_X]), 90)
+        self.assertEqual(int(rows[6, mt.PATH_YAW]), 0)
+        kinds = [e[3] for e in rec.run.events]
+        self.assertEqual(kinds.count('off_path'), 1)          # an edge, the second within the gap
+        self.t += 10.0
+        self.tick(rec, (2.0, 0.0, 0.0))
+        self.tick(rec, (2.1, -0.4, 0.0))
+        self.assertEqual([e[3] for e in rec.run.events].count('off_path'), 2)
+        self.assertEqual(rec.run.events[-1][4], '-0.40 m')
+
+    def test_far_from_the_path_is_none(self):
+        rec = self.run_on_path([0.0, 2.5])
+        self.assertEqual(int(self.rows(rec)[-1, mt.XTE]), mt.NONE)
+        self.assertEqual(int(self.rows(rec)[-1, mt.PATH_X]), mt.NONE)
+
+    def test_end_and_other_frame(self):
+        logs = []
+        rec = self.recorder()
+        rec.log = logs.append
+        rec.feed_busy(True)
+        rec.feed_path(self.t, 'g1', 'map', [(0.0, 0.0), (5.0, 0.0)])
+        rec.feed_path_end('g0')
+        self.tick(rec, (0.5, 0.1, 0.0))
+        self.assertEqual(int(self.rows(rec)[-1, mt.XTE]), 10)
+        rec.feed_path(self.t, 'g2', 'odom', [(0.0, 0.0), (5.0, 0.0)])
+        rec.feed_path(self.t, 'g3', 'odom', [(0.0, 0.0), (5.0, 0.0)])
+        self.assertEqual(len(logs), 1)
+        self.tick(rec, (0.7, 0.1, 0.0))
+        self.assertEqual(int(self.rows(rec)[-1, mt.XTE]), mt.NONE)
+        rec.feed_path(self.t, 'g4', '/map', [(0.0, 0.0), (5.0, 0.0)])
+        rec.feed_path_end('g4')
+        self.tick(rec, (0.9, 0.1, 0.0))
+        self.assertEqual(int(self.rows(rec)[-1, mt.XTE]), mt.NONE)
+
+    def test_sources_in_the_row(self):
+        rec = self.recorder()
+        rec.feed_busy(True)
+        rec.feed_owner(self.t, 'tracker')
+        rec.feed_path(self.t, 'g', 'map', [(0.0, 0.0), (9.0, 0.0)])
+        self.tick(rec, (0.85, 0.02, 0.0))                     # the run opens, signals reset
+        rec.feed_odom(self.t + 0.4, 3.0, -1.0, 0.5)
+        rec.feed_gps(self.t + 0.4, 1.02, 0.05)
+        rec.feed_heading(self.t + 0.4, math.radians(-2.0), math.radians(0.8))
+        rec.feed_tracker(self.t + 0.4, {'state': 'gps_owns', 'corr_m': 0.05, 'rms': 0.05,
+                                        'corr_yaw_deg': 1.0, 'corr_dx': -0.03, 'corr_dy': 0.04,
+                                        'corr_dyaw_deg': -1.0})
+        self.tick(rec, (1.0, 0.02, 0.0))
+        row = self.rows(rec)[-1]
+        self.assertEqual(tuple(int(v) for v in row[mt.GPS_X:mt.TRACK + 1]),
+                         (102, 5, -20, 8, 97, 6, -10, 300, -100, 286, 0, 4, 0))
+        d = mt.detail(rec.run.meta, self.rows(rec), rec.run.events, int(row[mt.T]))
+        self.assertEqual((d['owner'], d['track']), ('tracker', 'gps_owns'))
+        self.assertEqual((d['xte_m'], d['gps_xte_m'], d['lidar_xte_m']), (0.02, 0.05, 0.06))
+        self.assertEqual((d['gps_along_m'], d['gps_across_m']), (0.02, 0.03))
+        self.assertEqual((d['lidar_along_m'], d['lidar_across_m']), (-0.03, 0.04))
+        self.assertEqual(d['head_err_deg'], 2.0)
+        self.assertEqual((d['gps_head'], d['head_acc'], d['odom_yaw']), (-2.0, 0.8, 28.6))
+        for key in ('path_x', 'path_y', 'path_yaw', 'gps_x', 'gps_y', 'lidar_x', 'lidar_y',
+                    'lidar_dyaw', 'odom_x', 'odom_y', 'yaw'):
+            self.assertIn(key, d)
+
+    def test_stale_and_old_gloc(self):
+        rec = self.recorder()
+        rec.feed_busy(True)
+        rec.feed_owner(self.t, 'someone_new')
+        rec.feed_gps(self.t, 1.0, 0.0)
+        self.tick(rec, (0.9, 0.0, 0.0), dt=0.0)
+        rec.feed_heading(self.t + 0.3, 0.0, 31.6)             # the receiver's no-heading
+        rec.feed_tracker(self.t + 0.5, {'state': 'gps_owns', 'corr_m': 0.05, 'rms': 0.05})
+        rec.feed_tracker(self.t + 0.5, {'state': 'weird_new', 'corr_m': 0.05, 'rms': 0.05})
+        self.tick(rec, (1.0, 0.0, 0.0), dt=0.5)
+        row = self.rows(rec)[-1]
+        self.assertEqual(int(row[mt.GPS_HEAD]), mt.NONE)
+        self.assertEqual(int(row[mt.HEAD_ACC]), 18105)
+        self.assertEqual(int(row[mt.LIDAR]), 5)               # magnitude as before
+        self.assertEqual(int(row[mt.LIDAR_X]), mt.NONE)       # no vector from an old gloc
+        self.assertEqual(mt.OWNERS[int(row[mt.OWNER])], 'other')
+        self.assertEqual(mt.TRACK_STATES[int(row[mt.TRACK])], 'other')
+        self.tick(rec, (1.5, 0.0, 0.0), dt=2.0)
+        row = self.rows(rec)[-1]
+        self.assertEqual((int(row[mt.GPS_X]), int(row[mt.HEAD_ACC])), (mt.NONE, mt.NONE))
+
+    def test_wire_and_head_err(self):
+        rows = np.full((2, mt.STRIDE), mt.NONE, np.int32)
+        rows[:, mt.STATE] = 0
+        rows[0, mt.YAW], rows[0, mt.GPS_HEAD] = 1790, -1790   # 179 against -179: 2 deg
+        rows[0, mt.XTE] = -12
+        rows[0, mt.PATH_X:mt.PATH_Y + 1] = (5, 6)
+        rows[0, mt.GPS_X:mt.GPS_Y + 1] = (7, 8)
+        rows[0, mt.LIDAR_X:mt.LIDAR_Y + 1] = (9, 10)
+        rows[1, mt.YAW] = 100
+        wired = mt.wire(rows, np.array([False, False]))
+        self.assertEqual(mt.WIRE_STRIDE, 26)
+        self.assertEqual(len(wired), 2 * 26)
+        self.assertEqual(wired[18:26], [-12, 5, 6, 7, 8, 9, 10, -20])
+        self.assertEqual(wired[26 + 25], mt.NONE)
+        self.assertEqual(mt.wire(rows)[25], mt.NONE)          # alone, the first row has no rate
+
+    def test_summary(self):
+        rows = np.full((4, mt.STRIDE), mt.NONE, np.int32)
+        rows[:, mt.STATE] = 0
+        rows[:, mt.T] = np.arange(4)
+        rows[:, mt.X] = rows[:, mt.PATH_X] = rows[:, mt.GPS_X] = np.arange(4) * 10
+        rows[:, mt.Y] = rows[:, mt.PATH_Y] = 0
+        rows[:, mt.PATH_YAW] = 0
+        rows[:, mt.XTE] = (2, -4, 6, -8)
+        rows[:, mt.GPS_Y] = (-1, 3, -5, 7)
+        rows[:, mt.T] = np.arange(4) * 10                     # a second apart
+        rows[:, mt.YAW] = (10, 20, 30, 40)                    # 1 deg/s, slow
+        rows[:, mt.GPS_HEAD] = (0, 0, 0, 0)
+        rows[:, mt.FIX] = 4
+        s = mt.summarize(rows)
+        self.assertEqual((s['xte_med'], s['xte_p95']), (5, 7))
+        self.assertEqual((s['gps_xte_med'], s['gps_xte_p95']), (4, 6))
+        self.assertEqual((s['head_med'], s['head_p95']), (30, 39))   # the first row has no rate
+        # GPS against the path counts only on RTK fixed
+        rows[:2, mt.FIX] = 3
+        self.assertEqual(mt.summarize(rows)['gps_xte_med'], 6)
+        # a fast turn: no heading error there
+        rows[2, mt.YAW] = 400                                  # 37 deg in a second
+        s = mt.summarize(rows)
+        self.assertEqual((s['head_med'], s['head_p95']), (20, 20))
+        empty = mt.summarize(rows[:0])
+        self.assertIsNone(empty['xte_med'])
+
+    def test_every_old_width_loads(self):
+        os.makedirs(mt.run_dir('a'))
+        for i, width in enumerate((20, 26, 34)):
+            run = '20261108_10000%d' % i
+            old = np.zeros((3, width), np.int32)
+            old[:, mt.X] = 100
+            meta = {'v': 3, 'run': run, 'site': 'a', 'start': T0, 'end': T0 + 9,
+                    'datum': [self.datum['utm_e'], self.datum['utm_n'], self.datum['yaw_rad']]}
+            mt._write_npz(os.path.join(mt.run_dir('a'), run + '.npz'), meta, old, [])
+            rows = mt.read_run('a', run, self.datum)[1]
+            self.assertEqual(rows.shape, (3, mt.STRIDE))
+            self.assertTrue((rows[:, mt.PATH_X:] == mt.NONE).all())
+            self.assertEqual(len(mt.wire(rows)), 3 * mt.WIRE_STRIDE)
+            self.assertIsNone(mt.detail(meta, rows, [], 0)['xte_m'])
+            # the open run of an older driver, as jsonl
+            jrun = '20261108_11000%d' % i
+            with open(os.path.join(mt.run_dir('a'), jrun + '.jsonl'), 'w') as f:
+                f.write(json.dumps(dict(meta, run=jrun)) + '\n')
+                f.write(json.dumps([7] * width) + '\n')
+                f.write(json.dumps([7] * mt.STRIDE) + '\n')
+            rows = mt.read_run('a', jrun, self.datum)[1]
+            self.assertEqual(rows.shape, (2, mt.STRIDE))
+            self.assertEqual(int(rows[0, mt.PATH_X]), mt.NONE)
+            self.assertEqual(int(rows[1, mt.PATH_X]), 7)
+
+    def test_rebase_moves_positions(self):
+        rows = np.full((1, mt.STRIDE), mt.NONE, np.int32)
+        rows[0, mt.X], rows[0, mt.Y] = 100, 0
+        rows[0, mt.GPS_X], rows[0, mt.GPS_Y] = 100, 0
+        rows[0, mt.YAW] = 0
+        rows[0, mt.ODOM_X] = 55
+        stored = {'utm_e': 0.0, 'utm_n': 0.0, 'yaw_rad': 0.0}
+        datum = {'utm_e': 0.0, 'utm_n': 0.0, 'yaw_rad': math.pi / 2}
+        out = mt._rebase(rows, stored, datum)
+        self.assertEqual((int(out[0, mt.GPS_X]), int(out[0, mt.GPS_Y])), (0, -100))
+        self.assertEqual(int(out[0, mt.YAW]), -900)
+        self.assertEqual(int(out[0, mt.PATH_X]), mt.NONE)
+        self.assertEqual(int(out[0, mt.ODOM_X]), 55)
+
+    def test_gps_gate(self):
+        rec = self.recorder()
+        self.assertTrue(rec.gps_usable(3, 900, 50.0, 14.9))
+        self.assertTrue(rec.gps_usable(4, 14, 50.0, 14.9))
+        self.assertFalse(rec.gps_usable(2, 14, 50.0, 14.9))
+        self.assertFalse(rec.gps_usable(5, 14, 50.0, 14.9))             # time only
+        self.assertFalse(rec.gps_usable(3, 1001, 50.0, 14.9))
+        self.assertFalse(rec.gps_usable(3, 14, 0.0, 0.0))
+        rec = self.recorder(gps_max_hacc_m=2.0)
+        self.assertTrue(rec.gps_usable(3, 1500, 50.0, 14.9))
+
+    def test_fix_time_less_latency(self):
+        self.assertAlmostEqual(self.recorder().fix_time(100.0), 99.9)
+        self.assertAlmostEqual(self.recorder(gps_latency_s=0.25).fix_time(100.0), 99.75)
+
+    def test_past_the_end_is_none(self):
+        tr = mt.PathTracker()
+        tr.set_path('g', [(0.0, 0.0), (5.0, 0.0)])
+        got = tr.project(6.0, 0.0)
+        self.assertAlmostEqual(got[3], 0.0)                    # on the line of the path
+        self.assertAlmostEqual(got[4], 1.0)
+        rec = self.run_on_path([0.0, 0.0], path=[(0.0, 0.0), (0.2, 0.0)])
+        self.assertEqual(int(self.rows(rec)[0, mt.XTE]), 0)
+        self.t += 1.0
+        self.tick(rec, (2.5, 0.0, 0.0))                        # 2.3 m past the end, xte 0
+        self.assertEqual(int(self.rows(rec)[-1, mt.PATH_X]), mt.NONE)
+        self.assertEqual(int(self.rows(rec)[-1, mt.XTE]), mt.NONE)
+
+    def test_projection_on_an_old_path_does_not_steer_the_new(self):
+        tr = mt.PathTracker()
+        tr.set_path('g1', [(float(x), 0.0) for x in range(21)])
+        tr.project(15.0, 0.0)
+        old = tr._path
+        tr.set_path('g2', stripes())
+        self.assertIsNone(tr.s_last)                           # bound to g1
+        # a project() that started on g1 finishes after the swap: it must not store
+        tr._s = (old, 15.0)
+        self.assertIsNone(tr.s_last)
+        self.assertAlmostEqual(tr.project(0.5, 0.0)[1], 0.0)
+        self.assertAlmostEqual(tr.s_last, 0.5)
+
+    def test_set_and_end_from_threads(self):
+        import threading
+        tr = mt.PathTracker()
+        line = [(0.0, 0.0), (5.0, 0.0)]
+        stop, bad = [], []
+
+        def loop():
+            while not stop:
+                got = tr.project(1.0, 0.1)
+                if not (got is None or (len(got) == 5 and abs(got[3] - 0.1) < 1e-9)):
+                    bad.append(got)
+        th = threading.Thread(target=loop)
+        th.start()
+        for i in range(300):
+            tr.set_path('g%d' % i, line)
+            tr.end('g%d' % (i - 1))                             # an older result: no effect
+        stop.append(1)
+        th.join()
+        self.assertEqual(bad, [])
+        self.assertEqual(tr.goal_id, 'g299')
+        self.assertIsNotNone(tr.project(1.0, 0.1))
+
+    def test_lidar_when_gps_good_but_corr_too_big(self):
+        rec = self.recorder()
+        rec.feed_busy(True)
+        self.drive(rec, 1)
+        msg = {'state': 'corr_too_big', 'corr_m': 0.9, 'rms': 0.05, 'corr_yaw_deg': 2.0,
+               'corr_dx': 0.0, 'corr_dy': 0.9, 'corr_dyaw_deg': 2.0}
+        rec.feed_tracker(self.t, dict(msg, gps_good=False))
+        rec.feed_tracker(self.t, dict(msg, rms=0.5, gps_good=True))   # rms gate stays
+        self.assertIsNone(rec._read_lidar(self.t))
+        rec.feed_tracker(self.t, dict(msg, gps_good=True))
+        self.drive(rec, 1, x0=0.5, dt=0.1)
+        row = self.rows(rec)[-1]
+        self.assertEqual((int(row[mt.LIDAR]), int(row[mt.LIDAR_X]), int(row[mt.LIDAR_Y]),
+                          int(row[mt.LIDAR_DYAW])), (90, 50, 90, 20))
+        self.assertEqual(mt.TRACK_STATES[int(row[mt.TRACK])], 'corr_too_big')
+
+    def test_heading_must_be_fresh(self):
+        rec = self.recorder()
+        rec.feed_busy(True)
+        self.drive(rec, 1)
+        rec.feed_heading(self.t, 0.1, 0.01)
+        self.tick(rec, (0.5, 0.0, 0.0), dt=0.3)
+        self.assertNotEqual(int(self.rows(rec)[-1, mt.GPS_HEAD]), mt.NONE)
+        self.tick(rec, (1.0, 0.0, 0.0), dt=0.3)                # 0.6 s old
+        self.assertEqual(int(self.rows(rec)[-1, mt.GPS_HEAD]), mt.NONE)
+
+    def test_no_head_err_in_a_turn(self):
+        rows = np.full((3, mt.STRIDE), mt.NONE, np.int32)
+        rows[:, mt.STATE] = 0
+        rows[:, mt.T] = (0, 5, 10)                             # 0.5 s apart
+        rows[:, mt.GPS_HEAD] = 0
+        rows[:, mt.YAW] = (0, 50, 250)                         # 0.17 rad/s, then 0.7 rad/s
+        self.assertEqual(mt.wire(rows)[25::26], [mt.NONE, 50, mt.NONE])
+        # an append message gets the row before
+        self.assertEqual(mt.wire(rows[1:], mt._turning(rows[1:], 0.3, rows[0]))[25::26], [50, mt.NONE])
+        self.assertEqual(mt.wire(rows, mt._turning(rows, 1.0))[25::26], [mt.NONE, 50, 250])
+        # a line break: no rate
+        rows[1, mt.STATE] += mt.BRK
+        self.assertEqual(mt.wire(rows)[25::26][1], mt.NONE)
+
+    def test_live_messages_use_the_row_before(self):
+        rec = self.recorder()
+        rec.feed_busy(True)
+        for i in range(6):
+            rec.feed_heading(self.t + 0.5, 0.0, 0.01)
+            self.tick(rec, (i * 0.15, 0.0, 0.0))
+        heads = [v for m in self.sent('trail') for v in m['r'][25::26]]
+        self.assertEqual(heads[0], mt.NONE)                     # the very first row only
+        self.assertTrue(all(v == 0 for v in heads[1:]))
+        self.assertGreater(len(heads), 2)
+
+    def test_off_path_at_the_row(self):
+        rec = self.run_on_path([0.0, 0.0, 0.4])
+        e = [e for e in rec.run.events if e[3] == 'off_path'][0]
+        self.assertEqual((e[1], e[2]), (30, 40))
+
+    def test_old_odometry_is_none(self):
+        rec = self.recorder()
+        rec.feed_busy(True)
+        self.drive(rec, 1)
+        rec.feed_odom(self.t, 1.0, 2.0, 0.0)
+        self.tick(rec, (0.5, 0.0, 0.0), dt=0.5)
+        self.assertEqual(int(self.rows(rec)[-1, mt.ODOM_X]), 100)
+        self.tick(rec, (1.0, 0.0, 0.0), dt=0.8)
+        self.assertEqual(int(self.rows(rec)[-1, mt.ODOM_X]), mt.NONE)
+
+    def test_new_event_goes_last(self):
+        self.assertEqual(mt.EVENTS[-1], 'off_path')
+        self.assertEqual(mt.EVENTS.index('gps_jump'), 16)
 
 
 class Query(Base):
