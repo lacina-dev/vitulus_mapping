@@ -548,7 +548,9 @@ class Robust(unittest.TestCase):
     def test_kerb_left(self):
         for kerb in (0.05, 0.08):
             # grass on the kerb too: the whole strip is lifted (its bottom with
-            # its top), terrain beside the track -> unknown, never tall grass
+            # its top), terrain beside the track -> unknown, never tall grass.
+            # (Until review 3 this expected lane_edge with the kerb as tall
+            # grass: the test encoded the bug, changed with approval.)
             e = grass.GrassEngine(calib=calibrated())
             f = lambda x, y: np.where(y > 0.12, kerb, 0.0)       # noqa: E731
             for t in range(4):
@@ -609,20 +611,16 @@ class Review2(unittest.TestCase):
     def test_mown_uncut_edge_reports_the_tall_lane(self):
         for side in (1, -1):
             e = grass.GrassEngine(calib=calibrated())
-            outs = []
-            for t in range(8):
+            for t in range(6):
                 x = RNG.uniform(0.6, 1.8, 6000)
                 y = RNG.uniform(-0.4, 0.4, 6000)
                 tall = side * y > 0.12
                 z = np.where(tall, 0.130, 0.030) * RNG.uniform(0.3, 1.0, 6000)
-                outs.append(e.frame(t * 0.25, np.c_[x, y, z], (t * 0.05, 0.0, 0.0), (0.0, 0.0),
-                                    cut_mm=60.0))
-            # tall in most frames, never "mown"; an odd frame may stay unknown
-            self.assertNotIn("below_cut", [o["class"] for o in outs])
-            edges = [o for o in outs if o.get("lane_edge")]
-            self.assertGreaterEqual(len(edges), 6)
-            self.assertTrue(all(o["class"] == ">+4cm" and o["min_lane_class"] == "below_cut"
-                                for o in edges))
+                o = e.frame(t * 0.25, np.c_[x, y, z], (t * 0.05, 0.0, 0.0), (0.0, 0.0), cut_mm=60.0)
+                # every frame on either side (6/6): the edge and the tall lane
+                self.assertTrue(o.get("lane_edge"), (side, t, o))
+                self.assertEqual(o["class"], ">+4cm", (side, t, o))
+                self.assertEqual(o["min_lane_class"], "below_cut")
 
     def test_edge_cells_keep_both_sides(self):
         # drive along a mown | uncut edge: map cells come out per side, not averaged
@@ -745,6 +743,17 @@ class Review3(unittest.TestCase):
             cls = [o["class"] for o in outs]
             self.assertGreaterEqual(cls.count(">+4cm"), 5, (ye, cls))
             self.assertNotIn("below_cut", cls)
+
+    def test_edge_tall_or_beside_bare_path_on_both_sides(self):
+        # the bottom of grass scales with its height: 20 cm uncut beside a mown
+        # lane and 13 cm beside a bare path are edges too, mirrored alike
+        for side in (1, -1):
+            for tall, low in ((200.0, 30.0), (130.0, 0.0)):
+                outs = self.side_frames(flat_ground, lambda x, y, s=side, h=tall, lo=low:
+                                        np.where(s * y > 0.12, h, lo))
+                for o in outs:
+                    self.assertTrue(o.get("lane_edge"), (side, tall, low, o))
+                    self.assertEqual(o["class"], ">+4cm", (side, tall, low, o))
 
     def test_cell_with_two_heights_is_dropped(self):
         # drive along a kerb whose edge cuts through a row of cells (y = 0.3 in a

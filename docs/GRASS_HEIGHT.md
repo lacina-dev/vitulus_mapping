@@ -146,8 +146,15 @@ Kamera vidí jen vrch porostu („koberec“), nikdy zem pod ním. Proto:
      sklon se od schodu odliší proložením přímkou): hladký vyšší pruh je
      obrubník nebo chodník a tráva se čte z nižších pruhů; vyšší pruh je
      hrana posekané a neposekané trávy jen když jeho spodek (p10) sedí na
-     zemi nízkých pruhů (do 20 mm, nebo v dolní čtvrtině schodu) a jeho vrch
-     není plochý. Hlásí se pak výška každého pruhu a odpověď je vysoký pruh.
+     zemi nízkých pruhů: měřeno od spodku nízkých pruhů je do 20 mm, nebo
+     leží v dolní polovině výšky od spodku nízkých pruhů po vrch (p90)
+     vyššího pruhu, tj. `p10 − lo_bot ≤ 0,5·(p90 − lo_bot)` (`edge_bottom_frac`).
+     Tráva má stébla všech délek, takže tenhle podíl drží pro 6 cm i 25 cm
+     trávy i vedle holé cesty; obrubník nebo svah zvedne spodek s vrchem
+     a podíl jde k 1. Vrch vyššího pruhu navíc nesmí být plochý. Obě strany
+     schodu se posuzují stejně: pruh se dvěma výškami (leží přímo na hraně)
+     se nepočítá ani k jedné straně a každá strana musí mít aspoň jeden čistý
+     pruh. Hlásí se pak výška každého pruhu a odpověď je vysoký pruh.
      Zvednutý celý pruh (obrubník, okraj záhonu, kamenná obruba, svah) je
      terén → `unknown`; nerovné strany schodu (keř, předmět) taky;
    - hladký koberec (drsnost ≤ `rough_bare_mm`) blízko očekávané zemi
@@ -171,6 +178,42 @@ koridor z `grass_calib fit` má přednost před konfigurací.
   nebo `unknown` (začátek cap2 = robot vjíždí na vyvýšeninu, DEM potvrzuje
   terén), nikdy vysoká tráva: `test/test_grass_replay.py` (data mimo git,
   `GRASS_CAPS`).
+
+## Známá omezení v1
+
+První verze je záměrně konzervativní: když si není jistá, hlásí `unknown`,
+ne vysokou trávu. Ladit se bude na skutečných datech až po kalibraci
+(`grass_calib`: beton ve 2 směrech, posekaná tráva, vyšší tráva); další
+ladění na syntetických scénářích už má malý přínos.
+
+- **Šikmé hrany.** Hrana posekané a neposekané trávy rovnoběžná s jízdou se
+  pozná spolehlivě (obě strany stejně, tráva 13–25 cm vedle posekané i vedle
+  holé cesty). Hrana šikmo přes koridor se rozpadne: při 10–20° se pozná
+  jen část snímků, při 30° a víc skoro žádný; výsledek je `unknown`, nebo
+  `below_cut`, dokud je v koridoru hlavně posekaná část.
+- **Zatáčky.** Koridor míří po tečně, v zatáčce vidí hlavně vnější stranu
+  oblouku. Neposekaná tráva těsně uvnitř oblouku pak může vyjít `below_cut`,
+  hrana těsně vně oblouku `unknown`. Do mapy se buňka zapíše, jen když ji
+  pohled viděl aspoň z poloviny.
+- **Hustá a polehlá tráva.** Hustá rovnoměrná tráva má spodek vysoko pod
+  vrchem jako tráva na obrubníku; hrana husté trávy proto vychází `unknown`
+  (nerozliší se od zatravněného obrubníku). Celoplošná hustá nebo polehlá
+  tráva blízko hranice tříd vychází `unknown` (`low_confidence`).
+  Zmírnění `edge_top_rough` na tom nic nemění (ověřeno 0,15 → 0), proto
+  zůstává 0,15.
+- **Obrubníky a svahy vedle stopy.** Hladký holý obrubník se pozná jako
+  obrubník a tráva se čte z nízkých pruhů (typicky `below_cut`); zatravněné
+  obrubníky a svahy vycházejí `unknown`. Krátká tráva na obrubníku (≤ 6 cm)
+  nikdy nevyjde jako vysoká tráva.
+- **Nízká obruba s delší trávou.** Na obrubě nebo schodu 2,6–4 cm s trávou
+  8–10 cm se hlásí výška tráva + schod, třída tak může vyjít o stupeň výš
+  (`+2-4cm` → `>+4cm`). Vědomý důsledek kritéria spodku (D41: neladit na
+  syntetice, ověřit na datech).
+- **Svislé plochy vedle stopy** (zeď, plot, bok bedny) se mohou vyhodnotit
+  jako hrana neposekané trávy (`>+4cm`): body na svislé ploše mají spodek u
+  země a hrubý vrch a za plochou nejsou pruhy. Výstup `/grass/ahead` zatím
+  nikdo neřídí (jen informace); ve v2 vyžadovat ≥ 2 čisté vyšší pruhy nebo
+  body za vyšším pruhem.
 
 ## DEM a výška země (2026-11-08)
 

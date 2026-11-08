@@ -107,19 +107,19 @@ DEFAULTS = {
     "track_gap_s": 2.0,
     "drift_deg": 0.5,          # attitude error assumed for the integrated altitude (sigma per metre)
     "ground_max": 4000,
-    "lane_step_mm": 25.0,
+    "lane_step_mm": 25.0,      # strips side by side differing more = kerb or grass edge (a step)
     "strip_w": 0.07,           # lateral strips for kerbs and mown | uncut edges
     "strip_min_pts": 30,
     "strip_pure_gap": 0.35,    # a strip with a larger decile gap holds two heights (border strip)
     "side_even_mm": 15.0,      # strips on each side of a step must agree this well
     "edge_top_rough": 0.15,    # grass tops vary: (p90-p60)/(p90-p10) below this = flat top (kerb)
     "edge_bottom_mm": 20.0,    # a taller lane is grass when its p10 is this close to the low lanes' p10
-    "edge_bottom_frac": 0.25,  # ... or in the lower quarter of the step above their carpet
+    "edge_bottom_frac": 0.5,   # ... or p10 - lo_bot <= frac * (p90 - lo_bot) (lower half from the low lanes' bottom to its top)
     "cell_split_mm": 40.0,     # a map cell whose p90-p10 exceeds this and whose deciles have
     "cell_split_gap": 0.5,     # a gap over this share of it holds two heights (kerb, bank): dropped
     "cell_split_gap_terrain": 0.3,  # ... this share when the frame saw raised terrain beside
     "cell_flat_bottom": 0.15,  # (p40-p10)/(p90-p10) below this = flat bottom under a higher top
-    "cell_min_cover": 0.5,     # a map cell is written only when seen over this share of its area      # lanes differing more than this side by side = kerb or grass edge
+    "cell_min_cover": 0.5,     # a look counts for a map cell only when it saw this share of its area
     "bare_offset_mm": 20.0,    # smooth AND this close to the ground plane = bare surface
     "pivot_x": 0.125,          # front wheel contact: where a slope seen ahead starts
     "wheels_min_frac": 0.5,    # share of corridor cells with ground to call it wheels/dem
@@ -785,35 +785,47 @@ class GrassEngine(object):
             return None
         high = strips[m:] if jump > 0 else strips[:m]
         low = [sv for sv in strips if sv not in high]
+        # Both sides of the step are judged alike: a strip holding two heights sits
+        # on the border (lawn | kerb, mown | uncut) and belongs to neither side, so
+        # it is left out of the evenness, the kerb test and the low ground on
+        # either side; each side needs at least one clean strip.
+        lo_p, hi_p = self._pure(low), self._pure(high)
+        if not lo_p or not hi_p:
+            return ("terrain", low, high)
         # a clean step has two even sides; uneven sides (a bush, an object, rough
         # ground) are no edge and no kerb -> unknown
-        hj = [sv[2] for sv in high if sv[3] <= self.cfg["strip_pure_gap"]]
-        if (np.std([sv[2] for sv in low]) > self.cfg["side_even_mm"]
-                or (hj and np.std(hj) > max(self.cfg["side_even_mm"], 0.25 * abs(jump)))):
+        if (np.std([sv[2] for sv in lo_p]) > self.cfg["side_even_mm"]
+                or np.std([sv[2] for sv in hi_p]) > max(self.cfg["side_even_mm"], 0.25 * abs(jump))):
             return ("terrain", low, high)
-        if hj and all(sv[2] - sv[1] <= 1.5 * self.calib.rough_bare_mm
-                      for sv in high if sv[3] <= self.cfg["strip_pure_gap"]):
-            return ("kerb", low, high)       # judged on the clean strips, not the border one
-        if self._grows_from_low_ground(low, high):
+        if all(sv[2] - sv[1] <= 1.5 * self.calib.rough_bare_mm for sv in hi_p):
+            return ("kerb", low, high)
+        if self._grows_from_low_ground(lo_p, hi_p):
             return ("edge", low, high)
         return ("terrain", low, high)
 
+    def _pure(self, strips):
+        """Strips holding one height (decile gap share <= strip_pure_gap)."""
+        return [sv for sv in strips if sv[3] <= self.cfg["strip_pure_gap"]]
+
     def _grows_from_low_ground(self, low, high):
         """Taller strips are grass only if their bottom reaches down to the ground
-        of the low strips: bottom (p10) within edge_bottom_mm of theirs, or in the
-        lower edge_bottom_frac of the step above their carpet. A kerb, a bed
-        border or a bank lifts the bottom with the top. Strips: (y, p10, p90)."""
+        of the low strips (both lists clean strips: (y, p10, p90, gap, p60)).
+        Measured from the low strips' bottom lo_bot, a tall strip's bottom (p10)
+        must lie within edge_bottom_mm, or in the lower edge_bottom_frac of the
+        strip's own span (p10 and p90 over lo_bot). Grass keeps its p10/p90 share
+        whatever its height (blades of all lengths), so this holds for 13 cm as
+        for 25 cm grass and beside bare ground (the old reference, a quarter of
+        the step over the low carpet, failed above ~15 cm and beside bare
+        ground); a kerb, a bed border or a bank lifts the bottom with the top,
+        and its share goes to 1."""
         lo_bot = float(np.median([sv[1] for sv in low]))
-        lo_top = float(np.median([sv[2] for sv in low]))
-        # strips holding two heights sit on the border (lawn | kerb or mown | uncut):
-        # they cannot tell; at least one clean tall strip must show the bottom
-        pure = [sv for sv in high if sv[3] <= self.cfg["strip_pure_gap"]]
+        frac = self.cfg["edge_bottom_frac"]
         # a flat top (p60..p90 tight) is a kerb or bank top, not grass blades
-        return bool(pure) and all(
+        return bool(high) and all(
             (sv[1] - lo_bot <= self.cfg["edge_bottom_mm"]
-             or sv[1] <= lo_top + self.cfg["edge_bottom_frac"] * (sv[2] - lo_top))
+             or sv[1] - lo_bot <= frac * (sv[2] - lo_bot))
             and (sv[2] - sv[4]) >= self.cfg["edge_top_rough"] * max(1e-6, sv[2] - sv[1])
-            for sv in pure)
+            for sv in high)
 
     def _bias_deg(self):
         return self.cfg["imu_bias_measured_deg" if self.calib.imu_offset_measured
@@ -1124,6 +1136,8 @@ class GrassEngine(object):
             edge = False
             if side is not None:
                 kind, low_s, high = side
+                # each side's level from its clean strips (the border strip holds both)
+                low_s, high = self._pure(low_s) or low_s, self._pure(high) or high
                 lo_top = float(np.median([sv[2] for sv in low_s]))
                 if kind == "kerb":
                     # smooth raised strips = kerb/pavement: the low strips carry the grass
