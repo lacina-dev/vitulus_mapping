@@ -25,6 +25,11 @@ SRC_FILL = 2
 SRC_INPAINT = 3
 
 _GROW_CELLS = 128          # grow in blocks to amortize reallocation
+# Ground reference of the elevations. 1 = the wheel contact plane (= base_link).
+# Files without the key were written with a 0.055 m "wheel radius" subtracted
+# from base_link (trajectory_dem until 2026-11-08): 5.5 cm too low, lifted on load.
+GROUND_REF = 1
+LEGACY_GROUND_SHIFT_M = 0.055
 _WEIGHT_CAP = 50.0         # cap running-mean weight so seasonal change adapts
 
 
@@ -37,6 +42,7 @@ class DemGrid:
         self.weight = np.zeros((0, 0), np.float32)
         self.last_seen = np.zeros((0, 0), np.float64)
         self.source = np.zeros((0, 0), np.uint8)
+        self.migrated = False      # loaded from a legacy file and lifted
 
     # ---- geometry ----------------------------------------------------------
     @property
@@ -234,7 +240,8 @@ class DemGrid:
         os.close(fd)
         np.savez_compressed(tmp, res=self.res, ox=self.ox, oy=self.oy,
                             elev=self.elev, weight=self.weight,
-                            last_seen=self.last_seen, source=self.source)
+                            last_seen=self.last_seen, source=self.source,
+                            ground_ref=GROUND_REF)
         os.replace(tmp, path)
 
     @classmethod
@@ -247,4 +254,8 @@ class DemGrid:
             d.weight = f['weight']
             d.last_seen = f['last_seen']
             d.source = f['source']
+            legacy = 'ground_ref' not in f.files
+        if legacy:
+            d.elev = d.elev + np.float32(LEGACY_GROUND_SHIFT_M)
+            d.migrated = True
         return d
