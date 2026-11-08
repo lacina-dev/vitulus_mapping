@@ -115,7 +115,7 @@ A rotation away from a `nogo` stays possible with `v_fwd = v_back = 0`, rotation
   `slow`: cap when the footprint overlaps. `nogo`: `v_fwd`/`v_back` tapering to 0 at 0.15 m footprint
   clearance along that direction, stopping-distance aware; `w` limited if rotation sweeps the footprint in.
   TF older than 1 s with rules present: `v_fwd = v_back = w = 0`. Use the real footprint from config.
-- Guard publishes `/map_rules/state` latched JSON `{"in":[...],"near":[...],"limit":{...},"blade":"..."}`
+- Guard publishes `/map_rules/state` latched JSON `{"in":[...],"near":[...],"limit":{...},"blade":"...","zone":{...}}`
   for UI and agent, and `/map_rules/warning` when a human drives into a `nogo`.
 - `drive_primitive` refuses a command whose straight-line target crosses a `nogo` at start, with a reason.
 - `~enabled` param, default true. With no rules the guard publishes `rules: 0` and changes nothing.
@@ -127,6 +127,22 @@ if the guard stopped it, the program still runs and no stop reason exists. Patte
 `vitulus_gnss/nodes/gnss_watchdog:303-365`. Forbidden: rpm 0 (firmware ignores it), `/mower/set_power`
 in either direction (true resets the MCU on a powered board, false homes the deck and powers off).
 Allow 6 s soft-start after exit without treating it as a fault.
+
+Zone fence (2026-11-08): the blade cuts only inside the zone the program mows. The mission publishes
+`/mower_smach/active_zone`, latched JSON `{program, zone, frame:"map", points}` at GET_ZONE_DATA, `{}` at its
+start and at every `safe_blade_shutdown` (zone end, abort, stop, dock), always after its `set_motor_on(false)`.
+While a program runs, the robot centre more than `~zone_edge_m` (0.15) outside that polygon for `~zone_hold_s`
+(0.2) counts as a noblade area with the same off/on logic; back on within `~zone_edge_m - ~zone_hysteresis_m`
+(0.12), after `~zone_on_gap_s` (1.0, not `~blade_on_gap_s`: hysteresis and hold already stop cycling, and the
+robot stands meanwhile). Driving outside stays allowed. A zone change drops the fence's debt (never a True
+behind a zone); a respawn outside the zone with a debt of the same program and zone (`~blade_owed {program,
+zone, stamp}`, decided after the first `active_zone`) is `stopped_by_rule`, not `restore_failed`. A noblade
+area inside the zone on the way back keeps it a fence stop. `/map_rules/state` gets `zone: {name, program, outside, out_m}` (null without a zone) and
+`held_by: zone|noblade` while a True is owed; `rule_gate.noblade_here()` reads `zone.outside`. Back in the zone
+(`restoring`, `held_by` zone) while a path is mowed, `rule_gate.ZoneSpinUp` holds the mission (HOLD) until
+the blade is at speed (setpoint ±100 rpm); the transits to a path start (EXE_PATH_TO_BEGIN/_START,
+RemowSkippedSpans) do not stop at the edge. Going home (stop_reason, home latch) ends the wait. The on-gap counts from the first False of a stop. UI: no banner
+or notice for it (normal), info in the editor. Off: `~zone_fence false`.
 
 ### Coverage (vitulus_planner)
 `nogo` and `noblade` masks go to OBSTACLE in `np_zone` only, after node_planner:708; `np_zone_navi`
