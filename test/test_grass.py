@@ -822,12 +822,15 @@ def world_carpet(pose, ground, grass_mm, R, z_robot, n=6000, lo=0.3):
 
 
 def mow_lanes(ground, grass_mm, bias_deg, lanes=8, length=6.0, gap=0.3, cut_mm=60.0, cells=None,
-              jump=None):
+              jump=None, ramp=1):
     """Back-and-forth mowing lanes over a world terrain, IMU pitch off by
     bias_deg (blade vibration); jump = (lane, dx, dy): from the start of that lane
-    the REPORTED pose is off by dx, dy (a GNSS jump). Returns the outputs per lane."""
+    the REPORTED pose is off by dx, dy (a GNSS jump), reached over `ramp` frames
+    (an EKF sliding the correction in). Returns the outputs per lane."""
     e = grass.GrassEngine(calib=calibrated(), on_cell=(lambda *a: cells.append(a)) if cells is not None else None)
     t, outs = 0.0, []
+    n_jump = [0]
+
     def frame(X, Y, yaw, k):
         fx, fy = math.cos(yaw), math.sin(yaw)
         zf = ground(np.array([X + 0.125 * fx]), np.array([Y + 0.125 * fy]))[0]
@@ -835,7 +838,11 @@ def mow_lanes(ground, grass_mm, bias_deg, lanes=8, length=6.0, gap=0.3, cut_mm=6
         pitch = -math.atan2(zf - zr, 0.25)
         R = grass.rot_rpy(0.0, pitch, yaw)
         P = world_carpet((X, Y, yaw), ground, grass_mm, R, 0.5 * (zf + zr))
-        px, py = (X + jump[1], Y + jump[2]) if jump and k >= jump[0] else (X, Y)
+        px, py = X, Y
+        if jump and k >= jump[0]:
+            n_jump[0] += 1
+            f = min(1.0, n_jump[0] / float(ramp))
+            px, py = X + f * jump[1], Y + f * jump[2]
         return e.frame(t, P, (px, py, yaw), (0.0, pitch + math.radians(bias_deg)), cut_mm=cut_mm)
 
     for k in range(lanes):
@@ -942,6 +949,46 @@ class Drift(unittest.TestCase):
             self.assertGreaterEqual(e.track.epoch, 1, amt)
         e, _o = mow_lanes(ground, 50.0, 1.3, lanes=3)
         self.assertEqual(e.track.epoch, 0)          # driving itself is never a jump
+
+    def test_pose_slid_over_frames_starts_over(self):
+        # the same jump slid in over 3-10 frames (each step under the jump limit):
+        # the wheels come back on ground that no longer fits the drift curve
+        ground = lambda X, Y: 0.12 * np.sin(0.9 * X) + 0.02 * Y   # noqa: E731
+        for amt in (0.5, 0.9):
+            for ramp in (3, 5, 10):
+                e, outs = mow_lanes(ground, 50.0, 1.3, lanes=8, jump=(4, amt, 0.0), ramp=ramp)
+                got = {o["class"] for lane in outs for o in lane} - {"unknown"}
+                self.assertEqual(got, {"below_cut"}, (amt, ramp))
+                epochs = sum(v for k, v in e.stats.items() if k.startswith("epochs_"))
+                self.assertGreaterEqual(epochs, 1, (amt, ramp, e.stats))
+        e, _o = mow_lanes(ground, 50.0, 1.3, lanes=8)
+        self.assertFalse([k for k in e.stats if k.startswith("epochs_")], e.stats)
+
+    def test_epoch_causes_counted(self):
+        # a slide found by the wheels and a jump in the same frame count both;
+        # the doubt of the wheels ends with its track window
+        e = grass.GrassEngine(calib=calibrated())
+        for i in range(8):
+            e.frame(i * 0.25, carpet(flat_ground, 20.0), (i * 0.08, 0.0, 0.0), (0.0, 0.0))
+        e._restart = "ground"
+        e.frame(2.25, carpet(flat_ground, 20.0), (3.0, 0.0, 0.0), (0.0, 0.0))
+        self.assertEqual((e.stats.get("epochs_ground"), e.stats.get("epochs_jump")), (1, 1), e.stats)
+        self.assertEqual(e.track.epoch, 1)
+        d = grass.Drift(dict(grass.DEFAULTS))
+        d.suspect_s = 10.0
+        self.assertTrue(d.suspect(10.3))
+        self.assertFalse(d.suspect(11.0))
+
+    def test_pose_slid_on_bumpy_lawn(self):
+        # bumps at the cell scale and a molehill: the slide shows in the corridor
+        # (carpet of the earlier pass) before the wheels get there
+        def bumpy(X, Y):
+            return (0.12 * np.sin(0.9 * X) + 0.02 * Y + 0.015 * np.sin(17 * X) * np.cos(13 * Y)
+                    + 0.04 * np.exp(-((X - 3) ** 2 + (Y - 1.0) ** 2) / 0.02))
+        for amt, ramp in ((0.5, 3), (0.5, 20), (0.6, 10)):
+            e, outs = mow_lanes(bumpy, 50.0, 1.3, lanes=8, jump=(4, amt, 0.0), ramp=ramp)
+            got = {o["class"] for lane in outs for o in lane} - {"unknown"}
+            self.assertEqual(got, {"below_cut"}, (amt, ramp, e.stats))
 
     def test_partly_known_corridor_uses_the_plane(self):
         # lane 2 (Y = 0.3) sees the wheel tracks of lane 1 on one side only

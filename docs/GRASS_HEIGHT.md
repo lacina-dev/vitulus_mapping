@@ -194,7 +194,67 @@ až po 20 návratech se součtem 60 m stopy; nová epocha ji zahodí i se zemí 
 Nová epocha = mezera nad 2 s, spánek, nebo **skok pózy**: krok delší než
 0,15 m + 0,8 m/s × čas mezi snímky (při 4 Hz 0,35 m; robot jezdí do 0,5 m/s),
 nejvýš 1 m. Dřív se skok pod 1 m nepoznal a zem z kol se porovnávala přes něj
-(simulace skoku 0,5–0,9 m: falešné `>+4cm` s jistotou ~1). Výpočet je malá
+(simulace skoku 0,5–0,9 m: falešné `>+4cm` s jistotou ~1).
+
+Skok rozložený do víc snímků (EKF korekci GNSS dosouvá postupně, každý krok
+pod limitem) se hlídá dvakrát:
+
+- **Kola** (neshoda země): kola se vracejí na buňky, jejichž uložená zem teď
+  leží jinde. Kontroluje se každý návrat z víc než 0,6 m stopy zpět: medián
+  posledních 6 návratů proti křivce nad max(20 mm, 3σ křivky) → zem z dávna se
+  v tomtéž snímku nepoužije a od dalšího začne nová epocha (`epochs_ground`).
+  Nekontroluje se v otočce (kurz se za poslední 2 s mění rychleji než 10°/s)
+  ani na čerstvé křivce (méně než 150 návratů nebo 20 m stopy): večerní
+  záznamy 8. 11. tam bez kontroly dávaly falešné epochy ve víceraných otočkách
+  na konci pruhu (návraty z ~10 m stopy o 30–80 mm mimo křivku s σ ~11 mm,
+  map→odom pevné) a po nich DEM hlásil `>+4cm` tam, kde zem z kol říkala
+  `below_cut`. Slabina: póza posunutá po svahu posune i integrovanou výšku,
+  takže kola pod sebou rozdíl skoro nevidí (ruší se); vidí ho až na zakřivení
+  terénu, 1,5–1,8 m po začátku posunu.
+- **Koberec**: koridor 0,8–1,6 m před koly vidí buňky, které kamera viděla na
+  dřívějším průjezdu. Jejich tehdejší vrch porostu (převedený křivkou driftu,
+  stejné pásmo vzdálenosti 0,4 m) proti dnešnímu = přesně chyba, kterou by
+  dostala výška. Nad max(30 mm, 3,5× rozptyl mediánů tohoto trávníku, nejméně
+  3,5σ křivky) a jen nahoru (staré výšky příliš nízko = falešná vysoká tráva;
+  sečení mezi průjezdy vrch jen snižuje). Epochu sám nezakládá: na záznamu
+  2. běhu byl nad mezí 17× bez posunu (vrch porostu před a po sečení a z jiného
+  úhlu se liší, rozptyl ~36 mm).
+- **Pochybnost o póze** = koberec nad mezí, nebo kola nahoru na 65 % své meze
+  (platí 0,5 m stopy), nebo po epoše z neshody země, dokud kola nemají novou
+  křivku. Pak smí zem z dávna i DEM (bere se v póze, je mimo stejně jako ona)
+  říct nejvýš `below_cut`; vyšší třída → `unknown` (`low_confidence`,
+  `pose_check`) a její výška se nepočítá do vyhlazení dalších snímků. Třída
+  nad výšku sečení z extrapolace potřebuje v pochybnosti jistotu 0,7 místo 0,6
+  (po epoše nemá koridor žádnou změřenou zem a krtinec se čte jako tráva).
+  Bez pochybnosti platí 0,6 jako dřív.
+
+**Cena pravidel.** Na pěti záznamech 8. 11. (1. a 2. běh, 18:21, 18:41, 19:15)
+je výstup snímek po snímku stejný jako v masteru (`unknown` 5 / 572 / 62 /
+208 / 167, `>+4cm` 2 / 16 / 39 / 87 / 51 snímků; žádná epocha z neshody země).
+Skutečná vysoká tráva v simulaci kontrolora (`k_r3.py`, první průjezd 110 /
+130 / 180 mm, sečení, hrana, druhý průjezd): stejné jako master ve všech
+variantách kromě jedné: druhý průjezd neposekanou 130 mm trávou na zvlněném
+terénu s chybou IMU 1,3° najde 403 ze 480 snímků vysoké trávy místo 407 (4×
+`pose_check`: koberec tam přes mez bez posunu). Mez koberce 3σ / 25 mm by
+stála 23 snímků (384), proto 3,5σ / 30 mm. Simulace posunů pózy
+(`k_adv2.py`, 39 variant: zvlněný, boční svah 7°, strmý 14°, hrbolatý s
+krtincem, oblouky, šum pózy, chyba náklonu IMU; posun 0,3 / 0,5 / 0,9 m
+rozložený do 1–20 snímků, boční 0,4 m, hrbolatý s oblouky 0,6 m): 0 falešných
+tříd ve všech 39 variantách a bez posunu žádná epocha navíc (master: 3–27
+falešných `>+4cm` u rozložených posunů).
+Neplatí to obecně: kde koridor nemá buňky z dřívějška (první průjezd, okraj),
+chrání jen kola a extrapolace sama. Kontrola kol ve 4σ místo 3σ by měla na
+2. běhu větší rezervu (nejvyšší poměr medián/mez 0,71 místo 0,95), ale na
+hrbolatém terénu s oblouky by propustila 14–19 falešných tříd. Falešná epocha
+není zadarmo: zahodí zem z kol a dokud kola nemají novou křivku, odpovídá DEM
+nebo extrapolace s jejich vlastními chybami (proto pochybnost po epoše a brány
+kontroly kol výše).
+
+Počty nových epoch podle příčiny jsou ve `stats` uzlu (`epochs_jump`,
+`epochs_gap`, `epochs_ground`; skok a posun v témž snímku se počítají oba),
+`carpet_over` = snímky s kobercem nad mezí; log při usnutí.
+
+Výpočet je malá
 soustava normálních rovnic (31 × 31, Choleského rozklad v numpy, bez BLAS):
 při 4 Hz 2 % jádra jako dřív (soustava ~500 × 31 přes `lstsq` budila
 vícevláknový OpenBLAS: 58 % jádra); uzel navíc nastaví `OPENBLAS_NUM_THREADS`,
@@ -215,13 +275,14 @@ hloubky, kalibrace z robota, DEM z robota), koridor v zóně při sečení
 |---|---|---|
 | `unknown` | 52,8 % (terrain_change 416, low_confidence 328) | **24,8 %** (201 / 143) |
 | zdroj země | extrapolace 95 %, kola 1 % | kola 62 %, extrapolace 35 % |
-| `>+4cm` | 17 (kola 1) | 9 (kola 1; ostatní DEM a extrapolace) |
+| `>+4cm` | 17 (kola 1) | 9 (kola 1, DEM 5, extrapolace 3) |
 | výška p25/50/75 | 27 / 46 / 57 mm | 20 / 37 / 55 mm |
 | chyba proti vrstvě (buňky přejeté koly hned) | extrapolace +9 mm (IQR 32) | kola −2 mm (IQR 35), mimo 2σ 2 % |
 
-V záznamu je jeden skutečný skok pózy (snímek 1292: 0,39 m za 0,27 s), od něj
-se zem z kol staví znovu: před skokem 20,8 % `unknown`, po něm 27,3 %. Bez
-detekce skoku vycházelo 18,3 %, ale za cenu porovnání země přes skok.
+V záznamu je jeden skutečný skok pózy (mezi snímky 1292 a 1293, číslováno od
+0: 0,39 m za 0,27 s, v mapě i v odometrii), od něj se zem z kol staví znovu:
+před skokem 20,8 % `unknown`, po něm 27,3 %. Bez detekce skoku vycházelo
+18,3 %, ale za cenu porovnání země přes skok.
 
 Vrstva: stejné buňky beze změny (medián rozdílu 0 mm), o 14 % buněk víc.
 Přehrání ukládaného záznamu `/grass/ahead` z robota sedí se starým kódem
@@ -247,7 +308,9 @@ koridor z `grass_calib fit` má přednost před konfigurací.
   ze šumových návratů, pruhy tam a zpět po zvlněném terénu (sklon do 6°) s
   chybou IMU 1,3°: v dalších pruzích < 20 % `unknown`, výška 46 ± 8 mm, žádná
   falešná třída, neposekaná tráva vedle posekaných pruhů zůstane `>+4cm`,
-  skok pózy 0,5 / 0,7 / 0,9 m podél pruhu → nová epocha, žádná falešná třída
+  skok pózy 0,5 / 0,7 / 0,9 m podél pruhu → nová epocha, žádná falešná třída;
+  týž skok rozložený do 3 / 5 / 10 snímků a posun na hrbolatém terénu s
+  krtincem (0,5 m za 3 / 20 snímků, 0,6 m za 10) → žádná falešná třída
   (`test/test_grass.py`, třída `Drift`).
 
 - Syntetické snímky (rovina, schod betonu, svah s trávou, vysoká tráva, okraj

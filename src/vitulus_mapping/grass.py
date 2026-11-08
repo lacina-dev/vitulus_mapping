@@ -137,6 +137,33 @@ DEFAULTS = {
     "drift_max_rate": 0.06,    # |slope| above this (3.4 deg) now = no curve (a pose fault)
     "drift_sigma_min_m": 0.008,  # floor of the curve's uncertainty
     "drift_use_max_m": 110.0,  # with a curve: ground stamped up to this far back is used
+    # revisits that stop fitting the curve = the pose slid (a jump spread over
+    # frames): a new epoch. Median of the revisits over the last consist_track_m
+    "consist_track_m": 0.5,
+    "consist_min_ds_m": 0.6,   # revisits from this much track back (also the turn just made)
+    "consist_min_pairs": 6,
+    "consist_min_m": 0.02,
+    "consist_sigmas": 3.0,
+    "consist_turn_dps": 10.0,  # not checked while the heading turns faster than this
+    "consist_turn_s": 2.0,     # ... averaged over this long
+    "consist_fit_pairs": 150,  # ... nor before the curve has this many revisits
+    "consist_fit_track_m": 20.0,  # ... over this much track
+    "consist_suspect": 0.65,   # newest revisits off by this share of the limit: suspect,
+                               # no ground from long ago while it lasts (consist_track_m)
+    # CARPET MEMORY: the corridor sees cells the camera saw on an earlier pass
+    # (0.8-1.6 m ahead, long before the wheels get there). Their carpet then,
+    # brought onto the current drift, against the carpet now: a pose sliding in
+    # shifts both the old carpet and the old ground under the corridor alike, so
+    # carpet now - carpet then = the error the height would get. Only upward
+    # (old altitudes too low = false tall grass; mowing in between only lowers it).
+    "carpet_min_ds_m": 3.0,    # an earlier pass: at least this much track ago
+    "carpet_band_m": 0.4,      # cells compared within the same distance band ahead
+    "carpet_min_cells": 5,     # cells compared in a frame
+    "carpet_min_m": 0.03,      # median excess over max(this, carpet_sigmas * spread)
+    "carpet_sigmas": 3.5,      # ... spread = robust spread of the recent frame medians
+                               #     (never below the drift curve's sigma)
+    "carpet_hist": 60,         # frame medians kept for the spread
+    "carpet_warmup": 15,       # ... and needed before it decides anything
     "lane_step_mm": 25.0,      # strips side by side differing more = kerb or grass edge (a step)
     "strip_w": 0.07,           # lateral strips for kerbs and mown | uncut edges
     "strip_min_pts": 30,
@@ -156,6 +183,7 @@ DEFAULTS = {
     "wheels_partial_min_cells": 2,   # fewer known: the plane through them and the footprint
     "wheels_partial_resid_mm": 20.0, # ... if the known cells sit on it this well
     "conf_min": 0.6,           # probability that the class is right
+    "conf_min_extrapolated_over": 0.7,  # ... over the cut on extrapolated ground, pose in doubt
     "cut_default_mm": 60.0,
     "smooth_frames": 3,
     "smooth_window_s": 1.5,
@@ -511,9 +539,11 @@ class Track(object):
         self.last = None            # (t, x, y)
         self.hist = []              # (s, h, pitch_world_deg) along the track
         self.s = 0.0
+        self.reason = None
 
-    def reset(self):
+    def reset(self, reason="restart"):
         self.epoch += 1
+        self.reason = reason        # why the last epoch began (jump, gap, ground, ...)
         self.h = 0.0
         self.last = None
         self.hist = []
@@ -530,7 +560,7 @@ class Track(object):
             jump = min(self.cfg["track_jump_m"],
                        self.cfg["track_jump_min_m"] + self.cfg["track_vmax_mps"] * max(0.0, t - t0))
             if step > jump or t - t0 > self.cfg["track_gap_s"] or t < t0:
-                self.reset()
+                self.reset("jump" if step > jump else "gap")
             elif step > 1e-4:
                 M = np.array([[R[0, 0], R[0, 1]], [R[1, 0], R[1, 1]]])
                 try:
@@ -630,11 +660,54 @@ class Drift(object):
     def __init__(self, cfg):
         self.cfg = cfg
         self.pairs = []             # (s_old, s_new, dh)
+        self.recent = []
+        self.suspect_s = None
         self._cache = (None, None, 0)   # (s, fit, pairs added since)
 
     def reset(self):
         self.pairs = []
+        self.recent = []            # (s_new, residual against the curve) of new revisits
+        self.suspect_s = None       # track position of the last suspect revisit
         self._cache = (None, None, 0)
+
+    def inconsistent(self, ds, dh, s_new):
+        """A revisit against the curve fitted so far. A pose that slid over a few
+        frames (EKF slew of a GNSS correction) puts the wheels on cells whose
+        stored ground lies elsewhere: on sloped ground the revisits stop fitting
+        the curve all at once. True when the median of the revisits of the last
+        consist_track_m of track misses it by more than max(consist_min_m,
+        consist_sigmas * sigma) (at least consist_min_pairs of them)."""
+        cfg = self.cfg
+        if ds < cfg["consist_min_ds_m"]:
+            return False        # the same pass restamping its own cells
+        fit = self._cache[1]
+        if fit is None or s_new - ds < fit.s_min:
+            return False
+        r = dh - float(fit.corr(s_new - ds, s_new))
+        self.recent.append((s_new, r))
+        self.recent = [q for q in self.recent if q[0] >= s_new - cfg["consist_track_m"]][-60:]
+        if len(self.recent) < cfg["consist_min_pairs"]:
+            return False
+        # the newest revisits: a slow slide shows within a few frames
+        med = float(np.median([q[1] for q in self.recent[-cfg["consist_min_pairs"]:]]))
+        lim = max(cfg["consist_min_m"], cfg["consist_sigmas"] * fit.sigma)
+        # most of the way there and upward (the old ground reads too low against
+        # the wheels now = false tall grass ahead): suspect
+        if med > cfg["consist_suspect"] * lim:
+            self.suspect_s = s_new
+        return abs(med) > lim
+
+    def mature(self, s_now):
+        """The curve has enough revisits to judge new ones by (a fresh one, right
+        after an epoch began, is fitted to few and its sigma is too small)."""
+        fit = self._cache[1]
+        return (fit is not None and len(self.pairs) >= self.cfg["consist_fit_pairs"]
+                and s_now - fit.s_min >= self.cfg["consist_fit_track_m"])
+
+    def suspect(self, s_now):
+        """The newest revisits were most of the way off the curve within the last
+        consist_track_m of track."""
+        return self.suspect_s is not None and s_now - self.suspect_s <= self.cfg["consist_track_m"]
 
     def add(self, ds, dh, s_new):
         if ds < self.cfg["drift_min_ds_m"]:
@@ -895,6 +968,13 @@ class GrassEngine(object):
         self.on_cell = on_cell or (lambda *a: None)
         self.track = Track(self.cfg)
         self.drift = Drift(self.cfg)
+        self._restart = None        # why the next frame starts a new epoch (ground)
+        self._yaw_hist = []         # (t, yaw) of the last consist_turn_s
+        self._turning = False
+        self._post_slide = False    # a ground/jump epoch began and no curve yet
+        self.carpet = {}            # (col, row) -> (alt, drift position, epoch, track s) first look of a pass
+        self._carpet_meds = []      # recent frame medians of carpet now - carpet then
+
         self._epoch = self.track.epoch
         # (col, row) -> (alt, t, epoch, track s) ground under the wheels
         self.ground = {}
@@ -931,6 +1011,10 @@ class GrassEngine(object):
         """The integrated altitude restarted: nothing measured on the old zero
         may meet anything measured on the new one."""
         self._epoch = self.track.epoch
+        self._restart = None
+        self._post_slide = False
+        self.carpet.clear()
+        self._carpet_meds = []
         self.ground.clear()
         self.drift.reset()
         self.recent = []
@@ -1036,6 +1120,13 @@ class GrassEngine(object):
             if old is not None and old[2] == ep:
                 # the wheels are back on a cell they stamped earlier: the altitude
                 # difference over the track between is the drift
+                # not checked while turning (the multi-point turns at the end of a
+                # lane: revisits from ~10 m back off the curve by 30-80 mm with
+                # map->odom still and the speed even, 2026-11-08 evening) nor on
+                # a fresh curve
+                if (not self._turning and self.drift.mature(s_now)
+                        and self.drift.inconsistent(s_now - old[3], h + dz - old[0], s_now)):
+                    self._restart = "ground"    # the next frame starts a new epoch
                 self.drift.add(s_now - old[3], h + dz - old[0], s_now)
             self.ground[key] = (h + dz, t, ep, s_now)
             obs = self.pending.get(key)
@@ -1064,7 +1155,7 @@ class GrassEngine(object):
                     self._resolve(key, raw * 1000.0, t, SRC_WHEELS, sig)
                 else:
                     self.pending.pop(key, None)
-        if len(self.ground) > self.cfg["ground_max"]:
+        if len(self.ground) > self.cfg["ground_max"] or len(self.carpet) > self.cfg["ground_max"]:
             self._prune_ground()
 
     def _prune_ground(self):
@@ -1072,9 +1163,14 @@ class GrassEngine(object):
         s_now, ep = self.track.s, self.track.epoch
         for k in [k for k, g in self.ground.items() if g[2] != ep or s_now - g[3] > lim]:
             del self.ground[k]
+        for k in [k for k, g in self.carpet.items() if g[2] != ep or s_now - g[3] > lim]:
+            del self.carpet[k]
         if len(self.ground) > self.cfg["ground_max"]:          # standing still for ages
             keep = sorted(self.ground.items(), key=lambda kv: kv[1][1])[-self.cfg["ground_max"] // 2:]
             self.ground = dict(keep)
+        if len(self.carpet) > self.cfg["ground_max"]:
+            keep = sorted(self.carpet.items(), key=lambda kv: kv[1][3])[-self.cfg["ground_max"] // 2:]
+            self.carpet = dict(keep)
 
     def _wheel_ground(self, keys, drift=None):
         """(altitude, track distance since stamped) of cells the wheels know in
@@ -1121,6 +1217,48 @@ class GrassEngine(object):
         gap = float(np.max(np.maximum(0.0, np.maximum(lo - lat, lat - hi))))
         extra = math.hypot(resid, 1000.0 * gap * math.tan(math.radians(4.0 * cfg["drift_deg"])))
         return g, extra
+
+    def _carpet_check(self, keys, ca, fwd_d, drift):
+        """Carpet now against the carpet of the same cells on an earlier pass,
+        brought onto the current drift (see carpet_* in DEFAULTS). Remembers the
+        first look of each pass per distance band (the p90 of tops seen from
+        1.8 m is not the one seen from 1 m). True = over the limit: the old
+        altitudes read too low here (doubt: ground from long ago may not claim
+        grass over the cut). It never starts an epoch by itself: on the real
+        lawn of 2026-11-08 it went over the limit in 17 frames without any
+        slide (the carpet then and now differ by mowing and the viewing
+        angle; spread 36 mm), the wheels decide the epoch."""
+        cfg = self.cfg
+        ep, s_now = self.track.epoch, self.track.s
+        diffs = []
+        bw = cfg["carpet_band_m"]
+        for k, c, d in zip(keys, ca, fwd_d):
+            b = int(math.floor(d / bw))
+            mk = (k[0], k[1], b)
+            m = self.carpet.get(mk)
+            if (m is not None and m[2] == ep and s_now - m[3] >= cfg["carpet_min_ds_m"]
+                    and m[3] >= drift.s_min):
+                diffs.append(c - (m[0] + float(drift.corr(m[1], s_now + d))))
+            if m is None or m[2] != ep or s_now - m[3] > 0.8 * cfg["drift_window_m"]:
+                self.carpet[mk] = (float(c), s_now + float(d), ep, s_now)
+        if len(diffs) < cfg["carpet_min_cells"]:
+            return False
+        med = float(np.median(diffs))
+        hist = self._carpet_meds
+        if len(hist) < cfg["carpet_warmup"]:
+            hist.append(med)            # learn this lawn's spread first, decide later
+            return False
+        # the spread of this lawn's frame medians, never below the drift curve's own
+        # uncertainty (the comparison carries it; repeated cells make the spread small)
+        spread = 1.4826 * float(np.median(np.abs(np.array(hist) - np.median(hist))))
+        lim = max(cfg["carpet_min_m"], cfg["carpet_sigmas"] * max(spread, drift.sigma))
+        if med > lim:
+            self.stats["carpet_over"] = self.stats.get("carpet_over", 0) + 1
+            return True
+        if med < 0.5 * lim:             # a slide just starting must not widen the spread
+            hist.append(med)
+            del hist[:-int(cfg["carpet_hist"])]
+        return False
 
     def _dem_offset(self, dem, x, y, R, h):
         """Track altitude minus DEM elevation under the robot now (so that
@@ -1197,9 +1335,32 @@ class GrassEngine(object):
         R = rot_rpy(roll, pitch, yaw)
         h = 0.0
         if pose is not None:
+            restart, ep0 = self._restart, self.track.epoch
             h = self.track.update(t, pose[0], pose[1], R)
+            causes = [self.track.reason] if self.track.epoch != ep0 else []
+            if restart:
+                # the wheel ground or the carpet stopped fitting (the pose slid):
+                # altitude, wheel ground and curve start again, as after a jump
+                causes.append(restart)
+                if self.track.epoch == ep0:
+                    self.track.reset(restart)
+                    h = self.track.update(t, pose[0], pose[1], R)
+            for c in causes:                 # a jump and a slide at once count both
+                self.stats["epochs_" + c] = self.stats.get("epochs_" + c, 0) + 1
             if self.track.epoch != self._epoch:
                 self._new_epoch()
+                # after a slide the pose stays in doubt until the wheels have a
+                # drift curve again
+                self._post_slide = "ground" in causes
+            elif self._post_slide and self.drift.estimate(self.track.s) is not None:
+                self._post_slide = False
+            # turning: the heading changed faster than consist_turn_dps over the
+            # last consist_turn_s
+            self._yaw_hist = [q for q in self._yaw_hist if t - q[0] <= cfg["consist_turn_s"]]
+            self._yaw_hist.append((t, yaw))
+            turn = sum(abs(math.atan2(math.sin(b[1] - a[1]), math.cos(b[1] - a[1])))
+                       for a, b in zip(self._yaw_hist, self._yaw_hist[1:]))
+            self._turning = math.degrees(turn) > cfg["consist_turn_dps"] * cfg["consist_turn_s"]
             self._stamp_wheels(t, pose[0], pose[1], R, h)
 
         def done(o):
@@ -1292,14 +1453,31 @@ class GrassEngine(object):
 
         # ---- ground of the corridor: wheels, DEM, extrapolation ----
         source, ground_rel, sigma_g, slope_deg = None, None, None, None
+        doubt_ground = False
         xc_c = an["x_c"]
         if keys:
             ca = np.array(canopy_alt)
-            drift = self.drift.estimate(self.track.s)
-            gw, gdist = self._wheel_ground(keys, drift)
             cxy_all = np.array([self._centre(*k) for k in keys])
             fwd_d = ((cxy_all[:, 0] - pose[0]) * math.cos(yaw)
                      + (cxy_all[:, 1] - pose[1]) * math.sin(yaw))
+            drift = self.drift.estimate(self.track.s)
+            cc = self._carpet_check(keys, ca, fwd_d, drift) if drift is not None else False
+            # Old altitudes found off the curve (the wheels over the limit): no
+            # ground from long ago in this frame, a new epoch from the next one.
+            # In doubt (the carpet over its limit, or the wheels most of the way
+            # there): ground from long ago may say below the cut, but no more
+            # than that (see the class below).
+            doubt = cc or self.drift.suspect(self.track.s) or self._post_slide
+            if self._restart and drift is not None:
+                _g, far = self._wheel_ground(keys, drift)
+                if (np.isfinite(far) & (far > cfg["wheel_ahead_max_m"])).sum() >= cfg["wheels_partial_min_cells"]:
+                    # the corridor's ground would come from long ago and that is
+                    # off: no answer (the extrapolation is no better here)
+                    out.update(terrain_source="wheels", reason="low_confidence", pose_check=True)
+                    return done(out)
+            if self._restart:
+                drift = None
+            gw, gdist = self._wheel_ground(keys, drift)
             if drift:
                 # the carpet of a cell d ahead carries the drift of s_now + d, its
                 # ground the drift of when it was stamped: bring the ground over
@@ -1344,6 +1522,10 @@ class GrassEngine(object):
             if pick is not None:
                 ok = np.isfinite(pick)
                 raw = float(np.median((ca[ok] - pick[ok]) * 1000.0))
+                # ground from long ago, or from the DEM (looked up at the pose, as
+                # off as the pose is), while the pose is in doubt: below the cut at
+                # most (checked on the reported class below)
+                doubt_ground = doubt and (source == "dem" or out.get("ground_track_m", 0.0) > cfg["wheel_ahead_max_m"])
                 ground_rel = float(np.median(pick[ok]) - h) * 1000.0
                 canopy_rel = float(np.median(ca[ok]) - h) * 1000.0
                 cxy = np.array([self._centre(*k) for k in keys])[ok]
@@ -1468,7 +1650,17 @@ class GrassEngine(object):
                    height_mm=round(hs), raw_mm=round(raw, 1), terrain_source=source,
                    slope_deg=round(slope_deg, 1) if slope_deg is not None else None,
                    confidence=round(conf, 2), uncertainty_mm=round(sigma, 1))
-        if conf < cfg["conf_min"]:
+        # while the pose is in doubt, grass over the cut from the extrapolated
+        # plane needs more (after a slide the corridor has no measured ground at
+        # all and a bump or a molehill ahead reads as grass); otherwise conf_min
+        need = cfg["conf_min"]
+        if (source == "extrapolated" and classify(hs, cut) != "below_cut"
+                and (self._post_slide or (pose is not None and self.drift.suspect(self.track.s)))):
+            need = max(need, cfg["conf_min_extrapolated_over"])
+        if doubt_ground and classify(hs, cut) != "below_cut":
+            out.update(height_mm=None, reason="low_confidence", pose_check=True)
+            self.recent.pop()           # a height in doubt must not smooth the next frames
+        elif conf < need:
             out.update(height_mm=None, reason="low_confidence")
         else:
             out["class"] = classify(hs, cut)
