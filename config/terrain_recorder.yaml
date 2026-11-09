@@ -21,12 +21,15 @@ coverage_reload_s: 60.0
 flush_s: 60.0
 session_gap_s: 1800.0
 
-# smooth corrections into odom: /odometry/odom vs the correction-free wheel EKF ("" = off)
+# localisation jumps in odom: /odometry/odom vs the correction-free wheel EKF over 0.3 s ("" = off). Only jumps:
+# the continuous corrections of a GNSS-owned pose (2-5 deg, 5-10 cm per 1-2 s, p95) are no events.
 odom_topic: /odometry/odom
 odom_ref_topic: /odometry/ekf_wheel_odom
-corr_window_s: 1.0
-corr_xy_m: 0.03
-corr_yaw_deg: 0.5
+corr_window_s: 0.3
+corr_xy_m: 0.10
+corr_yaw_deg: 5.0
+corr_turn_rate: 0.15     # rad/s: no yaw criterion in turns (wheel slip of the reference)
+corr_merge_s: 1.0
 corr_settle_s: 3.0
 corr_enforce: false      # only count the events until measured on the robot (E3)
 batch_log: ""            # CSV path for diagnostics

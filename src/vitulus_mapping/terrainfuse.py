@@ -60,13 +60,17 @@ DEFAULTS = {
     "coverage_reload_s": 60.0,
     "flush_s": 60.0,
     "session_gap_s": 1800.0,     # no fused batch this long -> a new session (besides /mower_smach/busy)
-    # smooth localisation corrections pulled into odom (set_pose): /odometry/odom vs the correction-free
-    # wheel EKF over corr_window_s, in the body frame
-    "corr_window_s": 1.0,
-    "corr_xy_m": 0.03,
-    "corr_yaw_deg": 0.5,
+    # localisation jumps in odom (set_pose, heading re-anchoring): /odometry/odom vs the correction-free wheel EKF
+    # over a SHORT window, in the body frame. While GNSS owns the pose, navi_transform corrects odom all the
+    # time (heading from the fused heading on every set_pose, position slewed): over 1-2 s that is 2-5 deg and
+    # 5-10 cm (p95) on calm driving (bags 2026-08-02, 2026-10-17) and cannot be told from noise; only jumps count.
+    "corr_window_s": 0.3,
+    "corr_xy_m": 0.10,
+    "corr_yaw_deg": 5.0,
+    "corr_turn_rate": 0.15,      # rad/s: the yaw criterion only while the reference turns slower (wheel slip)
+    "corr_merge_s": 1.0,         # events closer than this are one event (counted once)
     "corr_settle_s": 3.0,        # a batch with a stamp in [event - window, event + settle] is not fused
-    "corr_max_dt": 0.15,         # s: nearest samples of both odometries at least this close
+    "corr_max_dt": 0.06,         # s: nearest samples of both odometries at least this close (~30 Hz)
     "corr_enforce": False,       # True = act on events (freshness boundary, drop unsettled / uncovered batches);
                                  # False (default until measured on the robot) = only count them in ~stats
     "batch_log": "",             # CSV of every message / fused batch (diagnostics, replays); "" = off
@@ -323,10 +327,14 @@ def _rel(p0, p1):
 
 
 class CorrectionDetector(object):
-    """Corrections pulled smoothly into odom: the motion of /odometry/odom over
-    corr_window_s (body frame) against the motion of a correction-free odometry
+    """Localisation jumps pulled into odom: the motion of /odometry/odom over
+    corr_window_s (0.3 s, body frame) against the motion of a correction-free odometry
     (/odometry/ekf_wheel_odom, never set_pose'd) over the same interval. More than
-    corr_xy_m / corr_yaw_deg apart = an event at that time."""
+    corr_xy_m (10 cm) apart, or corr_yaw_deg (5 deg) while the reference turns slower
+    than corr_turn_rate (skid steering slips in turns), = an event; events closer than
+    corr_merge_s are one. The continuous small corrections of a GNSS-owned pose stay
+    below (measured on two bags: 0.15-0.65 events/min instead of ~110, every known
+    jump > 10 cm caught)."""
 
     def __init__(self, cfg=None):
         self.cfg = dict(DEFAULTS)
@@ -390,10 +398,13 @@ class CorrectionDetector(object):
         dxy = math.hypot(a[0] - b[0], a[1] - b[1])
         dyaw = abs(math.degrees(_wrap(a[2] - b[2])))
         self.last_diff = (dxy, dyaw)
-        if dxy > c["corr_xy_m"] or dyaw > c["corr_yaw_deg"]:
+        turn = abs(b[2]) / w
+        if dxy > c["corr_xy_m"] or (dyaw > c["corr_yaw_deg"] and turn < c["corr_turn_rate"]):
+            merged = bool(self.events) and t - self.events[-1] <= c["corr_merge_s"]
             self.events.append(t)
-            self.n_events += 1
-            return True
+            if not merged:
+                self.n_events += 1
+            return not merged
         return False
 
     def covered(self, stamp, half=0.5):

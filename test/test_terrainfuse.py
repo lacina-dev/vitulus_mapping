@@ -336,13 +336,42 @@ class Core(unittest.TestCase):
         c.close()
         self.assertEqual(self.core().store.session, s0 + 1)
 
-    def odom_pair(self, c, t0, n, slew=0.0, yaw_slew=0.0):
-        """Driving 0.3 m/s along x; /odometry/odom gets an extra slew (m/s, rad/s)."""
+    def odom_pair(self, c, t0, n, slew=0.0, yaw_slew=0.0, jump_at=None, jump=0.0, yaw_jump=0.0):
+        """Driving 0.3 m/s along x at 20 Hz; /odometry/odom gets an extra slow slew (m/s sideways,
+        rad/s) and from sample index jump_at on a set_pose jump (m sideways, rad)."""
         for i in range(n):
             t = t0 + 0.05 * i
             d = 0.3 * 0.05 * i                              # the wheel EKF: own frame, heading 0.2 rad
             c.feed_ref(t, 10.0 + d * math.cos(0.2), 5.0 + d * math.sin(0.2), 0.2)
-            c.feed_odom(t, 0.3 * 0.05 * i, slew * 0.05 * i, yaw_slew * 0.05 * i)
+            j = jump_at is not None and i >= jump_at
+            c.feed_odom(t, 0.3 * 0.05 * i, slew * 0.05 * i + (jump if j else 0.0),
+                        yaw_slew * 0.05 * i + (yaw_jump if j else 0.0))
+
+    def test_detector_calm_vs_jump(self):
+        c = self.core()
+        self.odom_pair(c, T0, 600)                           # 30 s calm
+        self.assertEqual(c.corr.n_events, 0)
+        c = self.core()
+        self.odom_pair(c, T0, 600, slew=0.10, yaw_slew=math.radians(2.0))   # continuous GNSS corrections
+        self.assertEqual(c.corr.n_events, 0)
+        c = self.core()
+        self.odom_pair(c, T0, 600, jump_at=300, jump=0.30)   # set_pose: 30 cm at once
+        self.assertEqual(c.corr.n_events, 1)                 # one event, merged
+        self.assertAlmostEqual(c.corr.events[0], T0 + 15.0, delta=0.4)
+        c = self.core()
+        self.odom_pair(c, T0, 600, jump_at=300, yaw_jump=math.radians(8.0))  # heading re-anchored by 8 deg
+        self.assertEqual(c.corr.n_events, 1)
+
+    def test_detector_ignores_yaw_while_turning(self):
+        """Skid steering slips in turns: the wheel EKF turns 0.5 rad/s, odom 8 % more -> no event;
+        a 30 cm jump in the turn still is one."""
+        for jump, expected in ((0.0, 0), (0.30, 1)):
+            c = self.core()
+            for i in range(400):
+                t = T0 + 0.05 * i
+                c.feed_ref(t, 0.0, 0.0, 0.5 * 0.05 * i)
+                c.feed_odom(t, jump if i >= 200 else 0.0, 0.0, 1.08 * 0.5 * 0.05 * i)
+            self.assertEqual(c.corr.n_events, expected)
 
     def test_correction_only_counted_by_default(self):
         c = self.core(accept_delay=2.0)
@@ -350,9 +379,9 @@ class Core(unittest.TestCase):
         self.odom_pair(c, T0 - 15, 330)
         self.gate_ok(c, T0 - 15)
         self.drive(c, T0, 2)
-        self.odom_pair(c, T0 + 1.5, 40, slew=0.10)
-        self.assertGreater(c.corr.n_events, 0)
-        self.assertGreater(c.stats["corrections"], 0)
+        self.odom_pair(c, T0 + 1.5, 40, jump_at=5, jump=0.3)
+        self.assertEqual(c.corr.n_events, 1)
+        self.assertEqual(c.stats["corrections"], 1)
         self.assertIsNone(c.store.fresh_after)
         self.assertEqual(len(c.store.pending), 2)
         self.gate_ok(c, T0 + 3.3)
@@ -365,7 +394,7 @@ class Core(unittest.TestCase):
         self.assertEqual(c.corr.n_events, 0)
         self.gate_ok(c, T0 - 15)
         self.assertEqual(self.drive(c, T0, 2), ["queued", "queued"])
-        self.odom_pair(c, T0 + 1.5, 40, slew=0.10)            # pulled 10 cm/s sideways
+        self.odom_pair(c, T0 + 1.5, 40, jump_at=5, jump=0.3)  # set_pose jump at ~T0 + 1.75
         ev = c.corr.events[0]
         self.assertGreaterEqual(c.store.fresh_after, ev + 3.0)
         self.assertEqual(len(c.store.pending), 2)            # the queue stays, its stale cells go at processing
@@ -377,11 +406,7 @@ class Core(unittest.TestCase):
         # no comparison around the stamp (reference odometry missing): fails closed
         self.gate_ok(c, T0 + 20.3)
         self.assertEqual(c.feed(msg(T0 + 20), T0 + 20.3), "corr_nodata")
-        # yaw slew 1 deg/s is an event too; a quiet time after the settle time is not
-        c2 = self.core()
-        self.odom_pair(c2, T0, 60, yaw_slew=math.radians(1.0))
-        self.assertGreater(c2.corr.n_events, 0)
-        self.assertFalse(c2.corr.unsettled(T0 + 3 + 3.5 + 1))
+        self.assertFalse(c.corr.unsettled(T0 + 1.75 + 3.5 + 1))
 
     def test_program_end_writes_and_requests_export(self):
         c = self.core(accept_delay=0.0)

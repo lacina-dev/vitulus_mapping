@@ -107,8 +107,11 @@ headings — and even then only listed as `nogo_candidates`, never written anywh
   `~/.vitulus/terrain_recorder.json`). `nice -n 19`.
 * Fused only while: RTK FIXED + hAcc ≤ 30 mm (`/gnss/navpvt`), `/nav_tf/loc_status` owner `gps` with heading,
   both for the last 10 s; not settling (local node); a batch is fused 3 s (≥ period + 1 s) after its stamp.
-  Smooth corrections pulled into odom (`/odometry/odom` vs `/odometry/ekf_wheel_odom` over 1 s, > 3 cm / 0.5°) are
-  only counted by default (`corr_enforce: false`); switched on they set a freshness boundary (event + 3 s) and
+  Localisation jumps in odom (`/odometry/odom` vs `/odometry/ekf_wheel_odom` over 0.3 s in the body frame: > 10 cm,
+  or > 5° while the reference turns slower than 0.15 rad/s; merged within 1 s) are only counted by default
+  (`corr_enforce: false`). The continuous small corrections of a GNSS-owned pose are no events (2 bags: 0.1–0.6
+  events/min instead of ~110, every raw jump > 10 cm caught); switched on they set a freshness boundary
+  (event + 3 s) and
   batches without a comparison of both odometries are dropped (fails closed).
 * Export for the UI (`<site>/terrain_mosaic/`, versioned image names, JSON written last, version counter
   `<site>/terrain_export.version` never reused): a child process at `nice 19` reading the stored tiles read-only
